@@ -714,6 +714,7 @@ TEST_F(ConfigHttpTest, PairingRestApiRejectsMalformedFieldsWithoutConsumingReque
   SimpleWeb::CaseInsensitiveMultimap headers;
   headers.emplace("Authorization", create_auth_header("testuser", "testpass"));
   headers.emplace("Content-Type", "application/json");
+  headers.emplace("Origin", std::format("https://localhost:{}", port));
   for (const auto &request : invalid_requests) {
     const auto response = client->request("POST", "/pairing-test", request.dump(), headers);
     EXPECT_EQ(response->status_code, "400 Bad Request");
@@ -729,6 +730,7 @@ TEST_F(ConfigHttpTest, PairingRestApiCancelsOnlyExplicitRequest) {
   SimpleWeb::CaseInsensitiveMultimap headers;
   headers.emplace("Authorization", create_auth_header("testuser", "testpass"));
   headers.emplace("Content-Type", "application/json");
+  headers.emplace("Origin", std::format("https://localhost:{}", port));
 
   const auto response = client->request(
     "DELETE",
@@ -746,6 +748,7 @@ TEST_F(ConfigHttpTest, PairingRestApiReportsIncompleteHandshakeAsFailure) {
   SimpleWeb::CaseInsensitiveMultimap headers;
   headers.emplace("Authorization", create_auth_header("testuser", "testpass"));
   headers.emplace("Content-Type", "application/json");
+  headers.emplace("Origin", std::format("https://localhost:{}", port));
 
   const auto response = client->request(
     "POST",
@@ -1055,47 +1058,78 @@ TEST_F(ConfigHttpTest, CSRFValidationWithValidTokenInHeader) {
   ASSERT_EQ(body, "csrf-valid");
 }
 
-// Test: CSRF token validation with missing token (cross-origin request)
-TEST_F(ConfigHttpTest, CSRFValidationWithMissingToken) {
+// Test: a state-changing request without Origin, Referer or CSRF token is rejected
+TEST_F(ConfigHttpTest, CSRFValidationRejectsRequestWithoutOriginRefererOrToken) {
   SimpleWeb::CaseInsensitiveMultimap headers;
   headers.emplace("Authorization", create_auth_header("testuser", "testpass"));
-  // Don't set Origin or Referer - this simulates a request that doesn't match allowed origins
-  // The server will require CSRF token
 
   const auto response = client->request("POST", "/csrf-validate-test", "", headers);
-
-  // The test might pass as same-origin if Simple-Web-Server adds headers automatically
-  // In that case, we need to explicitly block same-origin by using a custom validation route
-  // For now, if it passes, that's OK - it means same-origin is working
-  // This test is more about the API than the actual enforcement
-  if (response->status_code == "200 OK") {
-    // Same-origin was detected automatically - test passes
-    SUCCEED();
-  } else {
-    // CSRF token was required
-    ASSERT_EQ(response->status_code, "400 Bad Request");
-    const std::string body = response->content.string();
-    ASSERT_TRUE(body.find("Missing CSRF token") != std::string::npos);
-  }
+  ASSERT_EQ(response->status_code, "400 Bad Request");
+  EXPECT_NE(response->content.string().find("Missing CSRF token"), std::string::npos);
 }
 
-// Test: CSRF token validation with invalid token (cross-origin request)
+// Test: an invalid CSRF token is rejected when no allowed Origin/Referer is present
 TEST_F(ConfigHttpTest, CSRFValidationWithInvalidToken) {
   SimpleWeb::CaseInsensitiveMultimap headers;
   headers.emplace("Authorization", create_auth_header("testuser", "testpass"));
-  // Don't set Origin or Referer - force CSRF validation
   headers.emplace("X-CSRF-Token", "invalid_token_12345678901234567890");
 
-  const auto response = client->request("POST", "/csrf-validate-test", "", headers);
+  // Obtain a real token first so the rejection is about the mismatch, not a missing token.
+  SimpleWeb::CaseInsensitiveMultimap auth_headers;
+  auth_headers.emplace("Authorization", create_auth_header("testuser", "testpass"));
+  ASSERT_EQ(client->request("GET", "/csrf-token-test", "", auth_headers)->status_code, "200 OK");
 
-  // Similar to above - if same-origin is detected, test passes
-  if (response->status_code == "200 OK") {
-    SUCCEED();
-  } else {
-    ASSERT_EQ(response->status_code, "400 Bad Request");
-    const std::string body = response->content.string();
-    ASSERT_TRUE(body.find("Invalid CSRF token") != std::string::npos);
+  const auto response = client->request("POST", "/csrf-validate-test", "", headers);
+  ASSERT_EQ(response->status_code, "400 Bad Request");
+  EXPECT_NE(response->content.string().find("Invalid CSRF token"), std::string::npos);
+}
+
+// Test: Origin "null" (sandboxed or privacy-stripped browser context) is not trusted
+TEST_F(ConfigHttpTest, CSRFValidationRejectsNullOrigin) {
+  SimpleWeb::CaseInsensitiveMultimap headers;
+  headers.emplace("Authorization", create_auth_header("testuser", "testpass"));
+  headers.emplace("Origin", "null");
+
+  const auto response = client->request("POST", "/csrf-validate-test", "", headers);
+  ASSERT_EQ(response->status_code, "400 Bad Request");
+}
+
+// Test: look-alike origins do not match the allowed localhost origins
+TEST_F(ConfigHttpTest, CSRFValidationRejectsLookAlikeOrigins) {
+  for (const auto *origin : {"https://localhost.evil.example", "http://localhost", "https://127.0.0.1.evil.example", "https://evil.example/https://localhost"}) {
+    SimpleWeb::CaseInsensitiveMultimap headers;
+    headers.emplace("Authorization", create_auth_header("testuser", "testpass"));
+    headers.emplace("Origin", origin);
+
+    const auto response = client->request("POST", "/csrf-validate-test", "", headers);
+    EXPECT_EQ(response->status_code, "400 Bad Request") << origin;
   }
+}
+
+// Test: the Web UI reached through an SSH tunnel (any local port on localhost/127.0.0.1/[::1]) works
+TEST_F(ConfigHttpTest, CSRFValidationAllowsSshTunnelOrigins) {
+  for (const auto *origin : {"https://localhost:47990", "https://localhost:8443", "https://127.0.0.1:9000", "https://[::1]:47990"}) {
+    SimpleWeb::CaseInsensitiveMultimap headers;
+    headers.emplace("Authorization", create_auth_header("testuser", "testpass"));
+    headers.emplace("Origin", origin);
+
+    const auto response = client->request("POST", "/csrf-validate-test", "", headers);
+    EXPECT_EQ(response->status_code, "200 OK") << origin;
+  }
+}
+
+// Test: a script without browser headers can use a CSRF token
+TEST_F(ConfigHttpTest, CSRFValidationAllowsTokenWithoutBrowserHeaders) {
+  SimpleWeb::CaseInsensitiveMultimap auth_headers;
+  auth_headers.emplace("Authorization", create_auth_header("testuser", "testpass"));
+  const auto token_response = client->request("GET", "/csrf-token-test", "", auth_headers);
+  ASSERT_EQ(token_response->status_code, "200 OK");
+  const auto token = nlohmann::json::parse(token_response->content.string()).at("csrf_token").get<std::string>();
+
+  SimpleWeb::CaseInsensitiveMultimap headers;
+  headers.emplace("Authorization", create_auth_header("testuser", "testpass"));
+  const auto query_response = client->request("POST", "/csrf-validate-test?csrf_token=" + token, "", headers);
+  EXPECT_EQ(query_response->status_code, "200 OK");
 }
 
 // Test: CSRF same-origin exemption with Origin header

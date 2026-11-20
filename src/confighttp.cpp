@@ -854,7 +854,7 @@ namespace confighttp {
       return false;
     }
 
-    if (token_it->second.token != provided_token) {
+    if (!webui_auth::constant_time_equals(token_it->second.token, provided_token)) {
       auto address = net::addr_to_normalized_string(request->remote_endpoint().address());
       BOOST_LOG(error) << "Web UI: ["sv << address << "] -- CSRF token validation failed: token mismatch"sv;
       bad_request(response, "Invalid CSRF token");
@@ -895,16 +895,15 @@ namespace confighttp {
       return true;
     }
 
-    // If neither Origin nor Referer is present, this cannot be a browser-initiated CSRF attack.
-    // Non-browser clients (e.g. curl, scripts) never send these headers, and a malicious web page
-    // cannot cause a non-browser client to make requests on a user's behalf.
-    if (origin_it == request->header.end() && referer_it == request->header.end()) {
-      return true;
-    }
-
-    // A browser-like request arrived with an Origin/Referer that doesn't match an allowed origin.
-    // Require a CSRF token.
-    const std::string_view blocked_origin = (origin_it != request->header.end()) ? origin_it->second : referer_it->second;
+    // Everything else needs a CSRF token: a mismatching Origin/Referer, `Origin: null`, and also
+    // requests carrying neither header. Browsers send Origin on every state-changing request, so
+    // a missing header is not proof of a non-browser client (older browsers and privacy settings
+    // can strip both), and the Web UI itself, including through an SSH tunnel to
+    // https://localhost:<port>, always presents an allowed Origin. Scripts obtain a token from
+    // GET /api/csrf-token and send it in the X-CSRF-Token header.
+    const bool has_origin = origin_it != request->header.end();
+    const bool has_referer = referer_it != request->header.end();
+    const std::string_view blocked_origin = has_origin ? std::string_view {origin_it->second} : (has_referer ? std::string_view {referer_it->second} : "(no Origin or Referer header)"sv);
     // Extract token from X-CSRF-Token header
     const auto header_it = request->header.find("X-CSRF-Token");
     if (header_it == request->header.end()) {
