@@ -6,9 +6,11 @@
 
 // standard includes
 #include <chrono>
+#include <cstddef>
 #include <filesystem>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <string>
 #include <string_view>
 
@@ -28,6 +30,19 @@
 
 namespace confighttp {
   constexpr auto PORT_HTTPS = 1;  ///< GameStream port offset for port https.
+
+  /**
+   * @brief Maximum request size (headers and body) accepted by the Web UI server.
+   * @details Larger requests are rejected before their body is buffered.
+   */
+  constexpr std::size_t MAX_REQUEST_SIZE = 4 * 1024 * 1024;
+
+  /**
+   * @brief Maximum size of an uploaded cover image after base64 decoding.
+   * @details The image travels base64-encoded (4/3 larger) inside a JSON body, so this is the largest
+   *          image whose upload still fits in @ref MAX_REQUEST_SIZE with 64 KiB to spare (about 2.95 MiB).
+   */
+  constexpr std::size_t COVER_MAX_SIZE = (MAX_REQUEST_SIZE - 64 * 1024) / 4 * 3;
 
   // Type aliases for HTTPS server components
   using https_server_t = SimpleWeb::Server<SimpleWeb::HTTPS>;
@@ -206,6 +221,32 @@ namespace confighttp {
   void savePassword(const resp_https_t &response, const req_https_t &request);
 
   void uploadCover(const resp_https_t &response, const req_https_t &request);
+
+  /**
+   * @brief Check that uploaded cover data is a PNG image within the size limit.
+   * @details Only PNG is accepted because cover images are served and validated as PNG elsewhere
+   *          (`proc::validate_app_image_path`, `getCover`, the GameStream app asset).
+   *
+   * @param data Decoded image bytes.
+   * @param error Receives a user-facing reason when the image is rejected.
+   * @return File extension (`.png`) for an accepted image, or no value.
+   */
+  std::optional<std::string_view> validate_cover_image(std::string_view data, std::string &error);
+
+  /**
+   * @brief Check that a cover key is safe to use as a file name.
+   *
+   * @param key Cover key from the request.
+   * @return `true` for 1-64 letters, digits, `_` or `-`.
+   */
+  bool is_valid_cover_key(std::string_view key);
+
+  /**
+   * @brief Apply the Web UI server's request limits.
+   *
+   * @param server Server to configure.
+   */
+  void configure_server_limits(https_server_t &server);
 
 #ifdef SUNSHINE_TESTS
   /**

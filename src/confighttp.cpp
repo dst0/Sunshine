@@ -9,6 +9,7 @@
 // standard includes
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <charconv>
 #include <filesystem>
 #include <format>
@@ -1746,6 +1747,30 @@ namespace confighttp {
     }
   }
 
+  std::optional<std::string_view> validate_cover_image(const std::string_view data, std::string &error) {
+    static constexpr std::string_view png_signature {"\x89PNG\r\n\x1a\n", 8};
+
+    if (data.empty()) {
+      error = "Cover image data is required";
+      return std::nullopt;
+    }
+    if (data.size() > COVER_MAX_SIZE) {
+      error = std::format("Cover image is too large (at most {} bytes)", COVER_MAX_SIZE);
+      return std::nullopt;
+    }
+    if (data.starts_with(png_signature)) {
+      return ".png"sv;
+    }
+    error = "Cover image must be a PNG file";
+    return std::nullopt;
+  }
+
+  bool is_valid_cover_key(const std::string_view key) {
+    return !key.empty() && key.size() <= 64 && std::ranges::all_of(key, [](const unsigned char c) {
+      return std::isalnum(c) || c == '_' || c == '-';
+    });
+  }
+
   /**
    * @brief Upload a cover image.
    * @param response The HTTP response object.
@@ -1753,12 +1778,14 @@ namespace confighttp {
    * The body for the post request should be JSON serialized in the following format:
    * @code{.json}
    * {
-   *   "key": "igdb_<game_id>",
-   *   "url": "https://images.igdb.com/igdb/image/upload/t_cover_big_2x/<slug>.png"
+   *   "key": "<1-64 characters: letters, digits, '_' or '-'>",
+   *   "data": "<base64-encoded PNG image, at most COVER_MAX_SIZE bytes (about 2.95 MiB)>"
    * }
    * @endcode
    *
-   * @api_examples{/api/covers/upload|:| POST|:| {"key":"igdb_1234","url":"https://images.igdb.com/igdb/image/upload/t_cover_big_2x/abc123.png"}}
+   * Downloading covers from a URL is not supported: Sunshine makes no outbound connections.
+   *
+   * @api_examples{/api/covers/upload|:| POST|:| {"key":"my_game","data":"iVBORw0KGgo..."}}
    */
   void uploadCover(const resp_https_t &response, const req_https_t &request) {
     if (!check_content_type(response, request, "application/json")) {
@@ -1768,38 +1795,51 @@ namespace confighttp {
       return;
     }
 
+    std::string client_id = get_client_id(request);
+    if (!validate_csrf_token(response, request, client_id)) {
+      return;
+    }
+
     std::stringstream ss;
     ss << request->content.rdbuf();
     try {
       nlohmann::json output_tree;
       nlohmann::json input_tree = nlohmann::json::parse(ss);
 
-      std::string key = input_tree.value("key", "");
-      if (key.empty()) {
-        bad_request(response, "Cover key is required");
+      if (input_tree.contains("url")) {
+        bad_request(response, "Downloading covers from a URL is not supported");
         return;
       }
-      std::string url = input_tree.value("url", "");
 
-      const std::string coverdir = platf::appdata().string() + "/covers/";
-      file_handler::make_directory(coverdir);
-
-      std::basic_string path = coverdir + http::url_escape(key) + ".png";
-      if (!url.empty()) {
-        if (http::url_get_host(url) != "images.igdb.com") {
-          bad_request(response, "Only images.igdb.com is allowed");
-          return;
-        }
-        if (!http::download_file(url, path)) {
-          bad_request(response, "Failed to download cover");
-          return;
-        }
-      } else {
-        auto data = SimpleWeb::Crypto::Base64::decode(input_tree.value("data", ""));
-
-        std::ofstream imgfile(path);
-        imgfile.write(data.data(), static_cast<int>(data.size()));
+      const std::string key = input_tree.value("key", "");
+      if (!is_valid_cover_key(key)) {
+        bad_request(response, "Cover key must be 1-64 letters, digits, '_' or '-'");
+        return;
       }
+
+      const auto data = webui_auth::base64_decode(input_tree.value("data", ""));
+      if (!data) {
+        bad_request(response, "Cover image data is not valid base64");
+        return;
+      }
+      std::string error;
+      const auto extension = validate_cover_image(*data, error);
+      if (!extension) {
+        bad_request(response, error);
+        return;
+      }
+
+      const auto coverdir = platf::appdata() / "covers";
+      file_handler::make_directory(coverdir.string());
+      const auto path = (coverdir / (key + std::string {*extension})).string();
+
+      std::ofstream imgfile(path, std::ios::binary | std::ios::trunc);
+      imgfile.write(data->data(), static_cast<std::streamsize>(data->size()));
+      if (!imgfile) {
+        bad_request(response, "Failed to save the cover image");
+        return;
+      }
+
       output_tree["status"] = true;
       output_tree["path"] = path;
       send_response(response, output_tree);
@@ -2568,6 +2608,10 @@ namespace confighttp {
     }
   }
 
+  void configure_server_limits(https_server_t &server) {
+    server.config.max_request_streambuf_size = MAX_REQUEST_SIZE;
+  }
+
   /**
    * @brief Start the HTTPS configuration server.
    */
@@ -2640,6 +2684,7 @@ namespace confighttp {
     server.config.reuse_address = true;
     server.config.address = net::get_bind_address(address_family);
     server.config.port = port_https;
+    configure_server_limits(server);
 
     const auto display_addr = net::get_bind_address_url_host();
 

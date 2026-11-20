@@ -16,12 +16,16 @@
 #include <filesystem>
 #include <format>
 #include <fstream>
+#include <initializer_list>
 #include <iostream>
+#include <iterator>
 #include <string_view>
 #include <thread>
+#include <tuple>
 #include <utility>
 
 // lib includes
+#include <boost/asio/ssl.hpp>
 #include <Simple-Web-Server/client_https.hpp>
 #include <Simple-Web-Server/crypto.hpp>
 #include <Simple-Web-Server/server_https.hpp>
@@ -194,6 +198,7 @@ protected:
     server->config.reuse_address = true;
     server->config.timeout_request = 5;
     server->config.timeout_content = 300;
+    confighttp::configure_server_limits(*server);
 
     // Add a route to test authentication directly
     server->resource["^/auth-test$"]["GET"] = [](
@@ -2395,4 +2400,130 @@ TEST_F(ConfigHttpTest, RepeatedLoginFailuresLockOutTheSource) {
   EXPECT_EQ(response->header.find("WWW-Authenticate"), response->header.end());
   EXPECT_EQ(webui_auth::password_evaluations_for_testing(), evaluations);
   EXPECT_NE(response->content.string().find("Too many failed login attempts"), std::string::npos);
+}
+
+/**
+ * @brief Build an authenticated, same-origin JSON request for the cover upload endpoint.
+ *
+ * @param port Test server port used in the Origin header.
+ * @return Request headers.
+ */
+static SimpleWeb::CaseInsensitiveMultimap cover_upload_headers(const unsigned short port) {
+  auto headers = same_origin_json_headers(port);
+  headers.emplace("Authorization", "Basic " + SimpleWeb::Crypto::Base64::encode("testuser:testpass"));
+  return headers;
+}
+
+// Test: covers can no longer be downloaded from a URL (no outbound connections)
+TEST_F(ConfigHttpTest, UploadCoverRejectsUrlDownloads) {
+  const nlohmann::json body {{"key", "igdb_1234"}, {"url", "https://images.igdb.com/igdb/image/upload/t_cover_big_2x/abc.png"}};
+  const auto response = client->request("POST", "/api/covers/upload", body.dump(), cover_upload_headers(port));
+
+  ASSERT_EQ(response->status_code, "400 Bad Request");
+  EXPECT_NE(response->content.string().find("not supported"), std::string::npos);
+  EXPECT_FALSE(std::filesystem::exists(platf::appdata() / "covers" / "igdb_1234.png"));
+}
+
+// Test: only PNG data is accepted
+TEST_F(ConfigHttpTest, UploadCoverRejectsNonImageData) {
+  for (const std::string &data : {std::string {"GIF89a....."}, std::string {"<svg onload=alert(1)>"}, std::string {"\xff\xd8\xff\xe0jpeg", 8}, std::string {}}) {
+    const nlohmann::json body {{"key", "not_an_image"}, {"data", SimpleWeb::Crypto::Base64::encode(data)}};
+    const auto response = client->request("POST", "/api/covers/upload", body.dump(), cover_upload_headers(port));
+    EXPECT_EQ(response->status_code, "400 Bad Request") << data;
+  }
+  const nlohmann::json invalid_base64 {{"key", "not_an_image"}, {"data", "%%%"}};
+  EXPECT_EQ(client->request("POST", "/api/covers/upload", invalid_base64.dump(), cover_upload_headers(port))->status_code, "400 Bad Request");
+  EXPECT_FALSE(std::filesystem::exists(platf::appdata() / "covers" / "not_an_image.png"));
+}
+
+// Test: cover keys cannot escape the covers directory
+TEST_F(ConfigHttpTest, UploadCoverRejectsUnsafeKeys) {
+  const std::string png {"\x89PNG\r\n\x1a\n0000", 12};
+  for (const auto &key : std::initializer_list<std::string> {"../escape", "a/b", "", std::string(65, 'a'), "name.png", "a b"}) {
+    const nlohmann::json body {{"key", key}, {"data", SimpleWeb::Crypto::Base64::encode(png)}};
+    const auto response = client->request("POST", "/api/covers/upload", body.dump(), cover_upload_headers(port));
+    EXPECT_EQ(response->status_code, "400 Bad Request") << key;
+  }
+}
+
+// Test: a valid PNG upload is stored, up to the largest size that fits the request limit
+TEST_F(ConfigHttpTest, UploadCoverStoresPngUpToTheSizeLimit) {
+  std::string largest(confighttp::COVER_MAX_SIZE, 'x');
+  largest.replace(0, 8, std::string {"\x89PNG\r\n\x1a\n", 8});
+  for (const auto &[key, data] : {std::pair {"test_cover_small", std::string {"\x89PNG\r\n\x1a\nrest-of-png", 19}}, std::pair {"test_cover_largest", largest}}) {
+    const auto path = platf::appdata() / "covers" / (std::string {key} + ".png");
+    std::filesystem::remove(path);
+    const nlohmann::json body {{"key", key}, {"data", SimpleWeb::Crypto::Base64::encode(data)}};
+    ASSERT_LE(body.dump().size(), confighttp::MAX_REQUEST_SIZE);
+    const auto response = client->request("POST", "/api/covers/upload", body.dump(), cover_upload_headers(port));
+
+    ASSERT_EQ(response->status_code, "200 OK") << key << ": " << response->content.string().substr(0, 200);
+    ASSERT_TRUE(std::filesystem::exists(path));
+    std::ifstream stored {path, std::ios::binary};
+    const std::string contents {std::istreambuf_iterator<char> {stored}, std::istreambuf_iterator<char> {}};
+    EXPECT_EQ(contents, data);
+    stored.close();
+    std::filesystem::remove(path);
+  }
+}
+
+// Test: cover uploads are CSRF protected
+TEST_F(ConfigHttpTest, UploadCoverRequiresCsrfProtection) {
+  SimpleWeb::CaseInsensitiveMultimap headers;
+  headers.emplace("Content-Type", "application/json");
+  headers.emplace("Authorization", create_auth_header("testuser", "testpass"));
+  headers.emplace("Origin", "https://example.invalid");
+  const nlohmann::json body {{"key", "csrf_cover"}, {"data", SimpleWeb::Crypto::Base64::encode(std::string {"\x89PNG\r\n\x1a\n", 8})}};
+  const auto response = client->request("POST", "/api/covers/upload", body.dump(), headers);
+  EXPECT_EQ(response->status_code, "400 Bad Request");
+  EXPECT_FALSE(std::filesystem::exists(platf::appdata() / "covers" / "csrf_cover.png"));
+}
+
+// Test: the decoded image size limit is enforced independently of the request limit
+TEST(ConfigHttpCoverValidationTest, RejectsOversizedAndUnknownImages) {
+  std::string error;
+  EXPECT_LE(confighttp::COVER_MAX_SIZE, 4u * 1024 * 1024);
+  std::string oversized(confighttp::COVER_MAX_SIZE + 1, '\0');
+  oversized.replace(0, 8, std::string {"\x89PNG\r\n\x1a\n", 8});
+  EXPECT_FALSE(confighttp::validate_cover_image(oversized, error));
+  EXPECT_NE(error.find("too large"), std::string::npos);
+
+  std::string largest(confighttp::COVER_MAX_SIZE, '\0');
+  largest.replace(0, 8, std::string {"\x89PNG\r\n\x1a\n", 8});
+  EXPECT_EQ(confighttp::validate_cover_image(largest, error), ".png");
+
+  EXPECT_FALSE(confighttp::validate_cover_image(std::string {"\xff\xd8\xff\xe0", 4}, error)) << "JPEG covers cannot be displayed";
+
+  EXPECT_FALSE(confighttp::validate_cover_image("BM....", error));
+  EXPECT_FALSE(confighttp::validate_cover_image("", error));
+  EXPECT_TRUE(confighttp::is_valid_cover_key("igdb_1234-x"));
+  EXPECT_FALSE(confighttp::is_valid_cover_key(".."));
+}
+
+// Test: the Web UI refuses oversized requests before buffering their body
+TEST_F(ConfigHttpTest, OversizedRequestIsRejectedBeforeBuffering) {
+  SimpleWeb::CaseInsensitiveMultimap headers = cover_upload_headers(port);
+  const std::string accepted_body(1024 * 1024, ' ');
+  EXPECT_EQ(client->request("POST", "/content-type-test", accepted_body, headers)->status_code, "200 OK");
+
+  boost::asio::io_context io;
+  boost::asio::ssl::context context {boost::asio::ssl::context::tls_client};
+  context.set_verify_mode(boost::asio::ssl::verify_none);
+  boost::asio::ssl::stream<boost::asio::ip::tcp::socket> stream {io, context};
+  boost::asio::ip::tcp::resolver resolver {io};
+  boost::asio::connect(stream.lowest_layer(), resolver.resolve("localhost", std::to_string(port)));
+  stream.handshake(boost::asio::ssl::stream_base::client);
+
+  const auto request = std::format(
+    "POST /api/covers/upload HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+    confighttp::MAX_REQUEST_SIZE + 1
+  );
+  boost::asio::write(stream, boost::asio::buffer(request));
+
+  // Only the headers were sent: the server must drop the connection instead of waiting for the body.
+  std::array<char, 1> byte {};
+  boost::system::error_code ec;
+  const auto read = stream.read_some(boost::asio::buffer(byte), ec);
+  EXPECT_EQ(read, 0);
+  EXPECT_TRUE(ec);
 }
