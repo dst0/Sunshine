@@ -328,6 +328,27 @@ namespace crypto {
        * @return Number of bytes written, signature bytes, or an error status depending on the overload.
        */
       int decrypt(const std::string_view &cipher, std::vector<std::uint8_t> &plaintext, aes_t *iv);
+
+      /**
+       * @brief Encrypt with additional authenticated data (AAD) that is authenticated but not encrypted.
+       * @param plaintext The plaintext data to be encrypted.
+       * @param tag The buffer where the 16-byte GCM tag will be written.
+       * @param ciphertext The buffer where the ciphertext (same length as the plaintext) will be written.
+       * @param iv The initialization vector to be used for the encryption.
+       * @param aad Additional authenticated data.
+       * @return The ciphertext length, or -1 in case of an error.
+       */
+      int encrypt(const std::string_view &plaintext, std::uint8_t *tag, std::uint8_t *ciphertext, aes_t *iv, const std::string_view &aad);
+
+      /**
+       * @brief Authenticate and decrypt `[tag][ciphertext]` with additional authenticated data (AAD).
+       * @param tagged_cipher GCM tag followed by the ciphertext; must be at least `tag_size` bytes.
+       * @param plaintext Receives the plaintext.
+       * @param iv The initialization vector used for the encryption.
+       * @param aad Additional authenticated data.
+       * @return 0 on success, or -1 when the input is too short or authentication fails.
+       */
+      int decrypt(const std::string_view &tagged_cipher, std::vector<std::uint8_t> &plaintext, aes_t *iv, const std::string_view &aad);
     };
 
     /**
