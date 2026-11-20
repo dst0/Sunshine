@@ -11,15 +11,19 @@
 #include <string>
 #include <thread>
 
+// local includes required before platform includes (Boost.Asio must include winsock2.h before windows.h)
+#include "src/sds/mic.h"
+
 // platform includes
+// clang-format off
+#include <windows.h>
 #include <Audioclient.h>
 #include <mmdeviceapi.h>
-#include <windows.h>
+// clang-format on
 
 // local includes
 #include "src/config.h"
 #include "src/logging.h"
-#include "src/sds/mic.h"
 #include "utf_utils.h"
 
 #ifndef AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM
