@@ -35,6 +35,7 @@
 #include <src/nvhttp.h>
 #include <src/process.h>
 #include <src/utility.h>
+#include <src/webui_auth.h>
 
 #ifdef SUNSHINE_BUILD_PORTAL
   #include <src/platform/linux/misc.h>
@@ -140,10 +141,12 @@ protected:
     saved_locale = config::sunshine.locale;
     saved_csrf_allowed_origins = config::sunshine.csrf_allowed_origins;
 
-    // Set up test credentials
+    // Set up test credentials (computed once: PBKDF2 at full strength is deliberately slow)
+    static const auto test_password_hash = webui_auth::hash_password("testpass");
     config::sunshine.username = "testuser";
-    config::sunshine.salt = "testsalt";
-    config::sunshine.password = util::hex(crypto::hash("testpass" + config::sunshine.salt)).to_string();
+    config::sunshine.salt.clear();
+    config::sunshine.password = test_password_hash;
+    webui_auth::reset_limiter_for_testing();
 
     // Set test locale
     config::sunshine.locale = "en";
@@ -386,6 +389,7 @@ protected:
     confighttp::reset_virtual_input_license_status_provider_for_testing();
     confighttp::reset_permission_statuses_for_testing();
     confighttp::reset_portal_token_path_provider_for_testing();
+    webui_auth::reset_limiter_for_testing();
 
     config::sunshine.username = saved_username;
     config::sunshine.password = saved_password;
@@ -2322,4 +2326,39 @@ TEST_F(ConfigHttpTest, PasswordEndpointChangesCredentialsWhenAuthenticated) {
   SimpleWeb::CaseInsensitiveMultimap new_auth;
   new_auth.emplace("Authorization", create_auth_header("newuser", "new passphrase"));
   EXPECT_EQ(client->request("GET", "/auth-test", "", new_auth)->status_code, "200 OK");
+}
+
+// Test: the Authorization header must use the Basic scheme
+TEST_F(ConfigHttpTest, AuthenticateRequiresBasicPrefix) {
+  SimpleWeb::CaseInsensitiveMultimap headers;
+  headers.emplace("Authorization", "Token " + SimpleWeb::Crypto::Base64::encode("testuser:testpass"));
+  EXPECT_EQ(client->request("GET", "/auth-test", "", headers)->status_code, "401 Unauthorized");
+
+  SimpleWeb::CaseInsensitiveMultimap raw;
+  raw.emplace("Authorization", SimpleWeb::Crypto::Base64::encode("xxxxxxtestuser:testpass"));
+  EXPECT_EQ(client->request("GET", "/auth-test", "", raw)->status_code, "401 Unauthorized");
+}
+
+// Test: repeated failures lock the source out with 429 and Retry-After, without checking the password
+TEST_F(ConfigHttpTest, RepeatedLoginFailuresLockOutTheSource) {
+  SimpleWeb::CaseInsensitiveMultimap wrong;
+  wrong.emplace("Authorization", create_auth_header("testuser", "wrongpass"));
+  for (int i = 0; i < 5; ++i) {
+    ASSERT_EQ(client->request("GET", "/auth-test", "", wrong)->status_code, "401 Unauthorized") << i;
+  }
+
+  const auto evaluations = webui_auth::password_evaluations_for_testing();
+  SimpleWeb::CaseInsensitiveMultimap right;
+  right.emplace("Authorization", create_auth_header("testuser", "testpass"));
+  const auto response = client->request("GET", "/auth-test", "", right);
+
+  ASSERT_EQ(response->status_code, "429 Too Many Requests");
+  const auto retry_after = response->header.find("Retry-After");
+  ASSERT_NE(retry_after, response->header.end());
+  const auto seconds = std::stoi(retry_after->second);
+  EXPECT_GT(seconds, 0);
+  EXPECT_LE(seconds, 15 * 60);
+  EXPECT_EQ(response->header.find("WWW-Authenticate"), response->header.end());
+  EXPECT_EQ(webui_auth::password_evaluations_for_testing(), evaluations);
+  EXPECT_NE(response->content.string().find("Too many failed login attempts"), std::string::npos);
 }

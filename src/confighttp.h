@@ -5,6 +5,7 @@
 #pragma once
 
 // standard includes
+#include <chrono>
 #include <filesystem>
 #include <functional>
 #include <memory>
@@ -40,6 +41,7 @@ namespace confighttp {
   void send_response(const resp_https_t &response, const nlohmann::json &output_tree);
   void send_unauthorized(const resp_https_t &response, const req_https_t &request);
   void send_redirect(const resp_https_t &response, const req_https_t &request, const char *path);
+  void send_too_many_requests(const resp_https_t &response, const req_https_t &request, std::chrono::seconds retry_after);
   bool authenticate(const resp_https_t &response, const req_https_t &request);
   void not_found(const resp_https_t &response, const std::string &error_message = "Not Found");
   void bad_request(const resp_https_t &response, const std::string &error_message = "Bad Request");

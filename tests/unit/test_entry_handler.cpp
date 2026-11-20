@@ -16,10 +16,9 @@
 
 // local includes
 #include <src/config.h>
-#include <src/crypto.h>
 #include <src/entry_handler.h>
 #include <src/httpcommon.h>
-#include <src/utility.h>
+#include <src/webui_auth.h>
 
 /**
  * @brief Test fixture that restores Web UI URL configuration after each test.
@@ -182,7 +181,7 @@ protected:
     if (http::reload_user_creds(file) != 0) {
       return false;
     }
-    return util::hex(crypto::hash(password + config::sunshine.salt)).to_string() == config::sunshine.password;
+    return webui_auth::verify_password(password, config::sunshine.password, config::sunshine.salt) != webui_auth::password_match_e::mismatch;
   }
 
   std::string file;  ///< Temporary credentials file.

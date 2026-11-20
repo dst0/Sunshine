@@ -6,6 +6,7 @@
 
 // standard includes
 #include <filesystem>
+#include <fstream>
 #include <utility>
 
 // lib includes
@@ -31,6 +32,7 @@
 #include "rtsp.h"
 #include "utility.h"
 #include "uuid.h"
+#include "webui_auth.h"
 
 namespace http {
   using namespace std::literals;
@@ -103,16 +105,30 @@ namespace http {
       }
     }
 
-    auto salt = crypto::rand_alphabet(16);
+    // The PBKDF2 hash carries its own salt and iteration count; the legacy salt field is kept
+    // (empty) so the file keeps the layout older code and tools expect.
     outputTree.put("username", username);
-    outputTree.put("salt", salt);
-    outputTree.put("password", util::hex(crypto::hash(password + salt)).to_string());
+    outputTree.put("salt", "");
     try {
+      outputTree.put("password", webui_auth::hash_password(password));
+
+      // The file holds the password hash: make it private to the user running Sunshine before the
+      // hash is written (writing truncates the file and keeps its permissions).
+      {
+        std::ofstream touch {file, std::ios::app};
+      }
+      std::error_code permissions_error;
+      fs::permissions(file, fs::perms::owner_read | fs::perms::owner_write, fs::perm_options::replace, permissions_error);
+      if (permissions_error) {
+        BOOST_LOG(warning) << "Couldn't restrict permissions of ["sv << file << "]: "sv << permissions_error.message();
+      }
+
       pt::write_json(file, outputTree);
     } catch (std::exception &e) {
       BOOST_LOG(error) << "error writing to the credentials file, perhaps try this again as an administrator? Details: "sv << e.what();
       return -1;
     }
+    webui_auth::clear_verification_cache();
 
     BOOST_LOG(info) << "New credentials have been created"sv;
     return 0;

@@ -62,6 +62,7 @@
 #include "system_tray.h"
 #include "utility.h"
 #include "uuid.h"
+#include "webui_auth.h"
 
 using namespace std::literals;
 
@@ -640,13 +641,42 @@ namespace confighttp {
   }
 
   /**
+   * @brief Send a 429 Too Many Requests response for a locked-out login.
+   * @param response The HTTP response object.
+   * @param request The HTTP request object.
+   * @param retry_after Remaining lockout, sent in the Retry-After header.
+   */
+  void send_too_many_requests(const resp_https_t &response, const req_https_t &request, const std::chrono::seconds retry_after) {
+    auto address = net::addr_to_normalized_string(request->remote_endpoint().address());
+    BOOST_LOG(warning) << "Web UI: ["sv << address << "] -- login refused while locked out ("sv << retry_after.count() << "s remaining)"sv;
+
+    constexpr auto code = SimpleWeb::StatusCode::client_error_too_many_requests;
+
+    nlohmann::json tree;
+    tree["status_code"] = code;
+    tree["status"] = false;
+    tree["error"] = "Too many failed login attempts";
+
+    // No WWW-Authenticate header: the browser must not prompt for credentials again while locked.
+    const SimpleWeb::CaseInsensitiveMultimap headers {
+      {"Content-Type", "application/json"},
+      {"Retry-After", std::to_string(retry_after.count())},
+      {"X-Frame-Options", "DENY"},
+      {"Content-Security-Policy", "frame-ancestors 'none';"}
+    };
+
+    response->write(code, tree.dump(), headers);
+  }
+
+  /**
    * @brief Authenticate the user.
    * @param response The HTTP response object.
    * @param request The HTTP request object.
    * @return True if the user is authenticated, false otherwise.
    */
   bool authenticate(const resp_https_t &response, const req_https_t &request) {
-    auto address = net::addr_to_normalized_string(request->remote_endpoint().address());
+    const auto remote = request->remote_endpoint().address();
+    auto address = net::addr_to_normalized_string(remote);
 
     if (const auto ip_type = net::from_address(address); ip_type > http::origin_web_ui_allowed) {
       BOOST_LOG(info) << "Web UI: ["sv << address << "] -- denied"sv;
@@ -654,38 +684,29 @@ namespace confighttp {
       return false;
     }
 
-    // If credentials are shown, redirect the user to a /welcome page
+    // Credentials are created before startup; if they are missing, show the instructions page.
     if (config::sunshine.username.empty()) {
       send_redirect(response, request, "/welcome");
       return false;
     }
 
-    auto fg = util::fail_guard([&]() {
-      send_unauthorized(response, request);
-    });
-
-    const auto auth = request->header.find("authorization");
-    if (auth == request->header.end()) {
-      return false;
+    std::optional<std::string_view> authorization;
+    if (const auto auth = request->header.find("authorization"); auth != request->header.end()) {
+      authorization = auth->second;
     }
 
-    const auto &rawAuth = auth->second;
-    auto authData = SimpleWeb::Crypto::Base64::decode(rawAuth.substr("Basic "sv.length()));
-
-    const auto index = static_cast<int>(authData.find(':'));
-    if (index >= authData.size() - 1) {
-      return false;
+    switch (const auto result = webui_auth::authenticate(authorization, remote); result.outcome) {
+      case webui_auth::outcome_e::authenticated:
+        return true;
+      case webui_auth::outcome_e::locked_out:
+        send_too_many_requests(response, request, result.retry_after);
+        return false;
+      case webui_auth::outcome_e::missing:
+      case webui_auth::outcome_e::rejected:
+      default:
+        send_unauthorized(response, request);
+        return false;
     }
-
-    const auto username = authData.substr(0, index);
-    const auto password = authData.substr(index + 1);
-
-    if (const auto hash = util::hex(crypto::hash(password + config::sunshine.salt)).to_string(); !boost::iequals(username, config::sunshine.username) || hash != config::sunshine.password) {
-      return false;
-    }
-
-    fg.disable();
-    return true;
   }
 
   /**
@@ -1864,13 +1885,16 @@ namespace confighttp {
       if (newUsername.empty()) {
         errors.emplace_back("Invalid Username");
       } else {
-        auto hash = util::hex(crypto::hash(password + config::sunshine.salt)).to_string();
-        if (!config::sunshine.username.empty() && boost::iequals(username, config::sunshine.username) && hash == config::sunshine.password) {
+        const bool current_valid = !config::sunshine.username.empty() &&
+                                   webui_auth::constant_time_equals(boost::to_lower_copy(username), boost::to_lower_copy(config::sunshine.username)) &&
+                                   webui_auth::verify_password(password, config::sunshine.password, config::sunshine.salt) != webui_auth::password_match_e::mismatch;
+        if (current_valid) {
           if (newPassword.empty() || newPassword != confirmPassword) {
             errors.emplace_back("Password Mismatch");
+          } else if (http::save_user_creds(config::sunshine.credentials_file, newUsername, newPassword) != 0 || http::reload_user_creds(config::sunshine.credentials_file) != 0) {
+            errors.emplace_back("Failed to save the new credentials");
           } else {
-            http::save_user_creds(config::sunshine.credentials_file, newUsername, newPassword);
-            http::reload_user_creds(config::sunshine.credentials_file);
+            webui_auth::clear_verification_cache();
             output_tree["status"] = true;
           }
         } else {
