@@ -87,6 +87,26 @@ const config = ref(props.config)
       </template>
     </PlatformLayout>
 
+    <!-- Microphone Passthrough (secure-desktop-stream) -->
+    <Checkbox class="mb-3"
+              id="mic_passthrough"
+              locale-prefix="config"
+              v-model="config.mic_passthrough"
+              default="true"
+    ></Checkbox>
+
+    <PlatformLayout :platform="platform">
+      <template #windows>
+        <!-- Microphone Device -->
+        <div class="mb-3">
+          <label for="mic_device" class="form-label">{{ $t('config.mic_device') }}</label>
+          <input type="text" class="form-control" id="mic_device" placeholder="CABLE Input"
+                 v-model="config.mic_device" />
+          <div class="form-text">{{ $t('config.mic_device_desc') }}</div>
+        </div>
+      </template>
+    </PlatformLayout>
+
     <AdapterNameSelector
         :platform="platform"
         :config="config"

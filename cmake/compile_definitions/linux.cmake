@@ -272,6 +272,10 @@ if(PIPEWIRE_FOUND)
     list(APPEND PLATFORM_LIBRARIES ${PIPEWIRE_LIBRARIES})
     list(APPEND PLATFORM_TARGET_FILES
             "${CMAKE_SOURCE_DIR}/src/platform/linux/pipewire.cpp")
+    # secure-desktop-stream: PipeWire virtual microphone
+    add_compile_definitions(SUNSHINE_MIC_PIPEWIRE)
+    list(APPEND PLATFORM_TARGET_FILES
+            "${CMAKE_SOURCE_DIR}/src/platform/linux/mic_pipewire.cpp")
 endif()
 
 # XDG portal
@@ -330,7 +334,9 @@ list(APPEND PLATFORM_TARGET_FILES
         "${CMAKE_SOURCE_DIR}/src/platform/linux/graphics.cpp"
         "${CMAKE_SOURCE_DIR}/src/platform/linux/misc.h"
         "${CMAKE_SOURCE_DIR}/src/platform/linux/misc.cpp"
-        "${CMAKE_SOURCE_DIR}/src/platform/linux/audio.cpp")
+        "${CMAKE_SOURCE_DIR}/src/platform/linux/audio.cpp"
+        "${CMAKE_SOURCE_DIR}/src/platform/linux/mic_linux.cpp"
+        "${CMAKE_SOURCE_DIR}/src/platform/linux/mic_sinks.h")
 
 list(APPEND PLATFORM_LIBRARIES
         dl

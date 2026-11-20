@@ -29,6 +29,7 @@
 #include "network.h"
 #include "platform/common.h"
 #include "process.h"
+#include "sds/mic.h"
 #include "stream.h"
 #include "sync.h"
 #include "system_tray.h"
@@ -562,6 +563,9 @@ namespace stream {
 
     std::uint32_t launch_session_id;  ///< RTSP launch-session ID associated with this stream.
     std::string client_cert;  ///< PEM certificate for the paired client owning the stream.
+
+    std::optional<sds::mic::session_config_t> mic_config;  ///< Microphone parameters when the client set up the mic stream.
+    sds::mic::session_handle_t mic;  ///< Running microphone passthrough, stopped with the stream.
     std::string input_session_id;  ///< Stable client identity used to retain input devices across resume.
 
     safe::mail_raw_t::event_t<bool> shutdown_event;  ///< Event raised when the stream should shut down.
@@ -2312,6 +2316,8 @@ namespace stream {
       session.audioThread.join();
       BOOST_LOG(debug) << "Waiting for control to end..."sv;
       session.controlEnd.view();
+      BOOST_LOG(debug) << "Stopping microphone..."sv;
+      session.mic.reset();
       // Reset input on session stop to avoid stuck repeated keys
       BOOST_LOG(debug) << "Resetting Input..."sv;
       input::reset(session.input);
@@ -2370,6 +2376,20 @@ namespace stream {
 
       session.audioThread = std::jthread {audioThread, &session};
       session.videoThread = std::jthread {videoThread, &session};
+
+      // secure-desktop-stream microphone passthrough: optional, never fails the stream
+      if (session.mic_config) {
+        auto mic_config = std::move(*session.mic_config);
+        session.mic_config.reset();
+        mic_config.expected_address = net::normalize_address(addr);
+        mic_config.stream_running = [state = &session.state]() {
+          return state->load(std::memory_order_relaxed) == state_e::RUNNING;
+        };
+        session.mic = sds::mic::session_handle_t {sds::mic::start_session(std::move(mic_config))};
+        if (!session.mic.get()) {
+          BOOST_LOG(warning) << "Microphone passthrough requested but unavailable for this stream"sv;
+        }
+      }
 
       session.state.store(state_e::RUNNING, std::memory_order_relaxed);
 
@@ -2452,6 +2472,14 @@ namespace stream {
       session->audio.avRiKeyId = util::endian::big(*(std::uint32_t *) launch_session.iv.data());
       session->audio.sequenceNumber = 0;
       session->audio.timestamp = 0;
+
+      if (launch_session.mic_requested) {
+        sds::mic::session_config_t mic_config;
+        mic_config.key = launch_session.gcm_key;
+        mic_config.ping_payload = launch_session.mic_ping_payload;
+        mic_config.client_cert = launch_session.client_cert;
+        session->mic_config = std::move(mic_config);
+      }
 
       session->control.peer = nullptr;
       session->state.store(state_e::STOPPED, std::memory_order_relaxed);

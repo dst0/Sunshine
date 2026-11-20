@@ -99,6 +99,10 @@ namespace rtsp_stream {
     std::string rtsp_url_scheme;  ///< URL scheme selected by the RTSP SETUP flow.
     uint32_t rtsp_iv_counter;  ///< Counter value mixed into encrypted RTSP IVs.
     std::string client_cert;  ///< PEM certificate for the paired Moonlight client.
+
+    // secure-desktop-stream microphone passthrough (set by RTSP SETUP streamid=mic)
+    bool mic_requested = false;  ///< Whether the client completed SETUP for the microphone stream.
+    std::string mic_ping_payload;  ///< Ping payload that binds the client's microphone UDP endpoint.
   };
 
   /**

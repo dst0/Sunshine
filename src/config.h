@@ -244,6 +244,16 @@ namespace config {
     bool external_audio;  ///< Windows capture-only mode; an external router owns endpoint defaults and formats.
   };
 
+  // secure-desktop-stream microphone passthrough (DESIGN.md section 7).
+  // SDS-MERGE: if the host-core sds config block also defines mic_passthrough, keep one definition.
+  /**
+   * @brief Microphone passthrough settings.
+   */
+  struct sds_mic_t {
+    bool passthrough;  ///< `mic_passthrough`: accept microphone audio from permitted clients.
+    std::string device;  ///< `mic_device`: Windows render endpoint (name substring or ID) feeding the virtual microphone.
+  };
+
   /**
    * @brief Encryption policy that always sends unencrypted video.
    */
@@ -412,6 +422,7 @@ namespace config {
 
   extern video_t video;
   extern audio_t audio;
+  extern sds_mic_t sds_mic;  ///< Microphone passthrough settings.
   extern stream_t stream;
   extern nvhttp_t nvhttp;
   extern input_t input;

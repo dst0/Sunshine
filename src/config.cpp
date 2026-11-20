@@ -807,6 +807,14 @@ namespace config {
   };
 
   /**
+   * @brief Default microphone passthrough settings.
+   */
+  sds_mic_t sds_mic {
+    true,  // mic_passthrough
+    {},  // mic_device
+  };
+
+  /**
    * @brief Default stream configuration values used before file and CLI overrides.
    */
   stream_t stream {
@@ -1811,6 +1819,8 @@ namespace config {
     bool_f(vars, "stream_audio", audio.stream);
     bool_f(vars, "install_steam_audio_drivers", audio.install_steam_drivers);
     bool_f(vars, "external_audio", audio.external_audio);
+    bool_f(vars, "mic_passthrough", sds_mic.passthrough);
+    string_f(vars, "mic_device", sds_mic.device);
 
     string_restricted_f(vars, "origin_web_ui_allowed", nvhttp.origin_web_ui_allowed, {"pc"sv, "lan"sv, "wan"sv});
 

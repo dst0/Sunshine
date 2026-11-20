@@ -973,6 +973,64 @@ consent prompt for directory ACLs, so the Web UI shows setup steps for correctin
     </tr>
 </table>
 
+### mic_passthrough
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            Accept microphone audio from Moonlight clients that hold the `mic` permission and play it into a
+            virtual microphone on the host while they stream. The audio arrives on UDP port base + 13 (48002
+            by default), encrypted and authenticated with the session key.
+            <br>
+            <br>
+            **Linux:** a PipeWire source named "Moonlight Microphone" (`sunshine-mic`) is created for the
+            duration of the stream; on PulseAudio-only systems a null sink and a remapped source with the same
+            name are loaded instead.
+            <br>
+            **Windows:** audio is played into a virtual audio cable whose capture side applications use as a
+            microphone (see [mic_device](#mic_device)). Sunshine does not install a driver.
+            @note{The feature is only offered to a client when a virtual microphone can be created.}
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}
+            enabled
+            @endcode</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            mic_passthrough = disabled
+            @endcode</td>
+    </tr>
+</table>
+
+### mic_device
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            The playback (render) device that feeds the virtual microphone, as a case-insensitive substring of its
+            name or its endpoint ID. When empty, Sunshine uses "CABLE Input" (VB-CABLE, www.vb-cable.com) or a
+            "Steam Streaming Microphone" playback device if present.
+            @note{This option is only supported on Windows.}
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">n/a</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            mic_device = CABLE Input
+            @endcode</td>
+    </tr>
+</table>
+
 ### adapter_name
 
 <table>

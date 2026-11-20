@@ -43,6 +43,8 @@
       "stream_audio": "enabled",
       "install_steam_audio_drivers": "enabled",
       "external_audio": "disabled",
+      "mic_passthrough": "enabled",
+      "mic_device": "",
       "adapter_name": "",
       "output_name": "",
       "dd_configuration_option": "disabled",
