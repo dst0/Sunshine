@@ -477,7 +477,7 @@ fi
 
 %files
 # Executables
-%caps(cap_sys_admin,cap_sys_nice+p) %{_bindir}/sunshine
+%{_bindir}/sunshine
 
 # Systemd unit files for user services
 %{_userunitdir}/*.service

@@ -535,6 +535,16 @@ overflow menu. Different versions of Windows may provide slightly different step
 ## Initial Setup
 After installation, some initial setup is required.
 
+### Web UI credentials
+Sunshine does not start until Web UI credentials exist, and they cannot be created from the browser. Create them on
+the host, as the user that runs Sunshine:
+
+```bash
+sunshine --creds <username>
+```
+
+The password is prompted for without being echoed. See [Hardening](hardening.md) for the other security defaults.
+
 ### FreeBSD
 
 #### Virtual Input Devices
@@ -689,14 +699,15 @@ on how to set up a headless streaming server without autologin and dummy plugs (
 ### Configuration
 
 Sunshine is configured via the web ui, which is available on [https://localhost:47990](https://localhost:47990)
-by default. You may replace *localhost* with your internal ip address.
+by default. Only the host itself may connect (`origin_web_ui_allowed = pc`); from another machine, use an SSH tunnel:
+`ssh -L 47990:127.0.0.1:47990 <user>@<host>`, then open https://localhost:47990.
 
 > [!NOTE]
 > Ignore any warning given by your browser about "insecure website". This is due to the SSL certificate
 > being self-signed.
 
 > [!CAUTION]
-> If running for the first time, make sure to note the username and password that you created.
+> Log in with the username and password you created with `sunshine --creds`.
 
 1. Change the web-ui to your desired theme, using the dropdown menu in the navbar.
    ![Theme Selection](images/split-themes.png)

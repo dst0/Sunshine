@@ -18,21 +18,8 @@ if [ -f "$packaged_modules_file" ]; then
   install -Dm644 "$packaged_modules_file" /etc/modules-load.d/60-sunshine.conf
 fi
 
-# Ensure Sunshine can grab images from KMS
-path_to_setcap=$(which setcap)
-if [ -x "$script_dir/sunshine" ]; then
-  path_to_sunshine=$(readlink -f "$script_dir/sunshine")
-else
-  path_to_sunshine=$(readlink -f "$(which sunshine)")
-fi
-if [ -x "$path_to_setcap" ] ; then
-  echo "Setting CAP_SYS_ADMIN, CAP_SYS_NICE capabilities on Sunshine binary."
-  echo "$path_to_setcap cap_sys_admin,cap_sys_nice+p $path_to_sunshine"
-  $path_to_setcap cap_sys_admin,cap_sys_nice+p "$path_to_sunshine"
-  echo "CAP_SYS_ADMIN, CAP_SYS_NICE capabilities set on Sunshine binary."
-else
-  echo "error: setcap not found or not executable."
-fi
+# No file capabilities are granted to the Sunshine binary (see docs/hardening.md):
+# KMS capture, which needs CAP_SYS_ADMIN, is therefore unavailable; use portal or X11 capture.
 
 # Reload the rules and reapply them to both virtual device factories and any
 # gamepad child nodes that already exist.

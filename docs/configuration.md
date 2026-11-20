@@ -2346,7 +2346,8 @@ consent prompt for directory ACLs, so the Web UI shows setup steps for correctin
     </tr>
     <tr>
         <td>kms</td>
-        <td>DRM/KMS screen capture from the kernel. This requires that Sunshine has `cap_sys_admin` capability.
+        <td>DRM/KMS screen capture from the kernel. This requires that Sunshine has `cap_sys_admin` capability,
+            which the packages do not grant (see [Hardening](hardening.md#no-file-capabilities)).
             @note{Applies to Linux only.}</td>
     </tr>
     <tr>
