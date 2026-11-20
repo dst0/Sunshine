@@ -777,11 +777,9 @@
     "up": "Up"
   },
   "welcome": {
-    "confirm_password": "Confirm password",
-    "create_creds": "Before Getting Started, we need you to make a new username and password for accessing the Web UI.",
-    "create_creds_alert": "The credentials below are needed to access Sunshine's Web UI. Keep them safe, since you will never see them again!",
+    "create_creds_cli": "Web UI credentials can only be created on the host itself. Run this command as the user that runs Sunshine; it asks for the password without showing it:",
+    "create_creds_restart": "Then restart Sunshine and reload this page. Your browser will ask for the new credentials.",
     "greeting": "Welcome to Sunshine!",
-    "login": "Login",
-    "welcome_success": "This page will reload soon, your browser will ask you for the new credentials"
+    "no_creds": "No Web UI credentials are configured, so the Web UI is locked."
   }
 }

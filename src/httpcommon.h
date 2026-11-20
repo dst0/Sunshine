@@ -35,6 +35,16 @@ namespace http {
   );
 
   /**
+   * @brief Load the Web UI credentials and refuse to continue without them.
+   * @details There is no unauthenticated first-run setup: credentials must be created with
+   *          `sunshine --creds <username>` before Sunshine starts.
+   *
+   * @param file Credentials file path.
+   * @return 0 when credentials were loaded; -1 (after logging how to create them) otherwise.
+   */
+  int require_user_creds(const std::string &file);
+
+  /**
    * @brief Reload Web UI user credentials from disk.
    *
    * @param file Destination path for the downloaded content.

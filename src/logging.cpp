@@ -270,9 +270,10 @@ namespace logging {
       << std::endl
       << "    Note: The configuration will be created if it doesn't exist."sv << std::endl
       << std::endl
-      << "    --help                    | print help"sv << std::endl
-      << "    --creds username password | set user credentials for the Web manager"sv << std::endl
-      << "    --version                 | print the version of sunshine"sv << std::endl
+      << "    --help                     | print help"sv << std::endl
+      << "    --creds username [password] | set user credentials for the Web manager"sv << std::endl
+      << "                               | without a password: prompt on the terminal, or read one line from stdin"sv << std::endl
+      << "    --version                  | print the version of sunshine"sv << std::endl
       << std::endl
       << "    flags"sv << std::endl
       << "        -0 | Read PIN from stdin"sv << std::endl

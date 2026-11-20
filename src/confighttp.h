@@ -201,6 +201,10 @@ namespace confighttp {
    */
   void saveApp(const resp_https_t &response, const req_https_t &request);
 
+  void savePassword(const resp_https_t &response, const req_https_t &request);
+
+  void uploadCover(const resp_https_t &response, const req_https_t &request);
+
 #ifdef SUNSHINE_TESTS
   /**
    * @brief Replace native permission statuses for deterministic HTTP tests.

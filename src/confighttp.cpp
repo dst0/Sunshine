@@ -1832,7 +1832,9 @@ namespace confighttp {
     if (!check_content_type(response, request, "application/json")) {
       return;
     }
-    if (!config::sunshine.username.empty() && !authenticate(response, request)) {
+    // Changing credentials always requires the current ones: there is no unauthenticated
+    // first-run setup (credentials are created with `sunshine --creds` before startup).
+    if (!authenticate(response, request)) {
       return;
     }
 
@@ -1863,7 +1865,7 @@ namespace confighttp {
         errors.emplace_back("Invalid Username");
       } else {
         auto hash = util::hex(crypto::hash(password + config::sunshine.salt)).to_string();
-        if (config::sunshine.username.empty() || (boost::iequals(username, config::sunshine.username) && hash == config::sunshine.password)) {
+        if (!config::sunshine.username.empty() && boost::iequals(username, config::sunshine.username) && hash == config::sunshine.password) {
           if (newPassword.empty() || newPassword != confirmPassword) {
             errors.emplace_back("Password Mismatch");
           } else {

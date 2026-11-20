@@ -108,6 +108,7 @@ protected:
   std::string saved_username;
   std::string saved_password;
   std::string saved_salt;
+  std::string saved_credentials_file;
   std::string saved_locale;
   std::vector<std::string> saved_csrf_allowed_origins;
   std::filesystem::path test_web_dir;
@@ -135,6 +136,7 @@ protected:
     saved_username = config::sunshine.username;
     saved_password = config::sunshine.password;
     saved_salt = config::sunshine.salt;
+    saved_credentials_file = config::sunshine.credentials_file;
     saved_locale = config::sunshine.locale;
     saved_csrf_allowed_origins = config::sunshine.csrf_allowed_origins;
 
@@ -157,6 +159,7 @@ protected:
     // Create test web directory in temp
     test_web_dir = std::filesystem::temp_directory_path() / "sunshine_test_confighttp";  // NOSONAR(cpp:S5443): safe for tests
     std::filesystem::create_directories(test_web_dir / "web");
+    config::sunshine.credentials_file = (test_web_dir / "credentials.json").string();
     confighttp::set_portal_token_path_provider_for_testing([this]() {
       return test_web_dir / "portal_token";
     });
@@ -345,6 +348,8 @@ protected:
     server->resource["^/pairing-test$"]["POST"] = confighttp::savePin;
     server->resource["^/portal-token-reset-test$"]["POST"] = confighttp::resetPortalToken;
     server->resource["^/api/apps$"]["POST"] = confighttp::saveApp;
+    server->resource["^/api/password$"]["POST"] = confighttp::savePassword;
+    server->resource["^/api/covers/upload$"]["POST"] = confighttp::uploadCover;
     server->default_resource["GET"] = confighttp::getFallbackPage;
 
     // Start server
@@ -385,6 +390,7 @@ protected:
     config::sunshine.username = saved_username;
     config::sunshine.password = saved_password;
     config::sunshine.salt = saved_salt;
+    config::sunshine.credentials_file = saved_credentials_file;
     config::sunshine.locale = saved_locale;
     config::sunshine.csrf_allowed_origins = saved_csrf_allowed_origins;
     nvhttp::expire_pair_sessions(std::chrono::steady_clock::time_point::max());
@@ -2247,4 +2253,73 @@ TEST_F(ConfigHttpTest, SaveAppOmitsNullOptionalFieldsAndPreservesConfiguredValue
     EXPECT_FALSE(app.at("prep-cmd").at(0).contains("undo"));
     EXPECT_FALSE(app.at("prep-cmd").at(0).contains("elevated"));
   }
+}
+
+/**
+ * @brief Build JSON headers for a same-origin browser request.
+ *
+ * @param port Test server port used in the Origin header.
+ * @return Headers with Content-Type and a same-origin Origin.
+ */
+static SimpleWeb::CaseInsensitiveMultimap same_origin_json_headers(const unsigned short port) {
+  SimpleWeb::CaseInsensitiveMultimap headers;
+  headers.emplace("Content-Type", "application/json");
+  headers.emplace("Origin", std::format("https://localhost:{}", port));
+  return headers;
+}
+
+// Test: without configured credentials, POST /api/password cannot be used to claim the account
+TEST_F(ConfigHttpTest, PasswordEndpointCannotCreateFirstCredentials) {
+  config::sunshine.username.clear();
+  config::sunshine.password.clear();
+  config::sunshine.salt.clear();
+
+  const nlohmann::json body {{"newUsername", "attacker"}, {"newPassword", "owned"}, {"confirmNewPassword", "owned"}};
+  const auto response = client->request("POST", "/api/password", body.dump(), same_origin_json_headers(port));
+
+  EXPECT_NE(response->status_code.substr(0, 3), "200");
+  EXPECT_FALSE(std::filesystem::exists(config::sunshine.credentials_file));
+  EXPECT_TRUE(config::sunshine.username.empty());
+}
+
+// Test: POST /api/password requires valid current credentials
+TEST_F(ConfigHttpTest, PasswordEndpointRequiresAuthentication) {
+  const nlohmann::json body {
+    {"currentUsername", "testuser"},
+    {"currentPassword", "testpass"},
+    {"newUsername", "attacker"},
+    {"newPassword", "owned"},
+    {"confirmNewPassword", "owned"}
+  };
+  const auto response = client->request("POST", "/api/password", body.dump(), same_origin_json_headers(port));
+
+  EXPECT_EQ(response->status_code, "401 Unauthorized");
+  EXPECT_FALSE(std::filesystem::exists(config::sunshine.credentials_file));
+  EXPECT_EQ(config::sunshine.username, "testuser");
+}
+
+// Test: an authenticated user can change the credentials
+TEST_F(ConfigHttpTest, PasswordEndpointChangesCredentialsWhenAuthenticated) {
+  auto headers = same_origin_json_headers(port);
+  headers.emplace("Authorization", create_auth_header("testuser", "testpass"));
+  const nlohmann::json body {
+    {"currentUsername", "testuser"},
+    {"currentPassword", "testpass"},
+    {"newUsername", "newuser"},
+    {"newPassword", "new passphrase"},
+    {"confirmNewPassword", "new passphrase"}
+  };
+  const auto response = client->request("POST", "/api/password", body.dump(), headers);
+
+  ASSERT_EQ(response->status_code, "200 OK") << response->content.string();
+  EXPECT_TRUE(std::filesystem::exists(config::sunshine.credentials_file));
+  EXPECT_EQ(config::sunshine.username, "newuser");
+
+  SimpleWeb::CaseInsensitiveMultimap old_auth;
+  old_auth.emplace("Authorization", create_auth_header("testuser", "testpass"));
+  EXPECT_EQ(client->request("GET", "/auth-test", "", old_auth)->status_code, "401 Unauthorized");
+
+  SimpleWeb::CaseInsensitiveMultimap new_auth;
+  new_auth.emplace("Authorization", create_auth_header("newuser", "new passphrase"));
+  EXPECT_EQ(client->request("GET", "/auth-test", "", new_auth)->status_code, "200 OK");
 }

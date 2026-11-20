@@ -7,6 +7,7 @@
 // standard includes
 #include <atomic>
 #include <functional>
+#include <istream>
 #include <memory>
 #include <optional>
 #include <string>
@@ -58,16 +59,37 @@ std::unique_ptr<platf::deinit_t> start_mdns_publisher(bool enabled);
 namespace args {
   /**
    * @brief Reset the user credentials.
+   * @details When the password argument is omitted, it is read from the terminal without echo
+   *          (and confirmed), or from the first line of standard input when it is not a terminal.
    * @param name The name of the program.
    * @param argc The number of arguments.
    * @param argv The arguments.
    * @examples
+   * creds("sunshine", 1, {"new_username"});
    * creds("sunshine", 2, {"new_username", "new_password"});
    * @examples_end
    *
-   * @return Process exit code from updating the stored credentials.
+   * @return Process exit code from updating the stored credentials (0 on success).
    */
   int creds(const char *name, int argc, char *argv[]);
+
+  /**
+   * @brief Reset the user credentials, reading an omitted password from the given stream.
+   * @param name The name of the program.
+   * @param argc The number of arguments.
+   * @param argv The arguments.
+   * @param input Stream the password is read from when it is not passed as an argument.
+   * @param interactive Whether `input` is a terminal: prompt, disable echo and ask for confirmation.
+   * @return Process exit code from updating the stored credentials (0 on success).
+   */
+  int creds(const char *name, int argc, char *argv[], std::istream &input, bool interactive);
+
+  /**
+   * @brief Read one password line from a stream.
+   * @param input Stream to read from.
+   * @return The line without its trailing line ending, or no value at end of input.
+   */
+  std::optional<std::string> read_password_line(std::istream &input);
 
   /**
    * @brief Print help to stdout, then exit.

@@ -63,15 +63,23 @@ namespace http {
       config::nvhttp.pkey = (dir / ("pkey-"s + unique_id)).string();
     }
 
+    if (require_user_creds(config::sunshine.credentials_file)) {
+      return -1;
+    }
     if ((!fs::exists(config::nvhttp.pkey) || !fs::exists(config::nvhttp.cert)) && create_creds(config::nvhttp.pkey, config::nvhttp.cert)) {
       return -1;
     }
-    if (!user_creds_exist(config::sunshine.credentials_file)) {
-      BOOST_LOG(info) << "Open the Web UI to set your new username and password and getting started";
-    } else if (reload_user_creds(config::sunshine.credentials_file)) {
-      return -1;
-    }
     return 0;
+  }
+
+  int require_user_creds(const std::string &file) {
+    if (user_creds_exist(file) && reload_user_creds(file) == 0 && !config::sunshine.username.empty() && !config::sunshine.password.empty()) {
+      return 0;
+    }
+
+    BOOST_LOG(fatal) << "No Web UI credentials are configured in ["sv << file << "]. Sunshine will not start without them."sv;
+    BOOST_LOG(fatal) << "Create them first by running: sunshine --creds <username>  (the password is prompted for)"sv;
+    return -1;
   }
 
   /**
