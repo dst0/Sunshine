@@ -27,6 +27,14 @@ const effectivePort = computed(() => Number(config.value?.port ?? defaultMoonlig
               default="false"
     ></Checkbox>
 
+    <!-- mDNS advertising -->
+    <Checkbox class="mb-3"
+              id="mdns_advertise"
+              locale-prefix="config"
+              v-model="config.mdns_advertise"
+              default="false"
+    ></Checkbox>
+
     <!-- Address family -->
     <div class="mb-3">
       <label for="address_family" class="form-label">{{ $t('config.address_family') }}</label>
@@ -142,7 +150,7 @@ const effectivePort = computed(() => Number(config.value?.port ?? defaultMoonlig
     <div class="mb-3">
       <label for="lan_encryption_mode" class="form-label">{{ $t('config.lan_encryption_mode') }}</label>
       <select id="lan_encryption_mode" class="form-select" v-model="config.lan_encryption_mode">
-        <option value="0">{{ $t('_common.disabled_def') }}</option>
+        <option value="0">{{ $t('_common.disabled') }}</option>
         <option value="1">{{ $t('config.lan_encryption_mode_1') }}</option>
         <option value="2">{{ $t('config.lan_encryption_mode_2') }}</option>
       </select>

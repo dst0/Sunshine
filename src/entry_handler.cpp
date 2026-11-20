@@ -38,6 +38,20 @@ void launch_ui(const std::optional<std::string> &path) {
   platf::open_url(get_launch_ui_url(path));
 }
 
+std::unique_ptr<platf::deinit_t> start_mdns_publisher(const bool enabled, const std::function<std::unique_ptr<platf::deinit_t>()> &start_publisher) {
+  if (!enabled) {
+    BOOST_LOG(info) << "mDNS advertising is disabled (mdns_advertise = disabled)"sv;
+    return nullptr;
+  }
+  return start_publisher();
+}
+
+std::unique_ptr<platf::deinit_t> start_mdns_publisher(const bool enabled) {
+  return start_mdns_publisher(enabled, []() {
+    return platf::publish::start();
+  });
+}
+
 namespace args {
   int creds(const char *name, int argc, char *argv[]) {
     if (argc < 2 || argv[0] == "help"sv || argv[1] == "help"sv) {

@@ -6,6 +6,8 @@
 
 // standard includes
 #include <atomic>
+#include <functional>
+#include <memory>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -13,6 +15,10 @@
 // local includes
 #include "thread_pool.h"
 #include "thread_safe.h"
+
+namespace platf {
+  class deinit_t;
+}  // namespace platf
 
 /**
  * @brief Build the URL used to launch the Web UI.
@@ -30,6 +36,21 @@ std::string get_launch_ui_url(const std::optional<std::string> &path = std::null
  * @param path Optional path to append to the base URL.
  */
 void launch_ui(const std::optional<std::string> &path = std::nullopt);
+
+/**
+ * @brief Start mDNS service advertising only when it is enabled.
+ * @param enabled Whether the `mdns_advertise` option is enabled.
+ * @param start_publisher Function that starts the platform mDNS publisher.
+ * @return Publisher lifetime guard, or `nullptr` when advertising is disabled or failed to start.
+ */
+std::unique_ptr<platf::deinit_t> start_mdns_publisher(bool enabled, const std::function<std::unique_ptr<platf::deinit_t>()> &start_publisher);
+
+/**
+ * @brief Start the platform mDNS publisher only when it is enabled.
+ * @param enabled Whether the `mdns_advertise` option is enabled.
+ * @return Publisher lifetime guard, or `nullptr` when advertising is disabled or failed to start.
+ */
+std::unique_ptr<platf::deinit_t> start_mdns_publisher(bool enabled);
 
 /**
  * @brief Functions for handling command line arguments.

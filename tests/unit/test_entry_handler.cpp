@@ -7,7 +7,11 @@
 #include "../tests_common.h"
 #include "../tests_log_checker.h"
 
+// standard includes
+#include <memory>
+
 // local includes
+#include <src/config.h>
 #include <src/entry_handler.h>
 
 /**
@@ -69,4 +73,51 @@ TEST(EntryHandlerTests, LogPublisherDataTest) {
   ASSERT_TRUE(log_checker::line_starts_with("test_sunshine.log", "Info: Package Publisher: "));
   ASSERT_TRUE(log_checker::line_starts_with("test_sunshine.log", "Info: Publisher Website: "));
   ASSERT_TRUE(log_checker::line_starts_with("test_sunshine.log", "Info: Get support: "));
+}
+
+namespace {
+  /**
+   * @brief Create a publisher factory that counts how often it is invoked.
+   *
+   * @param calls Counter incremented on each invocation.
+   * @return Factory returning a dummy publisher guard.
+   */
+  std::function<std::unique_ptr<platf::deinit_t>()> counting_publisher(int &calls) {
+    return [&calls]() {
+      ++calls;
+      return std::make_unique<platf::deinit_t>();
+    };
+  }
+}  // namespace
+
+/**
+ * @brief Disabled mDNS advertising never starts the platform publisher.
+ */
+TEST(MdnsPublisherTest, DisabledAdvertisingNeverStartsThePublisher) {
+  int calls = 0;
+  const auto guard = start_mdns_publisher(false, counting_publisher(calls));
+  EXPECT_EQ(calls, 0);
+  EXPECT_EQ(guard, nullptr);
+  EXPECT_TRUE(log_checker::line_contains("test_sunshine.log", "mDNS advertising is disabled"));
+}
+
+/**
+ * @brief Enabled mDNS advertising starts the publisher exactly once and keeps its guard.
+ */
+TEST(MdnsPublisherTest, EnabledAdvertisingStartsThePublisherOnce) {
+  int calls = 0;
+  const auto guard = start_mdns_publisher(true, counting_publisher(calls));
+  EXPECT_EQ(calls, 1);
+  EXPECT_NE(guard, nullptr);
+}
+
+/**
+ * @brief The default configuration does not advertise the host.
+ */
+TEST(MdnsPublisherTest, DefaultConfigurationDoesNotAdvertise) {
+  int calls = 0;
+  const auto guard = start_mdns_publisher(config::sunshine.mdns_advertise, counting_publisher(calls));
+  EXPECT_FALSE(config::sunshine.mdns_advertise);
+  EXPECT_EQ(calls, 0);
+  EXPECT_EQ(guard, nullptr);
 }
