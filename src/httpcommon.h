@@ -4,9 +4,6 @@
  */
 #pragma once
 
-// lib includes
-#include <curl/curl.h>
-
 // local includes
 #include "network.h"
 #include "thread_safe.h"
@@ -47,33 +44,10 @@ namespace http {
   /**
    * @brief Reload Web UI user credentials from disk.
    *
-   * @param file Destination path for the downloaded content.
+   * @param file Credentials file path.
    * @return 0 when credentials reload successfully; nonzero on failure.
    */
   int reload_user_creds(const std::string &file);
-  /**
-   * @brief Download a URL to a local file using libcurl.
-   *
-   * @param url URL used for the HTTP request.
-   * @param file Destination path for the downloaded content.
-   * @param ssl_version libcurl TLS version selector for the request.
-   * @return True when the file is downloaded successfully.
-   */
-  bool download_file(const std::string &url, const std::string &file, long ssl_version = CURL_SSLVERSION_TLSv1_2);
-  /**
-   * @brief Percent-encode a string for safe inclusion in a URL.
-   *
-   * @param url URL used for the HTTP request.
-   * @return Percent-encoded URL component.
-   */
-  std::string url_escape(const std::string &url);
-  /**
-   * @brief Extract the host component from a URL.
-   *
-   * @param url URL used for the HTTP request.
-   * @return Host name parsed from the URL, or an empty string when none is present.
-   */
-  std::string url_get_host(const std::string &url);
 
   extern std::string unique_id;
   extern net::net_e origin_web_ui_allowed;

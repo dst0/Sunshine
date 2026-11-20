@@ -15,7 +15,6 @@
 #include <boost/property_tree/json_parser.hpp>
 #include <boost/property_tree/ptree.hpp>
 #include <boost/property_tree/xml_parser.hpp>
-#include <curl/curl.h>
 #include <Simple-Web-Server/server_http.hpp>
 #include <Simple-Web-Server/server_https.hpp>
 
@@ -224,70 +223,5 @@ namespace http {
     }
 
     return 0;
-  }
-
-  /**
-   * @brief Send a static file response for a Web UI request.
-   */
-  bool download_file(const std::string &url, const std::string &file, long ssl_version) {
-    CURL *curl = curl_easy_init();
-    if (!curl) {
-      BOOST_LOG(error) << "Couldn't create CURL instance";
-      return false;
-    }
-
-    if (std::string file_dir = file_handler::get_parent_directory(file); !file_handler::make_directory(file_dir)) {
-      BOOST_LOG(error) << "Couldn't create directory ["sv << file_dir << ']';
-      curl_easy_cleanup(curl);
-      return false;
-    }
-
-    FILE *fp = fopen(file.c_str(), "wb");
-    if (!fp) {
-      BOOST_LOG(error) << "Couldn't open ["sv << file << ']';
-      curl_easy_cleanup(curl);
-      return false;
-    }
-
-    curl_easy_setopt(curl, CURLOPT_SSLVERSION, ssl_version);
-    curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
-    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, fwrite);
-    curl_easy_setopt(curl, CURLOPT_WRITEDATA, fp);
-
-    CURLcode result = curl_easy_perform(curl);
-    if (result != CURLE_OK) {
-      BOOST_LOG(error) << "Couldn't download ["sv << url << ", code:" << result << ']';
-    }
-
-    curl_easy_cleanup(curl);
-    fclose(fp);
-    return result == CURLE_OK;
-  }
-
-  /**
-   * @brief Percent-encode URL data for use in HTTP query strings.
-   */
-  std::string url_escape(const std::string &url) {
-    char *string = curl_easy_escape(nullptr, url.c_str(), static_cast<int>(url.length()));
-    std::string result(string);
-    curl_free(string);
-    return result;
-  }
-
-  /**
-   * @brief Extract the host component from a URL string.
-   */
-  std::string url_get_host(const std::string &url) {
-    CURLU *curlu = curl_url();
-    curl_url_set(curlu, CURLUPART_URL, url.c_str(), static_cast<unsigned int>(url.length()));
-    char *host;
-    if (curl_url_get(curlu, CURLUPART_HOST, &host, 0) != CURLUE_OK) {
-      curl_url_cleanup(curlu);
-      return "";
-    }
-    std::string result(host);
-    curl_free(host);
-    curl_url_cleanup(curlu);
-    return result;
   }
 }  // namespace http
