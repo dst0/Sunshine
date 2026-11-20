@@ -23,6 +23,7 @@
 #include <thread>
 #include <tuple>
 #include <utility>
+#include <vector>
 
 // lib includes
 #include <boost/asio/ssl.hpp>
@@ -500,7 +501,7 @@ protected:
 
     const auto csp = response->header.find("Content-Security-Policy");
     ASSERT_NE(csp, response->header.end());
-    ASSERT_EQ(csp->second, "frame-ancestors 'none';");
+    ASSERT_EQ(csp->second, confighttp::WEB_UI_CSP);
   }
 
   static void assert_json_error_response(const std::shared_ptr<SimpleWeb::Client<SimpleWeb::HTTPS>::Response> &response, const std::string_view &expected_message, const std::string_view &expected_status_code) {
@@ -2526,4 +2527,60 @@ TEST_F(ConfigHttpTest, OversizedRequestIsRejectedBeforeBuffering) {
   const auto read = stream.read_some(boost::asio::buffer(byte), ec);
   EXPECT_EQ(read, 0);
   EXPECT_TRUE(ec);
+}
+
+// Test: the strict CSP forbids everything the Web UI does not need
+TEST(ConfigHttpCspTest, PolicyIsStrict) {
+  const std::string_view csp = confighttp::WEB_UI_CSP;
+  for (const auto *directive : {
+         "default-src 'self'",
+         "connect-src 'self'",
+         "img-src 'self' data: blob:",
+         "style-src 'self' 'unsafe-inline'",
+         "script-src 'self'",
+         "font-src 'self'",
+         "object-src 'none'",
+         "base-uri 'self'",
+         "form-action 'self'",
+         "frame-ancestors 'none'",
+       }) {
+    EXPECT_NE(csp.find(directive), std::string_view::npos) << directive;
+  }
+  EXPECT_EQ(csp.find("unsafe-eval"), std::string_view::npos);
+  EXPECT_EQ(csp.find("script-src 'self' 'unsafe-inline'"), std::string_view::npos);
+  EXPECT_EQ(csp.find("http"), std::string_view::npos);
+  EXPECT_EQ(csp.find('*'), std::string_view::npos);
+}
+
+// Test: every kind of Web UI response carries the CSP
+TEST_F(ConfigHttpTest, EveryResponseCarriesTheContentSecurityPolicy) {
+  SimpleWeb::CaseInsensitiveMultimap auth;
+  auth.emplace("Authorization", create_auth_header("testuser", "testpass"));
+  SimpleWeb::CaseInsensitiveMultimap wrong;
+  wrong.emplace("Authorization", create_auth_header("testuser", "nope"));
+
+  const std::vector<std::pair<std::string, std::shared_ptr<SimpleWeb::Client<SimpleWeb::HTTPS>::Response>>> responses {
+    {"page", client->request("GET", "/page-test", "", auth)},
+    {"spa fallback", client->request("GET", "/some/route", "", auth)},
+    {"json", client->request("GET", "/json-test")},
+    {"unauthorized", client->request("GET", "/auth-test")},
+    {"wrong password", client->request("GET", "/auth-test", "", wrong)},
+    {"not found", client->request("GET", "/api/unknown")},
+    {"bad request", client->request("GET", "/badrequest-test")},
+    {"redirect", client->request("GET", "/redirect-test")},
+  };
+  for (const auto &[name, response] : responses) {
+    const auto csp = response->header.find("Content-Security-Policy");
+    ASSERT_NE(csp, response->header.end()) << name;
+    EXPECT_EQ(csp->second, confighttp::WEB_UI_CSP) << name;
+  }
+
+  for (int i = 0; i < 5; ++i) {
+    client->request("GET", "/auth-test", "", wrong);
+  }
+  const auto locked = client->request("GET", "/auth-test", "", auth);
+  ASSERT_EQ(locked->status_code, "429 Too Many Requests");
+  const auto locked_csp = locked->header.find("Content-Security-Policy");
+  ASSERT_NE(locked_csp, locked->header.end());
+  EXPECT_EQ(locked_csp->second, confighttp::WEB_UI_CSP);
 }

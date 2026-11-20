@@ -32,6 +32,17 @@ namespace confighttp {
   constexpr auto PORT_HTTPS = 1;  ///< GameStream port offset for port https.
 
   /**
+   * @brief Content-Security-Policy sent with every Web UI response.
+   * @details Only same-origin scripts, styles, fonts, images and requests; no plugins, framing,
+   *          cross-origin base URIs or cross-origin form posts. Inline styles stay allowed for
+   *          Bootstrap and Vue style bindings. `base-uri 'self'` (not `'none'`) keeps the Web UI's
+   *          own `<base href="/">` working, which relative API URLs rely on.
+   */
+  constexpr auto WEB_UI_CSP =
+    "default-src 'self'; connect-src 'self'; img-src 'self' data: blob:; style-src 'self' 'unsafe-inline'; "
+    "script-src 'self'; font-src 'self'; object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'";
+
+  /**
    * @brief Maximum request size (headers and body) accepted by the Web UI server.
    * @details Larger requests are rejected before their body is buffered.
    */
