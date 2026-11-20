@@ -501,6 +501,7 @@
     "new_stable": "A new Stable Version is Available!",
     "startup_errors": "<b>Attention!</b> Sunshine detected these errors during startup. We <b>STRONGLY RECOMMEND</b> fixing them before streaming.",
     "review_virtual_input": "Review Virtual Input",
+    "update_check_disabled": "Automatic update checks are disabled: the Web UI does not contact external services. Check for new releases manually.",
     "version_dirty": "Thank you for helping to make Sunshine a better software!",
     "version_latest": "You are running the latest version of Sunshine",
     "virtualhid_development_desc": "Thank you for using a development build of Virtual HID Broker. Your testing helps make Virtual HID Broker better!",

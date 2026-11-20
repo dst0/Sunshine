@@ -261,6 +261,7 @@ consent prompt for directory ACLs, so the Web UI shows setup steps for correctin
         <td>Description</td>
         <td colspan="2">
             Whether to be notified of new pre-release versions of Sunshine.
+            @note{This build makes no update checks, so this option has no effect.}
         </td>
     </tr>
     <tr>

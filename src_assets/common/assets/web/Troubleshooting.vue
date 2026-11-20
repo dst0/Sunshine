@@ -1019,69 +1019,14 @@
             });
         },
         /**
-         * @brief Refresh the installed backend details and latest stable Virtual HID Broker release.
+         * @brief Refresh the installed backend details.
+         *
+         * The latest-release lookup was removed: the Web UI makes no requests to external
+         * services. The release column therefore reports the release as unavailable and the
+         * download button links to the releases page.
          */
         refreshDriverInformation() {
           this.refreshVirtualInputStatus();
-          this.refreshDriverReleases();
-        },
-        /**
-         * @brief Refresh the latest stable release metadata for Virtual HID Broker.
-         */
-        refreshDriverReleases() {
-          if (this.showVirtualhid) {
-            this.updateLatestRelease(
-              'virtualhidRelease',
-              'LizardByte/libvirtualhid',
-              'https://github.com/LizardByte/libvirtualhid/releases/latest',
-            );
-          }
-        },
-        /**
-         * @brief Fetch one repository's latest non-prerelease release from GitHub.
-         *
-         * @param {string} property Component data property that stores the release metadata.
-         * @param {string} repository GitHub repository in owner/name form.
-         * @param {string} fallbackUrl Releases page used if the API request fails.
-         */
-        updateLatestRelease(property, repository, fallbackUrl) {
-          this[property] = {
-            ...this[property],
-            loading: true,
-            error: false,
-          };
-
-          fetch(`https://api.github.com/repos/${repository}/releases/latest`, {
-            headers: {
-              Accept: 'application/vnd.github+json',
-            },
-          })
-            .then((response) => {
-              if (!response.ok) {
-                throw new Error(`GitHub returned ${response.status}`);
-              }
-              return response.json();
-            })
-            .then((release) => {
-              if (!release.tag_name || release.draft || release.prerelease) {
-                throw new Error('GitHub did not return a stable release');
-              }
-              this[property] = {
-                loading: false,
-                version: release.tag_name,
-                url: release.html_url || fallbackUrl,
-                error: false,
-              };
-            })
-            .catch((error) => {
-              console.error(`Failed to fetch the latest ${repository} release:`, error);
-              this[property] = {
-                loading: false,
-                version: '',
-                url: fallbackUrl,
-                error: true,
-              };
-            });
         },
         refreshVirtualInputStatus() {
           fetch("/api/virtual-input/status")

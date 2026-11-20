@@ -32,12 +32,6 @@ async function mountHome(platform, { developmentVersion = true, licensed = true,
     if (url === './api/logs') {
       return { text: async () => '' }
     }
-    if (url === 'https://api.github.com/repos/SunshineStream/Sunshine/releases/latest') {
-      return { json: async () => ({ tag_name: 'v2026.927.1200' }) }
-    }
-    if (url === 'https://api.github.com/repos/SunshineStream/Sunshine/releases') {
-      return { json: async () => [{ tag_name: 'v2026.927.1200', prerelease: true }] }
-    }
     throw new Error(`Unexpected fetch: ${url}`)
   }))
 
@@ -53,6 +47,20 @@ async function mountHome(platform, { developmentVersion = true, licensed = true,
 
 afterEach(() => {
   vi.unstubAllGlobals()
+})
+
+describe('home page network access', () => {
+  it.each(['linux', 'windows', 'macos'])('only requests local API endpoints on %s', async platform => {
+    const wrapper = await mountHome(platform)
+
+    const urls = fetch.mock.calls.map(([url]) => String(url))
+    expect(urls.length).toBeGreaterThan(0)
+    for (const url of urls) {
+      expect(url).toMatch(/^\.\/api\//)
+    }
+    expect(wrapper.text()).toContain('index.update_check_disabled')
+    wrapper.unmount()
+  })
 })
 
 describe('development broker home notice', () => {
