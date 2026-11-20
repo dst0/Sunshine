@@ -986,3 +986,85 @@ TEST_F(SdsMicTest, RtspSetupMicReturnsPortAndPingPayloadOrNotFound) {
   run_rtsp(&rtsp_stream::cmd_setup, session, setup);
   EXPECT_EQ(session.mic_ping_payload, payload);
 }
+
+#if defined(__linux__) && defined(SUNSHINE_MIC_PIPEWIRE)
+  // local includes
+  #include <src/platform/linux/mic_sinks.h>
+
+  // standard includes
+  #include <cstdio>
+  #include <fstream>
+  #include <iterator>
+
+namespace {
+  std::string run_command(const std::string &command) {
+    std::string output;
+    if (auto *pipe = popen(command.c_str(), "r")) {
+      std::array<char, 4096> chunk {};
+      while (auto n = std::fread(chunk.data(), 1, chunk.size(), pipe)) {
+        output.append(chunk.data(), n);
+      }
+      pclose(pipe);
+    }
+    return output;
+  }
+}  // namespace
+
+/**
+ * @brief Live check against a running PipeWire daemon (skipped in the build container): the sink shows up as an
+ * Audio/Source node named sunshine-mic, a recorder targeting it captures the written tone, and the node disappears on stop.
+ */
+TEST(SdsMicPipewireLiveTest, VirtualSourceCarriesAudioToARecorder) {
+  if (!sds::mic::linux_sinks::pipewire_available()) {
+    GTEST_SKIP() << "no PipeWire daemon reachable";
+  }
+  if (std::system("command -v pw-record >/dev/null 2>&1 && command -v pw-cli >/dev/null 2>&1") != 0) {
+    GTEST_SKIP() << "pw-record/pw-cli not installed";
+  }
+
+  auto sink = sds::mic::linux_sinks::make_pipewire_sink();
+  ASSERT_EQ(sink->start(), 0);
+  std::this_thread::sleep_for(500ms);
+  const auto nodes = run_command("pw-cli ls Node 2>/dev/null");
+  EXPECT_NE(nodes.find("sunshine-mic"), std::string::npos) << nodes;
+  EXPECT_NE(nodes.find("Audio/Source"), std::string::npos) << nodes;
+
+  std::jthread writer {[&sink](std::stop_token stop) {
+    std::array<std::int16_t, sds::mic::FRAME_SAMPLES> pcm {};
+    std::uint64_t phase = 0;
+    auto next = std::chrono::steady_clock::now();
+    while (!stop.stop_requested()) {
+      for (auto &sample : pcm) {
+        sample = static_cast<std::int16_t>(8000.0 * std::sin(2.0 * 3.14159265358979 * 440.0 * static_cast<double>(phase++) / sds::mic::SAMPLE_RATE));
+      }
+      sink->write(pcm);
+      next += sds::mic::FRAME_DURATION;
+      std::this_thread::sleep_until(next);
+    }
+  }};
+
+  const std::string wav = "/tmp/sds-mic-live-test.wav";
+  std::remove(wav.c_str());
+  run_command("timeout -s INT 3 pw-record --target sunshine-mic --rate 48000 --channels 1 --format s16 " + wav + " 2>&1");
+  writer.request_stop();
+  writer.join();
+  sink->stop();
+
+  std::ifstream file {wav, std::ios::binary};
+  const std::string bytes {std::istreambuf_iterator<char> {file}, std::istreambuf_iterator<char> {}};
+  const auto data = bytes.find("data");
+  ASSERT_NE(data, std::string::npos) << "no WAV data chunk (" << bytes.size() << " bytes)";
+  const auto *samples = reinterpret_cast<const std::int16_t *>(bytes.data() + data + 8);
+  const auto count = (bytes.size() - data - 8) / sizeof(std::int16_t);
+  ASSERT_GT(count, static_cast<std::size_t>(sds::mic::SAMPLE_RATE));
+  double sum = 0;
+  for (std::size_t i = count / 2; i < count; ++i) {
+    sum += static_cast<double>(samples[i]) * samples[i];
+  }
+  const auto level = std::sqrt(sum / static_cast<double>(count - count / 2));
+  EXPECT_GT(level, 2000.0) << "recorded RMS " << level;
+
+  std::this_thread::sleep_for(300ms);
+  EXPECT_EQ(run_command("pw-cli ls Node 2>/dev/null").find("sunshine-mic"), std::string::npos);
+}
+#endif
