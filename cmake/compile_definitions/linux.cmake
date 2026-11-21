@@ -252,6 +252,19 @@ if(X11_FOUND)
     list(APPEND PLATFORM_TARGET_FILES
             "${CMAKE_SOURCE_DIR}/src/platform/linux/x11grab.h"
             "${CMAKE_SOURCE_DIR}/src/platform/linux/x11grab.cpp")
+
+    # Shared clipboard (X11 CLIPBOARD). libX11 is already linked above; libXfixes is linked
+    # directly as well (not dlopen'ed like x11grab's cursor code) because the backend cannot work
+    # without selection-owner notifications. The Debian/RPM packages declare the dependency.
+    if(X11_Xfixes_FOUND)
+        add_compile_definitions(SUNSHINE_BUILD_X11_CLIPBOARD)
+        include_directories(SYSTEM ${X11_Xfixes_INCLUDE_PATH})
+        list(APPEND PLATFORM_LIBRARIES ${X11_Xfixes_LIB})
+        list(APPEND PLATFORM_TARGET_FILES
+                "${CMAKE_SOURCE_DIR}/src/platform/linux/clipboard_x11.cpp")
+    else()
+        message(WARNING "libXfixes not found: the X11 shared clipboard backend is disabled")
+    endif()
 endif()
 
 # GIO
@@ -280,7 +293,9 @@ if(PIPEWIRE_FOUND AND GIO_FOUND AND ${SUNSHINE_ENABLE_PORTAL})
     set(PORTAL_FOUND ON)
     add_compile_definitions(SUNSHINE_BUILD_PORTAL)
     list(APPEND PLATFORM_TARGET_FILES
-            "${CMAKE_SOURCE_DIR}/src/platform/linux/portalgrab.cpp")
+            "${CMAKE_SOURCE_DIR}/src/platform/linux/portal_session.h"
+            "${CMAKE_SOURCE_DIR}/src/platform/linux/portalgrab.cpp"
+            "${CMAKE_SOURCE_DIR}/src/platform/linux/clipboard_portal.cpp")
 endif()
 
 # KWin ScreenCast (direct Wayland protocol, bypasses portal)
@@ -323,6 +338,14 @@ endif ()
 
 include_directories(SYSTEM
         ${CMAKE_BINARY_DIR}/generated-src)
+
+# Shared clipboard: backend factory and platform-independent conversion helpers
+list(APPEND PLATFORM_TARGET_FILES
+        "${CMAKE_SOURCE_DIR}/src/sds/clipboard_backend.h"
+        "${CMAKE_SOURCE_DIR}/src/sds/clipboard_backend_util.h"
+        "${CMAKE_SOURCE_DIR}/src/sds/clipboard_backend_util.cpp"
+        "${CMAKE_SOURCE_DIR}/src/platform/linux/clipboard_linux.h"
+        "${CMAKE_SOURCE_DIR}/src/platform/linux/clipboard.cpp")
 
 list(APPEND PLATFORM_TARGET_FILES
         "${CMAKE_SOURCE_DIR}/src/platform/linux/publish.cpp"

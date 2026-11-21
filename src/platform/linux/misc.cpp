@@ -59,6 +59,7 @@
 // local includes
 #include "graphics.h"
 #include "misc.h"
+#include "portal_session.h"
 #include "src/compat/boost_process.h"
 #include "src/config.h"
 #include "src/entry_handler.h"
@@ -1510,6 +1511,8 @@ namespace platf {
     if (portal_available || (config::video.capture.empty() && sources.none() && verify_portal())) {
       sources[source::PORTAL] = true;
     }
+    // The clipboard backend factory uses this to choose the portal clipboard.
+    portal::set_capture_active(sources[source::PORTAL]);
 #endif
 
     if (sources.none()) {

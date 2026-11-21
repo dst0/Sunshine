@@ -99,6 +99,7 @@ set(CPACK_DEBIAN_PACKAGE_DEPENDS "\
             libva-drm2, \
             libwayland-client0, \
             libx11-6, \
+            libxfixes3, \
             miniupnpc, \
             openssl | libssl3")
 set(CPACK_RPM_PACKAGE_REQUIRES "\
@@ -110,6 +111,7 @@ set(CPACK_RPM_PACKAGE_REQUIRES "\
             libva >= 2.14.0, \
             libwayland-client >= 1.20.0, \
             libX11 >= 1.7.3.1, \
+            libXfixes >= 5.0, \
             mesa-libgbm >= 25.0.7, \
             miniupnpc >= 2.2.4, \
             numactl-libs >= 2.0.14, \
@@ -124,6 +126,7 @@ list(APPEND CPACK_FREEBSD_PACKAGE_DEPS
         net/miniupnpc
         security/openssl
         x11/libX11
+        x11/libXfixes
 )
 
 if(NOT BOOST_USE_STATIC)
