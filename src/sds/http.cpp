@@ -15,6 +15,7 @@
 #include "auth.h"
 #include "http.h"
 #include "sds.h"
+#include "src/nvhttp.h"
 
 namespace sds::http {
   namespace {
@@ -161,7 +162,7 @@ namespace sds::http {
       }
 
       request_t fields;
-      fields.cert_pem = client_cert_pem(*request);
+      fields.cert_pem = nvhttp::verified_client_cert(request);
       if (match.size() > 1) {
         fields.id = match[1].str();
       }

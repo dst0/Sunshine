@@ -163,25 +163,9 @@ namespace system_tray {
   #endif
   }  // namespace
 
-  #if defined(_WIN32) || defined(__APPLE__)
-  constexpr auto LIBVIRTUALHID_RELEASES_URL = "https://github.com/LizardByte/libvirtualhid/releases/latest"sv;  ///< Latest Virtual HID Broker release.
-  #endif
-
   void tray_open_ui_cb([[maybe_unused]] struct tray_menu *item) {
     BOOST_LOG(info) << "Opening UI from system tray"sv;
     launch_ui();
-  }
-
-  void tray_donate_github_cb([[maybe_unused]] struct tray_menu *item) {
-    platf::open_url("https://github.com/sponsors/LizardByte");
-  }
-
-  void tray_donate_patreon_cb([[maybe_unused]] struct tray_menu *item) {
-    platf::open_url("https://www.patreon.com/LizardByte");
-  }
-
-  void tray_donate_paypal_cb([[maybe_unused]] struct tray_menu *item) {
-    platf::open_url("https://www.paypal.com/paypalme/ReenigneArcher");
   }
 
   #if defined(_WIN32) || defined(__APPLE__)
@@ -192,11 +176,6 @@ namespace system_tray {
     #else
     launch_ui("/troubleshooting#virtualhid-license");
     #endif
-  }
-
-  void tray_virtualhid_download_cb([[maybe_unused]] struct tray_menu *item) {
-    BOOST_LOG(info) << "Opening Virtual HID Broker download from system tray"sv;
-    platf::open_url(std::string {LIBVIRTUALHID_RELEASES_URL});
   }
   #endif
 
@@ -256,7 +235,7 @@ namespace system_tray {
   /**
    * @brief Create the initial Virtual HID Broker license submenu.
    *
-   * @return Menu storage with a checking state, benefits, license settings, and driver download.
+   * @return Menu storage with a checking state, license settings, and (on Windows) benefits.
    */
   std::array<struct tray_menu, 9> initial_virtualhid_license_menu() {
     std::array<struct tray_menu, 9> menu {};
@@ -265,9 +244,6 @@ namespace system_tray {
     menu[2] = {.text = "Get/Manage License", .cb = tray_virtualhid_license_cb};
     #ifdef _WIN32
     menu[3] = {.text = "Virtual HID Broker Benefits", .submenu = virtualhid_benefits_menu_storage().data()};
-    menu[4] = {.text = "Download Virtual HID Broker", .cb = tray_virtualhid_download_cb};
-    #else
-    menu[3] = {.text = "Download Virtual HID Broker", .cb = tray_virtualhid_download_cb};
     #endif
     return menu;
   }
@@ -304,15 +280,6 @@ namespace system_tray {
         {.text = "Virtual HID Broker", .submenu = virtualhid_license_menu.data()},
         {.text = "-"},
   #endif
-        {.text = "Donate",
-         .submenu =
-           (struct tray_menu[]) {
-             {.text = "GitHub Sponsors", .cb = tray_donate_github_cb},
-             {.text = "Patreon", .cb = tray_donate_patreon_cb},
-             {.text = "PayPal", .cb = tray_donate_paypal_cb},
-             {.text = nullptr}
-           }},
-        {.text = "-"},
   // Currently display device settings are only supported on Windows
   #ifdef _WIN32
         {.text = "Reset Display Device Config", .cb = tray_reset_display_device_config_cb},
@@ -479,9 +446,6 @@ namespace system_tray {
     #ifdef _WIN32
     set_virtualhid_license_menu_item(6, "Virtual HID Broker Benefits", false);
     virtualhid_license_menu[6].submenu = virtualhid_benefits_menu_storage().data();
-    set_virtualhid_license_menu_item(7, "Download Virtual HID Broker", false, tray_virtualhid_download_cb);
-    #else
-    set_virtualhid_license_menu_item(6, "Download Virtual HID Broker", false, tray_virtualhid_download_cb);
     #endif
   }
 

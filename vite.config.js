@@ -55,11 +55,9 @@ const emitTrayIconsPlugin = {
 
 // https://vitejs.dev/config/
 export default defineConfig({
-    resolve: {
-        alias: {
-            vue: 'vue/dist/vue.esm-bundler.js'
-        }
-    },
+    // Use Vue's default runtime-only build: every component is a precompiled SFC, and the full
+    // build's runtime template compiler relies on eval, which the Web UI's Content-Security-Policy
+    // (script-src 'self') forbids.
     base: '/',
     plugins: [
         vue(),

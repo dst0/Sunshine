@@ -15,20 +15,10 @@
 #include <string>
 #include <string_view>
 
-// lib includes
-#include <boost/asio/ip/tcp.hpp>
-#include <openssl/ssl.h>
-
 // local includes
 #include "permissions.h"
-#include "src/nvhttp.h"
 
 namespace sds {
-  /**
-   * @brief HTTPS request type of the paired nvhttp server.
-   */
-  using https_request_t = SimpleWeb::ServerBase<nvhttp::SunshineHTTPS>::Request;
-
   /**
    * @brief Globally switchable features (`sunshine.conf`).
    */
@@ -188,56 +178,4 @@ namespace sds {
    */
   std::pair<std::string, std::string> parse_content_type(std::string_view header);
 
-  /**
-   * @brief Record the verified client certificate of a connection right after the TLS handshake.
-   *
-   * SDS-MERGE: replace with nvhttp::verified_client_cert once hardening lands.
-   *
-   * @param ssl TLS connection whose peer certificate passed nvhttp's verify callback.
-   * @param remote Remote endpoint of the connection.
-   * @param local Local endpoint of the connection.
-   * @param connection Liveness token; the entry is ignored and purged once it expires.
-   */
-  void remember_verified_connection(SSL *ssl, const boost::asio::ip::tcp::endpoint &remote, const boost::asio::ip::tcp::endpoint &local, std::weak_ptr<void> connection);
-
-  /**
-   * @brief Record a certificate for a connection directly (tests and remember_verified_connection()).
-   *
-   * @param cert_pem Canonical PEM certificate.
-   * @param remote Remote endpoint.
-   * @param local Local endpoint.
-   * @param connection Liveness token.
-   */
-  void remember_connection_cert(std::string cert_pem, const boost::asio::ip::tcp::endpoint &remote, const boost::asio::ip::tcp::endpoint &local, std::weak_ptr<void> connection);
-
-  /**
-   * @brief Look up the verified certificate of a live connection.
-   *
-   * @param remote Remote endpoint.
-   * @param local Local endpoint.
-   * @return Certificate PEM, or no value when unknown or the connection is gone.
-   */
-  std::optional<std::string> connection_cert(const boost::asio::ip::tcp::endpoint &remote, const boost::asio::ip::tcp::endpoint &local);
-
-  /**
-   * @brief Verified client certificate of an HTTPS request.
-   *
-   * SDS-MERGE: replace with nvhttp::verified_client_cert once hardening lands.
-   *
-   * @param request Request received by the paired HTTPS server.
-   * @return Certificate PEM, or no value.
-   */
-  std::optional<std::string> client_cert_pem(const https_request_t &request);
-
-  /**
-   * @brief Number of tracked connections, after purging dead ones (tests).
-   *
-   * @return Live entries.
-   */
-  std::size_t tracked_connections();
-
-  /**
-   * @brief Forget every tracked connection (tests).
-   */
-  void forget_all_connections();
 }  // namespace sds

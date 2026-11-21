@@ -6,6 +6,7 @@ import Advanced from '../../src_assets/common/assets/web/configs/tabs/Advanced.v
 import General from '../../src_assets/common/assets/web/configs/tabs/General.vue'
 import Inputs from '../../src_assets/common/assets/web/configs/tabs/Inputs.vue'
 import Network from '../../src_assets/common/assets/web/configs/tabs/Network.vue'
+import configTabs from '../../src_assets/common/assets/web/configs/config_tabs.json'
 
 const globalOptions = {
   mocks: {
@@ -113,6 +114,33 @@ describe('network configuration', () => {
     expect(tableText).toContain('47989')
     expect(tableText).toContain('48010')
     expect(tableText).not.toContain('NaN')
+  })
+
+  it('ships LAN-only, encrypted defaults', () => {
+    const network = configTabs.find(tab => tab.id === 'network').options
+
+    expect(network.upnp).toBe('disabled')
+    expect(network.mdns_advertise).toBe('disabled')
+    expect(network.origin_web_ui_allowed).toBe('pc')
+    expect(network.lan_encryption_mode).toBe(2)
+    expect(network.wan_encryption_mode).toBe(2)
+  })
+
+  it('toggles mDNS advertising between enabled and disabled', async () => {
+    const config = { upnp: 'disabled', mdns_advertise: 'disabled', dscp_tagging: 'enabled' }
+    const wrapper = mount(Network, {
+      props: { platform: 'linux', config },
+      global: { ...globalOptions, stubs: { ...globalOptions.stubs, Checkbox: false } },
+    })
+    const input = wrapper.get('#mdns_advertise')
+
+    expect(input.element.checked).toBe(false)
+
+    await input.setValue(true)
+    expect(config.mdns_advertise).toBe('enabled')
+
+    await input.setValue(false)
+    expect(config.mdns_advertise).toBe('disabled')
   })
 
   it('toggles DSCP tagging between enabled and disabled', async () => {

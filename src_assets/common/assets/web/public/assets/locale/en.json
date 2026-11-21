@@ -348,7 +348,7 @@
     "keyboard_desc": "Allows guests to control the host system with the keyboard",
     "lan_encryption_mode": "LAN Encryption Mode",
     "lan_encryption_mode_1": "Enabled for supported clients",
-    "lan_encryption_mode_2": "Required for all clients",
+    "lan_encryption_mode_2": "Required for all clients (default)",
     "lan_encryption_mode_desc": "This determines when encryption will be used when streaming over your local network. Encryption can reduce streaming performance, particularly on less powerful hosts and clients.",
     "locale": "Locale",
     "locale_desc": "The locale used for Sunshine's user interface.",
@@ -358,6 +358,8 @@
     "max_bitrate_desc": "The maximum bitrate (in Kbps) that Sunshine will encode the stream at. If set to 0, it will always use the bitrate requested by Moonlight.",
     "max_stream_resolution": "Maximum Stream Resolution",
     "max_stream_resolution_desc": "The maximum resolution (formatted as WIDTHxHEIGHT, e.g. 2560x1440) that Sunshine will stream at. Larger client requests are downscaled, preserving aspect ratio. Lowering this reduces encoding latency on hosts where the encoder cannot keep up with the requested resolution. If empty, the resolution requested by Moonlight is used.",
+    "mdns_advertise": "Advertise on the local network (mDNS)",
+    "mdns_advertise_desc": "Announce this host with mDNS so Moonlight finds it automatically. When disabled, add the host in Moonlight by its IP address or host name.",
     "minimum_fps_target": "Minimum FPS Target",
     "minimum_fps_target_desc": "The lowest effective FPS a stream can reach. A value of 0 is treated as roughly half of the stream's FPS. A setting of 20 is recommended if you stream 24 or 30fps content.",
     "min_log_level": "Log Level",
@@ -405,9 +407,9 @@
     "nvenc_vbv_increase": "Single-frame VBV/HRD percentage increase",
     "nvenc_vbv_increase_desc": "By default sunshine uses single-frame VBV/HRD, which means any encoded video frame size is not expected to exceed requested bitrate divided by requested frame rate. Relaxing this restriction can be beneficial and act as low-latency variable bitrate, but may also lead to packet loss if the network doesn't have buffer headroom to handle bitrate spikes. Maximum accepted value is 400, which corresponds to 5x increased encoded video frame upper size limit.",
     "origin_web_ui_allowed": "Origin Web UI Allowed",
-    "origin_web_ui_allowed_desc": "The origin of the remote endpoint address that is not denied access to Web UI",
+    "origin_web_ui_allowed_desc": "The origin of the remote endpoint address that is not denied access to Web UI. With the default, use an SSH tunnel to reach the Web UI from another machine.",
     "origin_web_ui_allowed_lan": "Only those in LAN may access Web UI",
-    "origin_web_ui_allowed_pc": "Only localhost may access Web UI",
+    "origin_web_ui_allowed_pc": "Only localhost may access Web UI (default)",
     "origin_web_ui_allowed_wan": "Anyone may access Web UI",
     "output_name": "Display Id",
     "output_name_desc_macos": "During Sunshine startup, you should see the list of detected displays. Note: You need to use the id value inside the parenthesis. Below is an example; the actual output can be found in the Troubleshooting tab.",
@@ -515,8 +517,8 @@
     "vt_coder": "VideoToolbox Coder",
     "vt_realtime": "VideoToolbox Realtime Encoding",
     "wan_encryption_mode": "WAN Encryption Mode",
-    "wan_encryption_mode_1": "Enabled for supported clients (default)",
-    "wan_encryption_mode_2": "Required for all clients",
+    "wan_encryption_mode_1": "Enabled for supported clients",
+    "wan_encryption_mode_2": "Required for all clients (default)",
     "wan_encryption_mode_desc": "This determines when encryption will be used when streaming over the Internet. Encryption can reduce streaming performance, particularly on less powerful hosts and clients."
   },
   "index": {
@@ -533,6 +535,7 @@
     "new_stable": "A new Stable Version is Available!",
     "startup_errors": "<b>Attention!</b> Sunshine detected these errors during startup. We <b>STRONGLY RECOMMEND</b> fixing them before streaming.",
     "review_virtual_input": "Review Virtual Input",
+    "update_check_disabled": "Automatic update checks are disabled: the Web UI does not contact external services. Check for new releases manually.",
     "version_dirty": "Thank you for helping to make Sunshine a better software!",
     "version_latest": "You are running the latest version of Sunshine",
     "virtualhid_development_desc": "Thank you for using a development build of Virtual HID Broker. Your testing helps make Virtual HID Broker better!",
@@ -816,11 +819,9 @@
     "up": "Up"
   },
   "welcome": {
-    "confirm_password": "Confirm password",
-    "create_creds": "Before Getting Started, we need you to make a new username and password for accessing the Web UI.",
-    "create_creds_alert": "The credentials below are needed to access Sunshine's Web UI. Keep them safe, since you will never see them again!",
+    "create_creds_cli": "Web UI credentials can only be created on the host itself. Run this command as the user that runs Sunshine; it asks for the password without showing it:",
+    "create_creds_restart": "Then restart Sunshine and reload this page. Your browser will ask for the new credentials.",
     "greeting": "Welcome to Sunshine!",
-    "login": "Login",
-    "welcome_success": "This page will reload soon, your browser will ask you for the new credentials"
+    "no_creds": "No Web UI credentials are configured, so the Web UI is locked."
   }
 }

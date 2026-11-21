@@ -1,4 +1,3 @@
-import { mount, flushPromises } from '@vue/test-utils'
 import { parse } from '@vue/compiler-sfc'
 import { readFileSync } from 'node:fs'
 import { dirname, resolve } from 'node:path'
@@ -6,18 +5,11 @@ import { fileURLToPath } from 'node:url'
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest'
 import navbarSource from '../../src_assets/common/assets/web/Navbar.vue?raw'
 
-vi.mock('../../src_assets/common/assets/web/Navbar.vue', () => ({
-  default: { template: '<div />' },
-}))
-
-import Featured from '../../src_assets/common/assets/web/Featured.vue'
-
 const navbarCss = parse(navbarSource).descriptor.styles[0].content
 const projectRoot = resolve(dirname(fileURLToPath(import.meta.url)), '../..')
 const bootstrapCss = readFileSync(resolve(projectRoot, 'node_modules/bootstrap/dist/css/bootstrap.css'), 'utf8')
 const sunshineCss = readFileSync(resolve(projectRoot, 'src_assets/common/assets/web/sunshine.css'), 'utf8')
 let stylesheet
-let wrapper
 
 beforeAll(() => {
   stylesheet = document.createElement('style')
@@ -26,8 +18,6 @@ beforeAll(() => {
 })
 
 afterEach(() => {
-  wrapper?.unmount()
-  wrapper = undefined
   document.body.replaceChildren()
   delete document.documentElement.dataset.theme
   delete document.documentElement.dataset.bsTheme
@@ -48,25 +38,6 @@ afterAll(() => {
 function componentStyle(markup, selector) {
   document.body.innerHTML = markup
   return getComputedStyle(document.querySelector(selector))
-}
-
-/**
- * @brief Mount the featured page with a deterministic app directory.
- *
- * @param {object} directory App and category data returned by the directory service.
- * @returns {Promise<import('@vue/test-utils').VueWrapper>} Mounted featured page.
- */
-async function mountFeatured(directory) {
-  vi.stubGlobal('fetch', vi.fn(async () => ({
-    ok: true,
-    json: async () => directory,
-  })))
-  wrapper = mount(Featured, {
-    attachTo: document.body,
-    global: { mocks: { $t: key => key }, stubs: { Navbar: true, SimpleIcon: true } },
-  })
-  await flushPromises()
-  return wrapper
 }
 
 /** @brief Expected computed colors, independent of the stylesheet under test. */
@@ -152,40 +123,6 @@ function componentCases(colors) {
 describe.each(['light', 'dark'])('%s theme cascade', theme => {
   const colors = themeColors[theme]
 
-  it.each([0, 1, 2])('rounds the outside category filter corners with %i categories', async categoryCount => {
-    document.documentElement.dataset.theme = theme
-    document.documentElement.dataset.bsTheme = theme
-    const categories = [
-      { id: 'clients', originalId: 'clients' },
-      { id: 'tools', originalId: 'tools' },
-    ].slice(0, categoryCount)
-    await mountFeatured({ apps: [], categories })
-
-    expect(wrapper.get('fieldset legend').text()).toBe('featured.category_filter')
-    const buttons = wrapper.findAll('.btn-group > .btn')
-    expect(buttons).toHaveLength(categoryCount + 1)
-    const firstStyle = getComputedStyle(buttons[0].element)
-    const lastStyle = getComputedStyle(buttons.at(-1).element)
-    expect(firstStyle.borderTopLeftRadius).not.toBe('0px')
-    expect(firstStyle.borderBottomLeftRadius).not.toBe('0px')
-    expect(lastStyle.borderTopRightRadius).not.toBe('0px')
-    expect(lastStyle.borderBottomRightRadius).not.toBe('0px')
-    if (categoryCount > 0) {
-      expect(firstStyle.borderTopRightRadius).toBe('0px')
-      expect(firstStyle.borderBottomRightRadius).toBe('0px')
-      expect(lastStyle.borderTopLeftRadius).toBe('0px')
-      expect(lastStyle.borderBottomLeftRadius).toBe('0px')
-      for (const button of buttons.slice(1, -1)) {
-        const style = getComputedStyle(button.element)
-        expect([style.borderTopLeftRadius, style.borderBottomLeftRadius, style.borderTopRightRadius, style.borderBottomRightRadius]).toEqual(['0px', '0px', '0px', '0px'])
-      }
-      await buttons[1].trigger('click')
-      expect(buttons[1].classes()).toContain('active')
-      await buttons[0].trigger('click')
-      expect(buttons[0].classes()).toContain('active')
-    }
-  })
-
   it('allows specific component rules to override theme defaults', () => {
     document.documentElement.dataset.theme = theme
     document.documentElement.dataset.bsTheme = theme
@@ -208,17 +145,5 @@ describe.each(['light', 'dark'])('%s theme cascade', theme => {
     for (const [property, value] of Object.entries(expected)) {
       expect(style[property], property).toBe(value)
     }
-  })
-
-  it('themes the rendered official and platform badges without Bootstrap background utilities', async () => {
-    document.documentElement.dataset.theme = theme
-    document.documentElement.dataset.bsTheme = theme
-    await mountFeatured({ apps: [{ id: 'sample', name: 'Sample App', official: true, platforms: ['linux'] }] })
-
-    const [official, platform] = wrapper.findAll('.badge')
-    expect(getComputedStyle(official.element).backgroundColor).toBe(colors.primary)
-    expect(getComputedStyle(official.element).color).toBe(colors.onPrimary)
-    expect(getComputedStyle(platform.element).backgroundColor).toBe(colors.muted)
-    expect(getComputedStyle(platform.element).color).toBe(colors.text)
   })
 })

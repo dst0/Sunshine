@@ -28,7 +28,6 @@ BuildRequires: cmake >= 3.25.0
 BuildRequires: desktop-file-utils
 BuildRequires: git
 BuildRequires: libcap-devel
-BuildRequires: libcurl-devel
 BuildRequires: libdrm-devel
 BuildRequires: libevdev-devel
 BuildRequires: libva-devel
@@ -151,7 +150,6 @@ Requires: which >= 2.21
 %if 0%{?fedora}
 # Fedora runtime requirements
 Requires: libcap >= 2.22
-Requires: libcurl >= 7.0
 Requires: libdrm > 2.4.97
 Requires: libevdev >= 1.5.6
 Requires: libopusenc >= 0.2.1
@@ -169,7 +167,6 @@ Requires: vulkan-loader
 %if 0%{?suse_version}
 # openSUSE runtime requirements
 Requires: libcap2
-Requires: libcurl4
 Requires: libdrm2
 Requires: libevdev2
 Requires: libopusenc0
@@ -480,7 +477,7 @@ fi
 
 %files
 # Executables
-%caps(cap_sys_admin,cap_sys_nice+p) %{_bindir}/sunshine
+%{_bindir}/sunshine
 
 # Systemd unit files for user services
 %{_userunitdir}/*.service

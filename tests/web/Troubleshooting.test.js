@@ -257,6 +257,19 @@ describe('virtual input troubleshooting', () => {
     wrapper.unmount()
   })
 
+  it.each(['linux', 'macos', 'windows'])('only requests the local Web UI API on %s', async platform => {
+    const wrapper = await mountTroubleshooting(platform, 'all')
+    await wrapper.vm.refreshDriverInformation()
+    await flushPromises()
+
+    const urls = fetch.mock.calls.map(([url]) => String(url))
+    expect(urls.length).toBeGreaterThan(0)
+    for (const url of urls) {
+      expect(url).toMatch(/^\.?\/(api\/|$)/)
+    }
+    wrapper.unmount()
+  })
+
   it('keeps both backend rows on Windows when all backends are enabled', async () => {
     const wrapper = await mountTroubleshooting('windows', 'all')
 

@@ -9,6 +9,7 @@
 // standard includes
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <charconv>
 #include <filesystem>
 #include <format>
@@ -64,6 +65,7 @@
 #include "system_tray.h"
 #include "utility.h"
 #include "uuid.h"
+#include "webui_auth.h"
 
 using namespace std::literals;
 
@@ -594,7 +596,7 @@ namespace confighttp {
     SimpleWeb::CaseInsensitiveMultimap headers;
     headers.emplace("Content-Type", "application/json");
     headers.emplace("X-Frame-Options", "DENY");
-    headers.emplace("Content-Security-Policy", "frame-ancestors 'none';");
+    headers.emplace("Content-Security-Policy", WEB_UI_CSP);
     response->write(output_tree.dump(), headers);
   }
 
@@ -618,7 +620,7 @@ namespace confighttp {
       {"Content-Type", "application/json"},
       {"WWW-Authenticate", R"(Basic realm="Sunshine Gamestream Host", charset="UTF-8")"},
       {"X-Frame-Options", "DENY"},
-      {"Content-Security-Policy", "frame-ancestors 'none';"}
+      {"Content-Security-Policy", WEB_UI_CSP}
     };
 
     response->write(code, tree.dump(), headers);
@@ -636,9 +638,37 @@ namespace confighttp {
     const SimpleWeb::CaseInsensitiveMultimap headers {
       {"Location", path},
       {"X-Frame-Options", "DENY"},
-      {"Content-Security-Policy", "frame-ancestors 'none';"}
+      {"Content-Security-Policy", WEB_UI_CSP}
     };
     response->write(SimpleWeb::StatusCode::redirection_temporary_redirect, headers);
+  }
+
+  /**
+   * @brief Send a 429 Too Many Requests response for a locked-out login.
+   * @param response The HTTP response object.
+   * @param request The HTTP request object.
+   * @param retry_after Remaining lockout, sent in the Retry-After header.
+   */
+  void send_too_many_requests(const resp_https_t &response, const req_https_t &request, const std::chrono::seconds retry_after) {
+    auto address = net::addr_to_normalized_string(request->remote_endpoint().address());
+    BOOST_LOG(warning) << "Web UI: ["sv << address << "] -- login refused while locked out ("sv << retry_after.count() << "s remaining)"sv;
+
+    constexpr auto code = SimpleWeb::StatusCode::client_error_too_many_requests;
+
+    nlohmann::json tree;
+    tree["status_code"] = code;
+    tree["status"] = false;
+    tree["error"] = "Too many failed login attempts";
+
+    // No WWW-Authenticate header: the browser must not prompt for credentials again while locked.
+    const SimpleWeb::CaseInsensitiveMultimap headers {
+      {"Content-Type", "application/json"},
+      {"Retry-After", std::to_string(retry_after.count())},
+      {"X-Frame-Options", "DENY"},
+      {"Content-Security-Policy", WEB_UI_CSP}
+    };
+
+    response->write(code, tree.dump(), headers);
   }
 
   /**
@@ -648,46 +678,42 @@ namespace confighttp {
    * @return True if the user is authenticated, false otherwise.
    */
   bool authenticate(const resp_https_t &response, const req_https_t &request) {
-    auto address = net::addr_to_normalized_string(request->remote_endpoint().address());
+    const auto remote = request->remote_endpoint().address();
+    auto address = net::addr_to_normalized_string(remote);
 
     if (const auto ip_type = net::from_address(address); ip_type > http::origin_web_ui_allowed) {
       BOOST_LOG(info) << "Web UI: ["sv << address << "] -- denied"sv;
-      response->write(SimpleWeb::StatusCode::client_error_forbidden);
+      const SimpleWeb::CaseInsensitiveMultimap headers {
+        {"X-Frame-Options", "DENY"},
+        {"Content-Security-Policy", WEB_UI_CSP}
+      };
+      response->write(SimpleWeb::StatusCode::client_error_forbidden, headers);
       return false;
     }
 
-    // If credentials are shown, redirect the user to a /welcome page
+    // Credentials are created before startup; if they are missing, show the instructions page.
     if (config::sunshine.username.empty()) {
       send_redirect(response, request, "/welcome");
       return false;
     }
 
-    auto fg = util::fail_guard([&]() {
-      send_unauthorized(response, request);
-    });
-
-    const auto auth = request->header.find("authorization");
-    if (auth == request->header.end()) {
-      return false;
+    std::optional<std::string_view> authorization;
+    if (const auto auth = request->header.find("authorization"); auth != request->header.end()) {
+      authorization = auth->second;
     }
 
-    const auto &rawAuth = auth->second;
-    auto authData = SimpleWeb::Crypto::Base64::decode(rawAuth.substr("Basic "sv.length()));
-
-    const auto index = static_cast<int>(authData.find(':'));
-    if (index >= authData.size() - 1) {
-      return false;
+    switch (const auto result = webui_auth::authenticate(authorization, remote); result.outcome) {
+      case webui_auth::outcome_e::authenticated:
+        return true;
+      case webui_auth::outcome_e::locked_out:
+        send_too_many_requests(response, request, result.retry_after);
+        return false;
+      case webui_auth::outcome_e::missing:
+      case webui_auth::outcome_e::rejected:
+      default:
+        send_unauthorized(response, request);
+        return false;
     }
-
-    const auto username = authData.substr(0, index);
-    const auto password = authData.substr(index + 1);
-
-    if (const auto hash = util::hex(crypto::hash(password + config::sunshine.salt)).to_string(); !boost::iequals(username, config::sunshine.username) || hash != config::sunshine.password) {
-      return false;
-    }
-
-    fg.disable();
-    return true;
   }
 
   /**
@@ -706,7 +732,7 @@ namespace confighttp {
     SimpleWeb::CaseInsensitiveMultimap headers;
     headers.emplace("Content-Type", "application/json");
     headers.emplace("X-Frame-Options", "DENY");
-    headers.emplace("Content-Security-Policy", "frame-ancestors 'none';");
+    headers.emplace("Content-Security-Policy", WEB_UI_CSP);
 
     response->write(code, tree.dump(), headers);
   }
@@ -728,7 +754,7 @@ namespace confighttp {
     SimpleWeb::CaseInsensitiveMultimap headers;
     headers.emplace("Content-Type", "application/json");
     headers.emplace("X-Frame-Options", "DENY");
-    headers.emplace("Content-Security-Policy", "frame-ancestors 'none';");
+    headers.emplace("Content-Security-Policy", WEB_UI_CSP);
 
     response->write(code, tree.dump(), headers);
   }
@@ -835,7 +861,7 @@ namespace confighttp {
       return false;
     }
 
-    if (token_it->second.token != provided_token) {
+    if (!webui_auth::constant_time_equals(token_it->second.token, provided_token)) {
       auto address = net::addr_to_normalized_string(request->remote_endpoint().address());
       BOOST_LOG(error) << "Web UI: ["sv << address << "] -- CSRF token validation failed: token mismatch"sv;
       bad_request(response, "Invalid CSRF token");
@@ -876,16 +902,15 @@ namespace confighttp {
       return true;
     }
 
-    // If neither Origin nor Referer is present, this cannot be a browser-initiated CSRF attack.
-    // Non-browser clients (e.g. curl, scripts) never send these headers, and a malicious web page
-    // cannot cause a non-browser client to make requests on a user's behalf.
-    if (origin_it == request->header.end() && referer_it == request->header.end()) {
-      return true;
-    }
-
-    // A browser-like request arrived with an Origin/Referer that doesn't match an allowed origin.
-    // Require a CSRF token.
-    const std::string_view blocked_origin = (origin_it != request->header.end()) ? origin_it->second : referer_it->second;
+    // Everything else needs a CSRF token: a mismatching Origin/Referer, `Origin: null`, and also
+    // requests carrying neither header. Browsers send Origin on every state-changing request, so
+    // a missing header is not proof of a non-browser client (older browsers and privacy settings
+    // can strip both), and the Web UI itself, including through an SSH tunnel to
+    // https://localhost:<port>, always presents an allowed Origin. Scripts obtain a token from
+    // GET /api/csrf-token and send it in the X-CSRF-Token header.
+    const bool has_origin = origin_it != request->header.end();
+    const bool has_referer = referer_it != request->header.end();
+    const std::string_view blocked_origin = has_origin ? std::string_view {origin_it->second} : (has_referer ? std::string_view {referer_it->second} : "(no Origin or Referer header)"sv);
     // Extract token from X-CSRF-Token header
     const auto header_it = request->header.find("X-CSRF-Token");
     if (header_it == request->header.end()) {
@@ -945,7 +970,7 @@ namespace confighttp {
 
     // prevent click jacking
     headers.emplace("X-Frame-Options", "DENY");
-    headers.emplace("Content-Security-Policy", "frame-ancestors 'none';");
+    headers.emplace("Content-Security-Policy", WEB_UI_CSP);
 
     response->write(content, headers);
   }
@@ -978,7 +1003,7 @@ namespace confighttp {
     SimpleWeb::CaseInsensitiveMultimap headers;
     headers.emplace("Content-Type", "image/x-icon");
     headers.emplace("X-Frame-Options", "DENY");
-    headers.emplace("Content-Security-Policy", "frame-ancestors 'none';");
+    headers.emplace("Content-Security-Policy", WEB_UI_CSP);
     response->write(SimpleWeb::StatusCode::success_ok, in, headers);
   }
 
@@ -996,7 +1021,7 @@ namespace confighttp {
     SimpleWeb::CaseInsensitiveMultimap headers;
     headers.emplace("Content-Type", "image/png");
     headers.emplace("X-Frame-Options", "DENY");
-    headers.emplace("Content-Security-Policy", "frame-ancestors 'none';");
+    headers.emplace("Content-Security-Policy", WEB_UI_CSP);
     response->write(SimpleWeb::StatusCode::success_ok, in, headers);
   }
 
@@ -1049,7 +1074,7 @@ namespace confighttp {
     SimpleWeb::CaseInsensitiveMultimap headers;
     headers.emplace("Content-Type", mimeType->second);
     headers.emplace("X-Frame-Options", "DENY");
-    headers.emplace("Content-Security-Policy", "frame-ancestors 'none';");
+    headers.emplace("Content-Security-Policy", WEB_UI_CSP);
     std::ifstream in(filePath.string(), std::ios::binary);
     response->write(SimpleWeb::StatusCode::success_ok, in, headers);
   }
@@ -1774,13 +1799,37 @@ namespace confighttp {
       SimpleWeb::CaseInsensitiveMultimap headers;
       headers.emplace("Content-Type", "image/png");
       headers.emplace("X-Frame-Options", "DENY");
-      headers.emplace("Content-Security-Policy", "frame-ancestors 'none';");
+      headers.emplace("Content-Security-Policy", WEB_UI_CSP);
 
       response->write(SimpleWeb::StatusCode::success_ok, in, headers);
     } catch (std::exception &e) {
       BOOST_LOG(warning) << "GetCover: "sv << e.what();
       bad_request(response, e.what());
     }
+  }
+
+  std::optional<std::string_view> validate_cover_image(const std::string_view data, std::string &error) {
+    static constexpr std::string_view png_signature {"\x89PNG\r\n\x1a\n", 8};
+
+    if (data.empty()) {
+      error = "Cover image data is required";
+      return std::nullopt;
+    }
+    if (data.size() > COVER_MAX_SIZE) {
+      error = std::format("Cover image is too large (at most {} bytes)", COVER_MAX_SIZE);
+      return std::nullopt;
+    }
+    if (data.starts_with(png_signature)) {
+      return ".png"sv;
+    }
+    error = "Cover image must be a PNG file";
+    return std::nullopt;
+  }
+
+  bool is_valid_cover_key(const std::string_view key) {
+    return !key.empty() && key.size() <= 64 && std::ranges::all_of(key, [](const unsigned char c) {
+      return std::isalnum(c) || c == '_' || c == '-';
+    });
   }
 
   /**
@@ -1790,12 +1839,14 @@ namespace confighttp {
    * The body for the post request should be JSON serialized in the following format:
    * @code{.json}
    * {
-   *   "key": "igdb_<game_id>",
-   *   "url": "https://images.igdb.com/igdb/image/upload/t_cover_big_2x/<slug>.png"
+   *   "key": "<1-64 characters: letters, digits, '_' or '-'>",
+   *   "data": "<base64-encoded PNG image, at most COVER_MAX_SIZE bytes (about 2.95 MiB)>"
    * }
    * @endcode
    *
-   * @api_examples{/api/covers/upload|:| POST|:| {"key":"igdb_1234","url":"https://images.igdb.com/igdb/image/upload/t_cover_big_2x/abc123.png"}}
+   * Downloading covers from a URL is not supported: Sunshine makes no outbound connections.
+   *
+   * @api_examples{/api/covers/upload|:| POST|:| {"key":"my_game","data":"iVBORw0KGgo..."}}
    */
   void uploadCover(const resp_https_t &response, const req_https_t &request) {
     if (!check_content_type(response, request, "application/json")) {
@@ -1805,38 +1856,51 @@ namespace confighttp {
       return;
     }
 
+    std::string client_id = get_client_id(request);
+    if (!validate_csrf_token(response, request, client_id)) {
+      return;
+    }
+
     std::stringstream ss;
     ss << request->content.rdbuf();
     try {
       nlohmann::json output_tree;
       nlohmann::json input_tree = nlohmann::json::parse(ss);
 
-      std::string key = input_tree.value("key", "");
-      if (key.empty()) {
-        bad_request(response, "Cover key is required");
+      if (input_tree.contains("url")) {
+        bad_request(response, "Downloading covers from a URL is not supported");
         return;
       }
-      std::string url = input_tree.value("url", "");
 
-      const std::string coverdir = platf::appdata().string() + "/covers/";
-      file_handler::make_directory(coverdir);
-
-      std::basic_string path = coverdir + http::url_escape(key) + ".png";
-      if (!url.empty()) {
-        if (http::url_get_host(url) != "images.igdb.com") {
-          bad_request(response, "Only images.igdb.com is allowed");
-          return;
-        }
-        if (!http::download_file(url, path)) {
-          bad_request(response, "Failed to download cover");
-          return;
-        }
-      } else {
-        auto data = SimpleWeb::Crypto::Base64::decode(input_tree.value("data", ""));
-
-        std::ofstream imgfile(path);
-        imgfile.write(data.data(), static_cast<int>(data.size()));
+      const std::string key = input_tree.value("key", "");
+      if (!is_valid_cover_key(key)) {
+        bad_request(response, "Cover key must be 1-64 letters, digits, '_' or '-'");
+        return;
       }
+
+      const auto data = webui_auth::base64_decode(input_tree.value("data", ""));
+      if (!data) {
+        bad_request(response, "Cover image data is not valid base64");
+        return;
+      }
+      std::string error;
+      const auto extension = validate_cover_image(*data, error);
+      if (!extension) {
+        bad_request(response, error);
+        return;
+      }
+
+      const auto coverdir = platf::appdata() / "covers";
+      file_handler::make_directory(coverdir.string());
+      const auto path = (coverdir / (key + std::string {*extension})).string();
+
+      std::ofstream imgfile(path, std::ios::binary | std::ios::trunc);
+      imgfile.write(data->data(), static_cast<std::streamsize>(data->size()));
+      if (!imgfile) {
+        bad_request(response, "Failed to save the cover image");
+        return;
+      }
+
       output_tree["status"] = true;
       output_tree["path"] = path;
       send_response(response, output_tree);
@@ -1864,7 +1928,7 @@ namespace confighttp {
     SimpleWeb::CaseInsensitiveMultimap headers;
     headers.emplace("Content-Type", "text/plain");
     headers.emplace("X-Frame-Options", "DENY");
-    headers.emplace("Content-Security-Policy", "frame-ancestors 'none';");
+    headers.emplace("Content-Security-Policy", WEB_UI_CSP);
     response->write(SimpleWeb::StatusCode::success_ok, content, headers);
   }
 
@@ -1889,7 +1953,9 @@ namespace confighttp {
     if (!check_content_type(response, request, "application/json")) {
       return;
     }
-    if (!config::sunshine.username.empty() && !authenticate(response, request)) {
+    // Changing credentials always requires the current ones: there is no unauthenticated
+    // first-run setup (credentials are created with `sunshine --creds` before startup).
+    if (!authenticate(response, request)) {
       return;
     }
 
@@ -1919,13 +1985,16 @@ namespace confighttp {
       if (newUsername.empty()) {
         errors.emplace_back("Invalid Username");
       } else {
-        auto hash = util::hex(crypto::hash(password + config::sunshine.salt)).to_string();
-        if (config::sunshine.username.empty() || (boost::iequals(username, config::sunshine.username) && hash == config::sunshine.password)) {
+        const bool current_valid = !config::sunshine.username.empty() &&
+                                   webui_auth::constant_time_equals(boost::to_lower_copy(username), boost::to_lower_copy(config::sunshine.username)) &&
+                                   webui_auth::verify_password(password, config::sunshine.password, config::sunshine.salt) != webui_auth::password_match_e::mismatch;
+        if (current_valid) {
           if (newPassword.empty() || newPassword != confirmPassword) {
             errors.emplace_back("Password Mismatch");
+          } else if (http::save_user_creds(config::sunshine.credentials_file, newUsername, newPassword) != 0 || http::reload_user_creds(config::sunshine.credentials_file) != 0) {
+            errors.emplace_back("Failed to save the new credentials");
           } else {
-            http::save_user_creds(config::sunshine.credentials_file, newUsername, newPassword);
-            http::reload_user_creds(config::sunshine.credentials_file);
+            webui_auth::clear_verification_cache();
             output_tree["status"] = true;
           }
         } else {
@@ -2600,6 +2669,10 @@ namespace confighttp {
     }
   }
 
+  void configure_server_limits(https_server_t &server) {
+    server.config.max_request_streambuf_size = MAX_REQUEST_SIZE;
+  }
+
   /**
    * @brief Start the HTTPS configuration server.
    */
@@ -2673,6 +2746,7 @@ namespace confighttp {
     server.config.reuse_address = true;
     server.config.address = net::get_bind_address(address_family);
     server.config.port = port_https;
+    configure_server_limits(server);
 
     const auto display_addr = net::get_bind_address_url_host();
 

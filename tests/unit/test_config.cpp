@@ -63,6 +63,21 @@ TEST(ConfigDefaultsTest, UsesAutomaticGamepadSelection) {
   EXPECT_EQ(config::input.gamepad, "auto");
 }
 
+TEST(ConfigDefaultsTest, RequiresStreamEncryptionOnLanAndWan) {
+  EXPECT_EQ(config::stream.lan_encryption_mode, config::ENCRYPTION_MODE_MANDATORY);
+  EXPECT_EQ(config::stream.wan_encryption_mode, config::ENCRYPTION_MODE_MANDATORY);
+  EXPECT_EQ(config::ENCRYPTION_MODE_MANDATORY, 2);
+}
+
+TEST(ConfigDefaultsTest, RestrictsWebUiToLocalhost) {
+  EXPECT_EQ(config::nvhttp.origin_web_ui_allowed, "pc");
+}
+
+TEST(ConfigDefaultsTest, DoesNotAdvertiseOrOpenPorts) {
+  EXPECT_FALSE(config::sunshine.mdns_advertise);
+  EXPECT_FALSE(config::sunshine.flags[config::flag::UPNP]);
+}
+
 TEST(ConfigDefaultsTest, TreatsFp16SdrCapturesAsLinear) {
   EXPECT_FALSE(config::video.fp16_sdr_gamma_encoded);
 }
@@ -233,6 +248,24 @@ TEST_F(ConfigPersistenceTest, ParsesDscpTaggingOption) {
 
   config::apply_config_for_test("dscp_tagging = enabled\n");
   EXPECT_TRUE(config::stream.dscp_tagging);
+}
+
+/**
+ * @brief Verify the mDNS advertising option parses enabled and disabled values.
+ */
+TEST_F(ConfigPersistenceTest, ParsesMdnsAdvertiseOption) {
+  const auto apps_file = config_file().parent_path() / "sunshine_test_config_apps.json";
+  ASSERT_EQ(file_handler::write_file(apps_file.string().c_str(), "{}"), 0);
+  config::stream.file_apps = apps_file.string();
+  const auto restore = util::fail_guard([original = config::sunshine.mdns_advertise]() {
+    config::sunshine.mdns_advertise = original;
+  });
+
+  config::apply_config_for_test("mdns_advertise = enabled\n");
+  EXPECT_TRUE(config::sunshine.mdns_advertise);
+
+  config::apply_config_for_test("mdns_advertise = disabled\n");
+  EXPECT_FALSE(config::sunshine.mdns_advertise);
 }
 
 /**

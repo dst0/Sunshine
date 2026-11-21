@@ -261,6 +261,7 @@ consent prompt for directory ACLs, so the Web UI shows setup steps for correctin
         <td>Description</td>
         <td colspan="2">
             Whether to be notified of new pre-release versions of Sunshine.
+            @note{This build makes no update checks, so this option has no effect.}
         </td>
     </tr>
     <tr>
@@ -1598,6 +1599,30 @@ consent prompt for directory ACLs, so the Web UI shows setup steps for correctin
     </tr>
 </table>
 
+### mdns_advertise
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            Advertise this host on the local network with mDNS (Avahi/Bonjour) so that Moonlight clients
+            discover it automatically. When disabled, add the host in Moonlight by its IP address or host name.
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}
+            disabled
+            @endcode</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            mdns_advertise = enabled
+            @endcode</td>
+    </tr>
+</table>
+
 ### address_family
 
 <table>
@@ -1706,18 +1731,20 @@ consent prompt for directory ACLs, so the Web UI shows setup steps for correctin
         <td>Description</td>
         <td colspan="2">
             The origin of the remote endpoint address that is not denied for HTTPS Web UI.
+            With the default, reach the Web UI from another machine through an SSH tunnel
+            (for example `ssh -L 47990:127.0.0.1:47990 user@host`, then open https://localhost:47990).
         </td>
     </tr>
     <tr>
         <td>Default</td>
         <td colspan="2">@code{}
-            lan
+            pc
             @endcode</td>
     </tr>
     <tr>
         <td>Example</td>
         <td colspan="2">@code{}
-            origin_web_ui_allowed = lan
+            origin_web_ui_allowed = pc
             @endcode</td>
     </tr>
     <tr>
@@ -1798,13 +1825,13 @@ consent prompt for directory ACLs, so the Web UI shows setup steps for correctin
     <tr>
         <td>Default</td>
         <td colspan="2">@code{}
-            0
+            2
             @endcode</td>
     </tr>
     <tr>
         <td>Example</td>
         <td colspan="2">@code{}
-            lan_encryption_mode = 0
+            lan_encryption_mode = 2
             @endcode</td>
     </tr>
     <tr>
@@ -1835,13 +1862,13 @@ consent prompt for directory ACLs, so the Web UI shows setup steps for correctin
     <tr>
         <td>Default</td>
         <td colspan="2">@code{}
-            1
+            2
             @endcode</td>
     </tr>
     <tr>
         <td>Example</td>
         <td colspan="2">@code{}
-            wan_encryption_mode = 1
+            wan_encryption_mode = 2
             @endcode</td>
     </tr>
     <tr>
@@ -2643,7 +2670,8 @@ consent prompt for directory ACLs, so the Web UI shows setup steps for correctin
     </tr>
     <tr>
         <td>kms</td>
-        <td>DRM/KMS screen capture from the kernel. This requires that Sunshine has `cap_sys_admin` capability.
+        <td>DRM/KMS screen capture from the kernel. This requires that Sunshine has `cap_sys_admin` capability,
+            which the packages do not grant (see [Hardening](hardening.md#no-file-capabilities)).
             @note{Applies to Linux only.}</td>
     </tr>
     <tr>

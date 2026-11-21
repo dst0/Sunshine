@@ -84,15 +84,8 @@ dependencies we use in Debian-based, Fedora-based and Arch-based distributions. 
 script to support other distributions.
 
 ##### KMS Capture
-If you are using KMS, patching the Sunshine binary with `setcap` is required. Some post-install scripts handle this. If building
-from source and using the binary directly, this will also work:
-
-```bash
-sudo cp build/sunshine /tmp
-sudo setcap cap_sys_admin,cap_sys_nice+p /tmp/sunshine
-sudo getcap /tmp/sunshine
-sudo mv /tmp/sunshine build/sunshine
-```
+KMS capture needs the `cap_sys_admin` capability. The packages of this build do not grant it; use portal or X11
+capture instead. See [Hardening](hardening.md#no-file-capabilities) for the trade-offs and for granting it manually.
 
 ##### CUDA Toolkit
 When building Sunshine for a system with an NVIDIA GPU, install the CUDA Toolkit before configuring or compiling

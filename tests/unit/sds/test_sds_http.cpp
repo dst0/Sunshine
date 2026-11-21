@@ -72,7 +72,6 @@ namespace {
       config::nvhttp.file_state = (base / "state.json").string();
       config::sunshine.flags[config::flag::FRESH_STATE] = false;
       nvhttp::test_support::reset_client_state();
-      sds::forget_all_connections();
 
       server_creds = write_creds("server", crypto::gen_creds("Sunshine SDS Test Server", 2048));
       client_a = write_creds("a", crypto::gen_creds("SDS Client A", 2048));
@@ -153,7 +152,6 @@ namespace {
       }
       https_server.reset();
       http_server.reset();
-      sds::forget_all_connections();
       nvhttp::test_support::reset_client_state();
       config::nvhttp.file_state = saved_state_file;
       config::sunshine.flags[config::flag::FRESH_STATE] = saved_fresh_state;
@@ -263,7 +261,7 @@ TEST_F(SdsHttpTest, PairedClientGetsCapabilitiesAsJson) {
   EXPECT_EQ(body["permissions"], nlohmann::json::array({"clipboard_read", "clipboard_write", "file_upload", "file_download"}));
   EXPECT_EQ(reply.header.find("Content-Type")->second, "application/json");
   EXPECT_EQ(reply.header.find("Cache-Control")->second, "no-store");
-  EXPECT_EQ(sds::tracked_connections(), 1u);
+  EXPECT_EQ(nvhttp::test_support::verified_connection_count(), 1u);
 }
 
 TEST_F(SdsHttpTest, PlainHttpNeverRoutesSdsEndpoints) {
@@ -291,7 +289,7 @@ TEST_F(SdsHttpTest, ClientsWithoutPairedCertificateAreRejected) {
   const auto reply = send(*unknown, "GET", "/sds/v1/capabilities");
   EXPECT_TRUE(reply.body.empty() || reply.body.find("status_code=\"401\"") != std::string::npos) << reply.body;
   EXPECT_EQ(reply.body.find("\"version\""), std::string::npos);
-  EXPECT_EQ(sds::tracked_connections(), 0u);
+  EXPECT_EQ(nvhttp::test_support::verified_connection_count(), 0u);
 
   // A client unpaired while its keep-alive connection stays open loses access immediately.
   auto a = client(&client_a);

@@ -111,9 +111,7 @@ namespace {
     EXPECT_STREQ(license_menu[6].text, "Virtual HID Broker Benefits");
     EXPECT_EQ(license_menu[6].cb, nullptr);
     verify_virtualhid_benefits_menu(license_menu[6].submenu);
-    EXPECT_STREQ(license_menu[7].text, "Download Virtual HID Broker");
-    EXPECT_NE(license_menu[7].cb, nullptr);
-    EXPECT_EQ(license_menu[8].text, nullptr);
+    EXPECT_EQ(license_menu[7].text, nullptr);
   }
   #endif
 
@@ -141,50 +139,33 @@ namespace {
     EXPECT_STREQ(tray_data.menu[2].submenu[3].text, "Virtual HID Broker Benefits");
     EXPECT_EQ(tray_data.menu[2].submenu[3].cb, nullptr);
     verify_virtualhid_benefits_menu(tray_data.menu[2].submenu[3].submenu);
-    EXPECT_STREQ(tray_data.menu[2].submenu[4].text, "Download Virtual HID Broker");
-    EXPECT_NE(tray_data.menu[2].submenu[4].cb, nullptr);
-    EXPECT_EQ(tray_data.menu[2].submenu[5].text, nullptr);
-    #else
-    EXPECT_STREQ(tray_data.menu[2].submenu[3].text, "Download Virtual HID Broker");
-    EXPECT_NE(tray_data.menu[2].submenu[3].cb, nullptr);
     EXPECT_EQ(tray_data.menu[2].submenu[4].text, nullptr);
-    #endif
-    EXPECT_STREQ(tray_data.menu[3].text, "-");
-    EXPECT_STREQ(tray_data.menu[4].text, "Donate");
-    ASSERT_NE(tray_data.menu[4].submenu, nullptr);
-    EXPECT_STREQ(tray_data.menu[4].submenu[0].text, "GitHub Sponsors");
-    EXPECT_STREQ(tray_data.menu[4].submenu[1].text, "Patreon");
-    EXPECT_STREQ(tray_data.menu[4].submenu[2].text, "PayPal");
-    EXPECT_EQ(tray_data.menu[4].submenu[3].text, nullptr);
-    EXPECT_STREQ(tray_data.menu[5].text, "-");
-    #ifdef _WIN32
-    EXPECT_STREQ(tray_data.menu[6].text, "Reset Display Device Config");
-    EXPECT_NE(tray_data.menu[6].cb, nullptr);
-    EXPECT_STREQ(tray_data.menu[7].text, "Restart");
-    EXPECT_NE(tray_data.menu[7].cb, nullptr);
-    EXPECT_STREQ(tray_data.menu[8].text, "Quit");
-    EXPECT_NE(tray_data.menu[8].cb, nullptr);
-    EXPECT_EQ(tray_data.menu[9].text, nullptr);
     #else
-    EXPECT_STREQ(tray_data.menu[6].text, "Restart");
-    EXPECT_NE(tray_data.menu[6].cb, nullptr);
-    EXPECT_STREQ(tray_data.menu[7].text, "Quit");
-    EXPECT_NE(tray_data.menu[7].cb, nullptr);
-    EXPECT_EQ(tray_data.menu[8].text, nullptr);
-    #endif
-  #else
-    EXPECT_STREQ(tray_data.menu[2].text, "Donate");
-    ASSERT_NE(tray_data.menu[2].submenu, nullptr);
-    EXPECT_STREQ(tray_data.menu[2].submenu[0].text, "GitHub Sponsors");
-    EXPECT_STREQ(tray_data.menu[2].submenu[1].text, "Patreon");
-    EXPECT_STREQ(tray_data.menu[2].submenu[2].text, "PayPal");
     EXPECT_EQ(tray_data.menu[2].submenu[3].text, nullptr);
+    #endif
     EXPECT_STREQ(tray_data.menu[3].text, "-");
+    #ifdef _WIN32
+    EXPECT_STREQ(tray_data.menu[4].text, "Reset Display Device Config");
+    EXPECT_NE(tray_data.menu[4].cb, nullptr);
+    EXPECT_STREQ(tray_data.menu[5].text, "Restart");
+    EXPECT_NE(tray_data.menu[5].cb, nullptr);
+    EXPECT_STREQ(tray_data.menu[6].text, "Quit");
+    EXPECT_NE(tray_data.menu[6].cb, nullptr);
+    EXPECT_EQ(tray_data.menu[7].text, nullptr);
+    #else
     EXPECT_STREQ(tray_data.menu[4].text, "Restart");
     EXPECT_NE(tray_data.menu[4].cb, nullptr);
     EXPECT_STREQ(tray_data.menu[5].text, "Quit");
     EXPECT_NE(tray_data.menu[5].cb, nullptr);
     EXPECT_EQ(tray_data.menu[6].text, nullptr);
+    #endif
+  #else
+    // No entry opens an external website (donation and download links were removed).
+    EXPECT_STREQ(tray_data.menu[2].text, "Restart");
+    EXPECT_NE(tray_data.menu[2].cb, nullptr);
+    EXPECT_STREQ(tray_data.menu[3].text, "Quit");
+    EXPECT_NE(tray_data.menu[3].cb, nullptr);
+    EXPECT_EQ(tray_data.menu[4].text, nullptr);
   #endif
   }
 
@@ -619,9 +600,7 @@ TEST_F(SystemTrayTest, ShowsLicensedMacBrokerDetailsBeforeInitialization) {
   EXPECT_STREQ(menu[4].text, "-");
   EXPECT_STREQ(menu[5].text, "Get/Manage License");
   EXPECT_NE(menu[5].cb, nullptr);
-  EXPECT_STREQ(menu[6].text, "Download Virtual HID Broker");
-  EXPECT_NE(menu[6].cb, nullptr);
-  EXPECT_EQ(menu[7].text, nullptr);
+  EXPECT_EQ(menu[6].text, nullptr);
   EXPECT_EQ(tray_data.notification_title, nullptr);
 }
 

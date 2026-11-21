@@ -285,7 +285,6 @@ function add_arch_deps() {
     'boost'
     'boost-libs'
     'cmake'
-    'curl'
     'doxygen'
     "gcc${gcc_version}"
     "gcc${gcc_version}-libs"
@@ -349,7 +348,6 @@ function add_debian_based_deps() {
     "graphviz"
     "imagemagick"  # necessary for system tray screenshots in unit tests
     "libcap-dev"  # KMS
-    "libcurl4-openssl-dev"
     "libdrm-dev"  # KMS
     "libevdev-dev"
     "libgbm-dev"
@@ -472,7 +470,6 @@ function add_fedora_deps() {
     "ImageMagick"  # necessary for system tray screenshots in unit tests
     "libappstream-glib"
     "libcap-devel"
-    "libcurl-devel"
     "libdrm-devel"
     "libevdev-devel"
     "libX11-devel"  # X11

@@ -31,7 +31,6 @@ makedepends="
 	appstream-glib
 	build-base
 	cmake
-	curl-dev
 	desktop-file-utils
 	eudev-dev
 	freetype-dev

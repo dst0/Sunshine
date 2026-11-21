@@ -146,7 +146,8 @@ jobs:
           fi
           test -f /etc/modules-load.d/60-sunshine.conf
           grep -Fxq 'uhid' /etc/modules-load.d/60-sunshine.conf
-          getcap /usr/bin/sunshine | grep -Eq 'cap_sys_admin,cap_sys_nice[=+]p'
+          # The package must not grant file capabilities (see docs/hardening.md).
+          test -z "$(getcap /usr/bin/sunshine)"
 
           mkdir -p artifacts
           cp "${package_file}" \

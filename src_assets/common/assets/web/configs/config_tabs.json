@@ -69,14 +69,15 @@
     "nameKey": "config.category_network",
     "options": {
       "upnp": "disabled",
+      "mdns_advertise": "disabled",
       "address_family": "ipv4",
       "bind_address": "",
       "port": 47989,
-      "origin_web_ui_allowed": "lan",
+      "origin_web_ui_allowed": "pc",
       "csrf_allowed_origins": "",
       "external_ip": "",
-      "lan_encryption_mode": 0,
-      "wan_encryption_mode": 1,
+      "lan_encryption_mode": 2,
+      "wan_encryption_mode": 2,
       "ping_timeout": 10000,
       "packetsize": 0,
       "dscp_tagging": "enabled"

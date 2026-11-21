@@ -819,8 +819,8 @@ namespace config {
 
     20,  // fecPercentage
 
-    ENCRYPTION_MODE_NEVER,  // lan_encryption_mode
-    ENCRYPTION_MODE_OPPORTUNISTIC,  // wan_encryption_mode
+    ENCRYPTION_MODE_MANDATORY,  // lan_encryption_mode
+    ENCRYPTION_MODE_MANDATORY,  // wan_encryption_mode
     0,  // packetsize
     true,  // dscp_tagging
   };
@@ -829,7 +829,7 @@ namespace config {
    * @brief Default NVHTTP server configuration values used before file and CLI overrides.
    */
   nvhttp_t nvhttp {
-    "lan",  // origin web manager
+    "pc",  // origin web manager
 
     PRIVATE_KEY_FILE,
     CERTIFICATE_FILE,
@@ -887,6 +887,7 @@ namespace config {
     platf::appdata().string() + "/sunshine.log",  // log file
     false,  // notify_pre_releases
     true,  // system_tray
+    false,  // mdns_advertise
     {},  // prep commands
     {},  // csrf_allowed_origins
   };
@@ -2102,6 +2103,7 @@ namespace config {
 
     bool_f(vars, "notify_pre_releases", sunshine.notify_pre_releases);
     bool_f(vars, "system_tray", sunshine.system_tray);
+    bool_f(vars, "mdns_advertise", sunshine.mdns_advertise);
 
     int port = sunshine.port;
     int_between_f(vars, "port"s, port, {1024 + nvhttp::PORT_HTTPS, 65535 - rtsp_stream::RTSP_SETUP_PORT});

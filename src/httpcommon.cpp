@@ -6,6 +6,7 @@
 
 // standard includes
 #include <filesystem>
+#include <fstream>
 #include <utility>
 
 // lib includes
@@ -14,7 +15,6 @@
 #include <boost/property_tree/json_parser.hpp>
 #include <boost/property_tree/ptree.hpp>
 #include <boost/property_tree/xml_parser.hpp>
-#include <curl/curl.h>
 #include <Simple-Web-Server/server_http.hpp>
 #include <Simple-Web-Server/server_https.hpp>
 
@@ -31,6 +31,7 @@
 #include "rtsp.h"
 #include "utility.h"
 #include "uuid.h"
+#include "webui_auth.h"
 
 namespace http {
   using namespace std::literals;
@@ -63,15 +64,23 @@ namespace http {
       config::nvhttp.pkey = (dir / ("pkey-"s + unique_id)).string();
     }
 
+    if (require_user_creds(config::sunshine.credentials_file)) {
+      return -1;
+    }
     if ((!fs::exists(config::nvhttp.pkey) || !fs::exists(config::nvhttp.cert)) && create_creds(config::nvhttp.pkey, config::nvhttp.cert)) {
       return -1;
     }
-    if (!user_creds_exist(config::sunshine.credentials_file)) {
-      BOOST_LOG(info) << "Open the Web UI to set your new username and password and getting started";
-    } else if (reload_user_creds(config::sunshine.credentials_file)) {
-      return -1;
-    }
     return 0;
+  }
+
+  int require_user_creds(const std::string &file) {
+    if (user_creds_exist(file) && reload_user_creds(file) == 0 && !config::sunshine.username.empty() && !config::sunshine.password.empty()) {
+      return 0;
+    }
+
+    BOOST_LOG(fatal) << "No Web UI credentials are configured in ["sv << file << "]. Sunshine will not start without them."sv;
+    BOOST_LOG(fatal) << "Create them first by running: sunshine --creds <username>  (the password is prompted for)"sv;
+    return -1;
   }
 
   /**
@@ -95,16 +104,30 @@ namespace http {
       }
     }
 
-    auto salt = crypto::rand_alphabet(16);
+    // The PBKDF2 hash carries its own salt and iteration count; the legacy salt field is kept
+    // (empty) so the file keeps the layout older code and tools expect.
     outputTree.put("username", username);
-    outputTree.put("salt", salt);
-    outputTree.put("password", util::hex(crypto::hash(password + salt)).to_string());
+    outputTree.put("salt", "");
     try {
+      outputTree.put("password", webui_auth::hash_password(password));
+
+      // The file holds the password hash: make it private to the user running Sunshine before the
+      // hash is written (writing truncates the file and keeps its permissions).
+      {
+        std::ofstream touch {file, std::ios::app};
+      }
+      std::error_code permissions_error;
+      fs::permissions(file, fs::perms::owner_read | fs::perms::owner_write, fs::perm_options::replace, permissions_error);
+      if (permissions_error) {
+        BOOST_LOG(warning) << "Couldn't restrict permissions of ["sv << file << "]: "sv << permissions_error.message();
+      }
+
       pt::write_json(file, outputTree);
     } catch (std::exception &e) {
       BOOST_LOG(error) << "error writing to the credentials file, perhaps try this again as an administrator? Details: "sv << e.what();
       return -1;
     }
+    webui_auth::clear_verification_cache();
 
     BOOST_LOG(info) << "New credentials have been created"sv;
     return 0;
@@ -200,70 +223,5 @@ namespace http {
     }
 
     return 0;
-  }
-
-  /**
-   * @brief Send a static file response for a Web UI request.
-   */
-  bool download_file(const std::string &url, const std::string &file, long ssl_version) {
-    CURL *curl = curl_easy_init();
-    if (!curl) {
-      BOOST_LOG(error) << "Couldn't create CURL instance";
-      return false;
-    }
-
-    if (std::string file_dir = file_handler::get_parent_directory(file); !file_handler::make_directory(file_dir)) {
-      BOOST_LOG(error) << "Couldn't create directory ["sv << file_dir << ']';
-      curl_easy_cleanup(curl);
-      return false;
-    }
-
-    FILE *fp = fopen(file.c_str(), "wb");
-    if (!fp) {
-      BOOST_LOG(error) << "Couldn't open ["sv << file << ']';
-      curl_easy_cleanup(curl);
-      return false;
-    }
-
-    curl_easy_setopt(curl, CURLOPT_SSLVERSION, ssl_version);
-    curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
-    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, fwrite);
-    curl_easy_setopt(curl, CURLOPT_WRITEDATA, fp);
-
-    CURLcode result = curl_easy_perform(curl);
-    if (result != CURLE_OK) {
-      BOOST_LOG(error) << "Couldn't download ["sv << url << ", code:" << result << ']';
-    }
-
-    curl_easy_cleanup(curl);
-    fclose(fp);
-    return result == CURLE_OK;
-  }
-
-  /**
-   * @brief Percent-encode URL data for use in HTTP query strings.
-   */
-  std::string url_escape(const std::string &url) {
-    char *string = curl_easy_escape(nullptr, url.c_str(), static_cast<int>(url.length()));
-    std::string result(string);
-    curl_free(string);
-    return result;
-  }
-
-  /**
-   * @brief Extract the host component from a URL string.
-   */
-  std::string url_get_host(const std::string &url) {
-    CURLU *curlu = curl_url();
-    curl_url_set(curlu, CURLUPART_URL, url.c_str(), static_cast<unsigned int>(url.length()));
-    char *host;
-    if (curl_url_get(curlu, CURLUPART_HOST, &host, 0) != CURLUE_OK) {
-      curl_url_cleanup(curlu);
-      return "";
-    }
-    std::string result(host);
-    curl_free(host);
-    curl_url_cleanup(curlu);
-    return result;
   }
 }  // namespace http

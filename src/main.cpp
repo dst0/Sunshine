@@ -285,6 +285,11 @@ int main(int argc, char *argv[]) {
     return fn->second(argv[0], config::sunshine.cmd.argc, config::sunshine.cmd.argv);
   }
 
+  // There is no unauthenticated first-run setup: refuse to start until Web UI credentials exist.
+  if (http::require_user_creds(config::sunshine.credentials_file)) {
+    return 1;
+  }
+
 #ifdef _WIN32
   config::select_all_gamepad_drivers_if_licensed(lvh::get_license_status().license.licensed());
 #endif
@@ -483,7 +488,7 @@ int main(int argc, char *argv[]) {
 
   std::unique_ptr<platf::deinit_t> mDNS;
   auto sync_mDNS = std::async(std::launch::async, [&mDNS]() {
-    mDNS = platf::publish::start();
+    mDNS = start_mdns_publisher(config::sunshine.mdns_advertise);
   });
 
   std::unique_ptr<platf::deinit_t> upnp_unmap;

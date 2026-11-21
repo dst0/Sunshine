@@ -6,15 +6,10 @@
 #include <algorithm>
 #include <cctype>
 #include <cmath>
-#include <format>
 #include <utility>
-
-// lib includes
-#include <openssl/x509.h>
 
 // local includes
 #include "auth.h"
-#include "src/crypto.h"
 
 namespace sds {
   namespace {
@@ -159,58 +154,6 @@ namespace sds {
       return SMALL_BODY_MAX;
     }
 
-    /**
-     * @brief Connection registry entry.
-     */
-    struct connection_entry_t {
-      std::string cert;  ///< Verified certificate PEM.
-      std::weak_ptr<void> alive;  ///< Expires with the connection.
-    };
-
-    /**
-     * @brief Registry of verified connections keyed by endpoint pair.
-     *
-     * SDS-MERGE: replace with nvhttp::verified_client_cert once hardening lands.
-     */
-    struct connection_registry_t {
-      std::mutex mutex;  ///< Protects entries.
-      std::map<std::string, connection_entry_t, std::less<>> entries;  ///< Entries by endpoint key.
-    };
-
-    /**
-     * @brief Access the process-wide registry.
-     *
-     * @return Registry.
-     */
-    connection_registry_t &registry() {
-      static connection_registry_t instance;
-      return instance;
-    }
-
-    /**
-     * @brief Build the registry key of an endpoint pair.
-     *
-     * @param remote Remote endpoint.
-     * @param local Local endpoint.
-     * @return Key, or empty when either endpoint is unset.
-     */
-    std::string endpoint_key(const boost::asio::ip::tcp::endpoint &remote, const boost::asio::ip::tcp::endpoint &local) {
-      if (remote.port() == 0 || local.port() == 0) {
-        return {};
-      }
-      return std::format("{}|{}|{}|{}", remote.address().to_string(), remote.port(), local.address().to_string(), local.port());
-    }
-
-    /**
-     * @brief Remove entries whose connection is gone. Caller holds the registry mutex.
-     *
-     * @param reg Registry.
-     */
-    void purge_dead(connection_registry_t &reg) {
-      std::erase_if(reg.entries, [](const auto &entry) {
-        return entry.second.alive.expired();
-      });
-    }
   }  // namespace
 
   rate_limiter_t::rate_limiter_t(double rate_per_second):
@@ -359,66 +302,4 @@ namespace sds {
     return result;
   }
 
-  void remember_connection_cert(std::string cert_pem, const boost::asio::ip::tcp::endpoint &remote, const boost::asio::ip::tcp::endpoint &local, std::weak_ptr<void> connection) {
-    const auto key = endpoint_key(remote, local);
-    if (key.empty() || cert_pem.empty()) {
-      return;
-    }
-    auto &reg = registry();
-    std::lock_guard lock {reg.mutex};
-    purge_dead(reg);
-    reg.entries.insert_or_assign(key, connection_entry_t {std::move(cert_pem), std::move(connection)});
-  }
-
-  void remember_verified_connection(SSL *ssl, const boost::asio::ip::tcp::endpoint &remote, const boost::asio::ip::tcp::endpoint &local, std::weak_ptr<void> connection) {
-    if (!ssl) {
-      return;
-    }
-    crypto::x509_t x509 {
-#if OPENSSL_VERSION_MAJOR >= 3
-      SSL_get1_peer_certificate(ssl)
-#else
-      SSL_get_peer_certificate(ssl)
-#endif
-    };
-    if (!x509) {
-      return;
-    }
-    remember_connection_cert(crypto::pem(x509), remote, local, std::move(connection));
-  }
-
-  std::optional<std::string> connection_cert(const boost::asio::ip::tcp::endpoint &remote, const boost::asio::ip::tcp::endpoint &local) {
-    const auto key = endpoint_key(remote, local);
-    if (key.empty()) {
-      return std::nullopt;
-    }
-    auto &reg = registry();
-    std::lock_guard lock {reg.mutex};
-    const auto it = reg.entries.find(key);
-    if (it == reg.entries.end()) {
-      return std::nullopt;
-    }
-    if (it->second.alive.expired()) {
-      reg.entries.erase(it);
-      return std::nullopt;
-    }
-    return it->second.cert;
-  }
-
-  std::optional<std::string> client_cert_pem(const https_request_t &request) {
-    return connection_cert(request.remote_endpoint(), request.local_endpoint());
-  }
-
-  std::size_t tracked_connections() {
-    auto &reg = registry();
-    std::lock_guard lock {reg.mutex};
-    purge_dead(reg);
-    return reg.entries.size();
-  }
-
-  void forget_all_connections() {
-    auto &reg = registry();
-    std::lock_guard lock {reg.mutex};
-    reg.entries.clear();
-  }
 }  // namespace sds

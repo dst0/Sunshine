@@ -1,5 +1,10 @@
 # windows specific dependencies
 
+# Sunshine no longer uses libcurl (it makes no outbound HTTP requests). The Windows build still
+# links the static curl bundle because its link line also supplies system libraries that the
+# static OpenSSL needs; dropping it there has not been verified on a Windows toolchain.
+pkg_check_modules(CURL REQUIRED libcurl)
+
 # MinHook setup - use installed minhook for AMD64, otherwise download minhook-detours for ARM64
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "AMD64")
     # Make sure MinHook is installed for x86/x64

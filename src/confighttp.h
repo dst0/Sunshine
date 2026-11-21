@@ -5,9 +5,12 @@
 #pragma once
 
 // standard includes
+#include <chrono>
+#include <cstddef>
 #include <filesystem>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <string>
 #include <string_view>
 
@@ -28,6 +31,30 @@
 namespace confighttp {
   constexpr auto PORT_HTTPS = 1;  ///< GameStream port offset for port https.
 
+  /**
+   * @brief Content-Security-Policy sent with every Web UI response.
+   * @details Only same-origin scripts, styles, fonts, images and requests; no plugins, framing,
+   *          cross-origin base URIs or cross-origin form posts. Inline styles stay allowed for
+   *          Bootstrap and Vue style bindings. `base-uri 'self'` (not `'none'`) keeps the Web UI's
+   *          own `<base href="/">` working, which relative API URLs rely on.
+   */
+  constexpr auto WEB_UI_CSP =
+    "default-src 'self'; connect-src 'self'; img-src 'self' data: blob:; style-src 'self' 'unsafe-inline'; "
+    "script-src 'self'; font-src 'self'; object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'";
+
+  /**
+   * @brief Maximum request size (headers and body) accepted by the Web UI server.
+   * @details Larger requests are rejected before their body is buffered.
+   */
+  constexpr std::size_t MAX_REQUEST_SIZE = 4 * 1024 * 1024;
+
+  /**
+   * @brief Maximum size of an uploaded cover image after base64 decoding.
+   * @details The image travels base64-encoded (4/3 larger) inside a JSON body, so this is the largest
+   *          image whose upload still fits in @ref MAX_REQUEST_SIZE with 64 KiB to spare (about 2.95 MiB).
+   */
+  constexpr std::size_t COVER_MAX_SIZE = (MAX_REQUEST_SIZE - 64 * 1024) / 4 * 3;
+
   // Type aliases for HTTPS server components
   using https_server_t = SimpleWeb::Server<SimpleWeb::HTTPS>;
   using resp_https_t = std::shared_ptr<typename SimpleWeb::ServerBase<SimpleWeb::HTTPS>::Response>;
@@ -40,6 +67,7 @@ namespace confighttp {
   void send_response(const resp_https_t &response, const nlohmann::json &output_tree);
   void send_unauthorized(const resp_https_t &response, const req_https_t &request);
   void send_redirect(const resp_https_t &response, const req_https_t &request, const char *path);
+  void send_too_many_requests(const resp_https_t &response, const req_https_t &request, std::chrono::seconds retry_after);
   bool authenticate(const resp_https_t &response, const req_https_t &request);
   void not_found(const resp_https_t &response, const std::string &error_message = "Not Found");
   void bad_request(const resp_https_t &response, const std::string &error_message = "Bad Request");
@@ -219,6 +247,36 @@ namespace confighttp {
    * @brief Save an application with optional fields normalized before persistence.
    */
   void saveApp(const resp_https_t &response, const req_https_t &request);
+
+  void savePassword(const resp_https_t &response, const req_https_t &request);
+
+  void uploadCover(const resp_https_t &response, const req_https_t &request);
+
+  /**
+   * @brief Check that uploaded cover data is a PNG image within the size limit.
+   * @details Only PNG is accepted because cover images are served and validated as PNG elsewhere
+   *          (`proc::validate_app_image_path`, `getCover`, the GameStream app asset).
+   *
+   * @param data Decoded image bytes.
+   * @param error Receives a user-facing reason when the image is rejected.
+   * @return File extension (`.png`) for an accepted image, or no value.
+   */
+  std::optional<std::string_view> validate_cover_image(std::string_view data, std::string &error);
+
+  /**
+   * @brief Check that a cover key is safe to use as a file name.
+   *
+   * @param key Cover key from the request.
+   * @return `true` for 1-64 letters, digits, `_` or `-`.
+   */
+  bool is_valid_cover_key(std::string_view key);
+
+  /**
+   * @brief Apply the Web UI server's request limits.
+   *
+   * @param server Server to configure.
+   */
+  void configure_server_limits(https_server_t &server);
 
 #ifdef SUNSHINE_TESTS
   /**

@@ -16,6 +16,7 @@ vi.mock('../../src_assets/common/assets/web/fetch_utils', () => ({
   apiFetch: vi.fn(),
 }))
 
+import { mount } from '@vue/test-utils'
 import { apiFetch } from '../../src_assets/common/assets/web/fetch_utils'
 import Password from '../../src_assets/common/assets/web/Password.vue'
 import Welcome from '../../src_assets/common/assets/web/Welcome.vue'
@@ -32,7 +33,6 @@ afterEach(() => {
 })
 
 describe.each([
-  ['Welcome', Welcome],
   ['Password', Password],
 ])('%s credential saving', (_name, component) => {
   it('posts credentials and reloads only after the success delay', async () => {
@@ -123,21 +123,24 @@ describe.each([
   })
 })
 
-it('clears the welcome loading state when the HTTP response arrives', async () => {
-  const ctx = Welcome.data()
-  const response = Promise.withResolvers()
-  const body = Promise.withResolvers()
-  const json = vi.fn(() => body.promise)
-  apiFetch.mockReturnValue(response.promise)
+describe('Welcome first-run page', () => {
+  it('explains how to create credentials on the host instead of offering a form', () => {
+    vi.unstubAllGlobals()  // Mounting needs the real jsdom document stubbed out by beforeEach.
+    const fetchSpy = vi.fn()
+    vi.stubGlobal('fetch', fetchSpy)
+    const wrapper = mount(Welcome, {
+      global: {
+        mocks: { $t: key => key },
+      },
+    })
 
-  const saving = Welcome.methods.save.call(ctx)
-  expect(ctx.loading).toBe(true)
-
-  response.resolve({ status: 200, json })
-  await vi.waitFor(() => expect(json).toHaveBeenCalledOnce())
-  expect(ctx.loading).toBe(false)
-
-  body.resolve({ status: false, error: 'Invalid credentials' })
-  await saving
-  expect(ctx.error).toBe('Invalid credentials')
+    expect(wrapper.find('form').exists()).toBe(false)
+    expect(wrapper.find('input').exists()).toBe(false)
+    expect(wrapper.text()).toContain('welcome.no_creds')
+    expect(wrapper.text()).toContain('sunshine --creds <username>')
+    expect(Welcome.methods?.save).toBeUndefined()
+    expect(apiFetch).not.toHaveBeenCalled()
+    expect(fetchSpy).not.toHaveBeenCalled()
+    wrapper.unmount()
+  })
 })

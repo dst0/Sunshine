@@ -35,6 +35,7 @@ inputs = [
   "docs/performance_tuning.md",
   "docs/api.md",
   "docs/troubleshooting.md",
+  "docs/hardening.md",
   "docs/building.md",
   "docs/contributing.md",
   "src",

@@ -3,10 +3,18 @@
  * @brief Definitions for entry handling functions.
  */
 // standard includes
+#include <algorithm>
 #include <csignal>
 #include <format>
 #include <iostream>
 #include <thread>
+
+#ifdef _WIN32
+  #include <io.h>
+#else
+  #include <termios.h>
+  #include <unistd.h>
+#endif
 
 // local includes
 #include "config.h"
@@ -38,15 +46,162 @@ void launch_ui(const std::optional<std::string> &path) {
   platf::open_url(get_launch_ui_url(path));
 }
 
-namespace args {
-  int creds(const char *name, int argc, char *argv[]) {
-    if (argc < 2 || argv[0] == "help"sv || argv[1] == "help"sv) {
-      help(name);
+std::unique_ptr<platf::deinit_t> start_mdns_publisher(const bool enabled, const std::function<std::unique_ptr<platf::deinit_t>()> &start_publisher) {
+  if (!enabled) {
+    BOOST_LOG(info) << "mDNS advertising is disabled (mdns_advertise = disabled)"sv;
+    return nullptr;
+  }
+  return start_publisher();
+}
+
+std::unique_ptr<platf::deinit_t> start_mdns_publisher(const bool enabled) {
+  return start_mdns_publisher(enabled, []() {
+    return platf::publish::start();
+  });
+}
+
+namespace {
+  /**
+   * @brief Disable terminal echo on standard input for the lifetime of the object.
+   */
+  class scoped_echo_off_t {
+  public:
+    scoped_echo_off_t() {
+#ifdef _WIN32
+      handle_ = GetStdHandle(STD_INPUT_HANDLE);
+      if (handle_ != INVALID_HANDLE_VALUE && GetConsoleMode(handle_, &mode_)) {
+        restore_ = SetConsoleMode(handle_, mode_ & ~ENABLE_ECHO_INPUT) != 0;
+      }
+#else
+      if (tcgetattr(STDIN_FILENO, &mode_) == 0) {
+        auto silent = mode_;
+        silent.c_lflag &= ~static_cast<tcflag_t>(ECHO);
+        restore_ = tcsetattr(STDIN_FILENO, TCSAFLUSH, &silent) == 0;
+      }
+#endif
     }
 
-    http::save_user_creds(config::sunshine.credentials_file, argv[0], argv[1]);
+    scoped_echo_off_t(const scoped_echo_off_t &) = delete;
+    scoped_echo_off_t &operator=(const scoped_echo_off_t &) = delete;
 
+    ~scoped_echo_off_t() {
+      if (!restore_) {
+        return;
+      }
+#ifdef _WIN32
+      SetConsoleMode(handle_, mode_);
+#else
+      tcsetattr(STDIN_FILENO, TCSAFLUSH, &mode_);
+#endif
+    }
+
+  private:
+#ifdef _WIN32
+    HANDLE handle_ = INVALID_HANDLE_VALUE;  ///< Console input handle.
+    DWORD mode_ = 0;  ///< Console mode restored on destruction.
+#else
+    termios mode_ {};  ///< Terminal attributes restored on destruction.
+#endif
+    bool restore_ = false;  ///< Whether echo was disabled and must be restored.
+  };
+
+  /**
+   * @brief Check whether standard input is an interactive terminal.
+   *
+   * @return `true` when standard input is a terminal.
+   */
+  bool stdin_is_terminal() {
+#ifdef _WIN32
+    return _isatty(_fileno(stdin)) != 0;
+#else
+    return isatty(STDIN_FILENO) != 0;
+#endif
+  }
+
+  /**
+   * @brief Prompt for a password on the terminal without echoing it.
+   *
+   * @param input Terminal input stream.
+   * @param prompt Prompt written to standard error.
+   * @return Entered password, or no value at end of input.
+   */
+  std::optional<std::string> prompt_password(std::istream &input, const std::string_view prompt) {
+    std::cerr << prompt << std::flush;
+    const scoped_echo_off_t echo_off;
+    auto password = args::read_password_line(input);
+    std::cerr << std::endl;
+    return password;
+  }
+}  // namespace
+
+namespace args {
+  std::optional<std::string> read_password_line(std::istream &input) {
+    std::string line;
+    if (!std::getline(input, line) && line.empty()) {
+      return std::nullopt;
+    }
+    if (!line.empty() && line.back() == '\r') {
+      line.pop_back();
+    }
+    return line;
+  }
+
+  int creds(const char *name, int argc, char *argv[], std::istream &input, const bool interactive) {
+    if (argc < 1 || argv[0] == "help"sv || (argc >= 2 && argv[1] == "help"sv)) {
+      help(name);
+      return argc < 1 ? 1 : 0;
+    }
+
+    const std::string username = argv[0];
+    if (username.empty()) {
+      std::cerr << "Error: the username must not be empty." << std::endl;
+      return 1;
+    }
+
+    std::string password;
+    if (argc >= 2) {
+      std::cerr << "Warning: a password on the command line is visible to other users and in the shell history; "
+                   "omit it to be prompted instead."
+                << std::endl;
+      password = argv[1];
+    } else if (interactive) {
+      auto first = prompt_password(input, "New Web UI password: ");
+      auto second = first ? prompt_password(input, "Confirm password: ") : std::nullopt;
+      if (!first || !second) {
+        std::cerr << "Error: no password entered." << std::endl;
+        return 1;
+      }
+      if (*first != *second) {
+        std::cerr << "Error: the passwords do not match." << std::endl;
+        return 1;
+      }
+      password = std::move(*first);
+    } else {
+      auto line = read_password_line(input);
+      if (!line) {
+        std::cerr << "Error: no password on standard input." << std::endl;
+        return 1;
+      }
+      password = std::move(*line);
+    }
+
+    if (password.empty()) {
+      std::cerr << "Error: the password must not be empty." << std::endl;
+      return 1;
+    }
+
+    const auto result = http::save_user_creds(config::sunshine.credentials_file, username, password);
+    std::fill(password.begin(), password.end(), '\0');
+    if (result != 0) {
+      std::cerr << "Error: could not save the credentials to " << config::sunshine.credentials_file << std::endl;
+      return 1;
+    }
+    std::cerr << "Web UI credentials saved to " << config::sunshine.credentials_file << std::endl;
     return 0;
+  }
+
+  int creds(const char *name, int argc, char *argv[]) {
+    return creds(name, argc, argv, std::cin, stdin_is_terminal());
   }
 
   int help(const char *name) {
