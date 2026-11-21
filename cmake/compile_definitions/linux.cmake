@@ -324,6 +324,12 @@ endif ()
 include_directories(SYSTEM
         ${CMAKE_BINARY_DIR}/generated-src)
 
+# Shared clipboard: platform-independent conversion helpers
+list(APPEND PLATFORM_TARGET_FILES
+        "${CMAKE_SOURCE_DIR}/src/sds/clipboard_backend.h"
+        "${CMAKE_SOURCE_DIR}/src/sds/clipboard_backend_util.h"
+        "${CMAKE_SOURCE_DIR}/src/sds/clipboard_backend_util.cpp")
+
 list(APPEND PLATFORM_TARGET_FILES
         "${CMAKE_SOURCE_DIR}/src/platform/linux/publish.cpp"
         "${CMAKE_SOURCE_DIR}/src/platform/linux/graphics.h"
