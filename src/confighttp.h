@@ -117,6 +117,25 @@ namespace confighttp {
   void savePin(const resp_https_t &response, const req_https_t &request);
 
   /**
+   * @brief Replace the secure-desktop-stream permissions of a paired client.
+   *
+   * The body for the POST request should be JSON serialized in the following format:
+   * @code{.json}
+   * {
+   *   "uuid": "<uuid>",
+   *   "permissions": ["clipboard_read", "clipboard_write", "file_upload", "file_download", "mic"]
+   * }
+   * @endcode
+   * Unknown permission names are rejected with 400.
+   *
+   * @param response The HTTP response object.
+   * @param request The HTTP request object.
+   *
+   * @api_examples{/api/clients/permissions|:| POST|:| {"uuid":"<uuid>","permissions":["clipboard_read"]}}
+   */
+  void updateClientPermissions(const resp_https_t &response, const req_https_t &request);
+
+  /**
    * @brief Check whether a detected driver version identifies a development build.
    *
    * Numeric versions beginning with `0.0` and containing at least three

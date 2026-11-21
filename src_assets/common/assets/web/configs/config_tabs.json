@@ -83,6 +83,26 @@
     }
   },
   {
+    "id": "sds",
+    "nameKey": "config.category_clipboard_files",
+    "options": {
+      "clipboard": "enabled",
+      "file_transfer": "enabled",
+      "mic_passthrough": "enabled",
+      "clipboard_text_max": "1M",
+      "clipboard_image_max": "16M",
+      "clipboard_rate": 10,
+      "file_max": "4G",
+      "file_chunk_max": "4M",
+      "file_uploads_max_concurrent": 2,
+      "file_min_free_space": "1G",
+      "file_upload_idle_timeout": 120,
+      "file_inbox_dir": "",
+      "file_outbox_dir": "",
+      "sds_default_permissions": ""
+    }
+  },
+  {
     "id": "files",
     "nameKey": "config.category_config_files",
     "options": {

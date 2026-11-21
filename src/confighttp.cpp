@@ -59,6 +59,8 @@
 #include "platform/permissions.h"
 #include "process.h"
 #include "rtsp.h"
+#include "sds/permissions.h"
+#include "sds/sds.h"
 #include "system_tray.h"
 #include "utility.h"
 #include "uuid.h"
@@ -1469,6 +1471,7 @@ namespace confighttp {
         auto cert = nvhttp::get_cert_by_uuid(uuid);
         if (!cert.empty()) {
           rtsp_stream::terminate_sessions_by_cert(cert);
+          sds::on_client_changed(cert);
         }
 
         if (rtsp_stream::session_count() == 0 && proc::proc.running() > 0) {
@@ -1481,6 +1484,56 @@ namespace confighttp {
       BOOST_LOG(warning) << "Update Client: "sv << e.what();
       bad_request(response, e.what());
     }
+  }
+
+  void updateClientPermissions(const resp_https_t &response, const req_https_t &request) {
+    if (!check_content_type(response, request, "application/json")) {
+      return;
+    }
+    if (!authenticate(response, request)) {
+      return;
+    }
+    std::string client_id = get_client_id(request);
+    if (!validate_csrf_token(response, request, client_id)) {
+      return;
+    }
+
+    print_req(request);
+
+    std::stringstream ss;
+    ss << request->content.rdbuf();
+    const nlohmann::json input_tree = nlohmann::json::parse(ss.str(), nullptr, false);
+    if (input_tree.is_discarded() || !input_tree.is_object()) {
+      bad_request(response, "Invalid JSON");
+      return;
+    }
+    const auto uuid_it = input_tree.find("uuid");
+    const auto permissions_it = input_tree.find("permissions");
+    if (uuid_it == input_tree.end() || !uuid_it->is_string() || permissions_it == input_tree.end() || !permissions_it->is_array()) {
+      bad_request(response, "uuid and permissions are required");
+      return;
+    }
+    std::vector<std::string> permissions;
+    for (const auto &permission : *permissions_it) {
+      if (!permission.is_string()) {
+        bad_request(response, "permissions must be strings");
+        return;
+      }
+      permissions.push_back(permission.get<std::string>());
+    }
+    if (!sds::all_permissions_known(permissions)) {
+      bad_request(response, "Unknown permission");
+      return;
+    }
+
+    const auto uuid = uuid_it->get<std::string>();
+    nlohmann::json output_tree;
+    output_tree["status"] = nvhttp::set_client_permissions(uuid, permissions);
+    if (output_tree["status"]) {
+      output_tree["permissions"] = sds::normalize_permissions(permissions);
+      sds::on_client_changed(nvhttp::get_cert_by_uuid(uuid));
+    }
+    send_response(response, output_tree);
   }
 
   /**
@@ -1519,8 +1572,12 @@ namespace confighttp {
       nlohmann::json output_tree;
       const nlohmann::json input_tree = nlohmann::json::parse(ss);
       const std::string uuid = input_tree.value("uuid", "");
+      const auto cert = nvhttp::get_cert_by_uuid(uuid);
       const bool removed = nvhttp::unpair_client(uuid);
       output_tree["status"] = removed;
+      if (removed) {
+        sds::on_client_changed(cert);
+      }
 
       if (removed && nvhttp::get_all_clients().empty()) {
         proc::proc.terminate();
@@ -2587,6 +2644,7 @@ namespace confighttp {
     server.resource["^/api/clients/unpair$"]["POST"] = unpair;
     server.resource["^/api/clients/unpair-all$"]["POST"] = unpairAll;
     server.resource["^/api/clients/update$"]["POST"] = updateClient;
+    server.resource["^/api/clients/permissions$"]["POST"] = updateClientPermissions;
     server.resource["^/api/config$"]["GET"] = getConfig;
     server.resource["^/api/config$"]["POST"] = saveConfig;
     server.resource["^/api/configLocale$"]["GET"] = getLocale;

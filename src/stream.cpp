@@ -29,6 +29,7 @@
 #include "network.h"
 #include "platform/common.h"
 #include "process.h"
+#include "rtsp.h"
 #include "stream.h"
 #include "sync.h"
 #include "system_tray.h"
@@ -2286,6 +2287,7 @@ namespace stream {
       }
 
       session.shutdown_event->raise(true);
+      rtsp_stream::notify_session_state(session.client_cert, false);
     }
 
     /**
@@ -2372,6 +2374,7 @@ namespace stream {
       session.videoThread = std::jthread {videoThread, &session};
 
       session.state.store(state_e::RUNNING, std::memory_order_relaxed);
+      rtsp_stream::notify_session_state(session.client_cert, true);
 
       // If this is the first session, invoke the platform callbacks
       if (++running_sessions == 1) {
@@ -2460,5 +2463,19 @@ namespace stream {
 
       return session;
     }
+
+#ifdef SUNSHINE_TESTS
+    namespace test_support {
+      std::shared_ptr<session_t> make_session(std::string client_cert, state_e state) {
+        auto session = std::make_shared<session_t>();
+        auto mail = std::make_shared<safe::mail_raw_t>();
+        session->shutdown_event = mail->event<bool>(mail::shutdown);
+        session->mail = std::move(mail);
+        session->client_cert = std::move(client_cert);
+        session->state.store(state, std::memory_order_relaxed);
+        return session;
+      }
+    }  // namespace test_support
+#endif
   }  // namespace session
 }  // namespace stream

@@ -112,6 +112,13 @@
         :platform="platform">
       </network>
 
+      <!-- Clipboard & Files Tab -->
+      <clipboard-files
+        v-if="currentTab === 'sds'"
+        :config="config"
+        :platform="platform">
+      </clipboard-files>
+
       <!-- Files Tab -->
       <files
         v-if="currentTab === 'files'"
@@ -147,11 +154,13 @@
   import Inputs from './configs/tabs/Inputs.vue'
   import Network from './configs/tabs/Network.vue'
   import Files from './configs/tabs/Files.vue'
+  import ClipboardFiles from './configs/tabs/ClipboardFiles.vue'
   import Advanced from './configs/tabs/Advanced.vue'
   import AudioVideo from './configs/tabs/AudioVideo.vue'
   import ContainerEncoders from './configs/tabs/ContainerEncoders.vue'
   import {
     Check,
+    Clipboard,
     Cpu,
     FileCog,
     Gamepad2,
@@ -198,6 +207,7 @@
       Inputs,
       Network,
       Files,
+      ClipboardFiles,
       Advanced,
       // They will be accessible via audio-video, container-encoders only.
       AudioVideo,
@@ -205,6 +215,7 @@
       // icons
       Cpu,
       Check,
+      Clipboard,
       FileCog,
       Gamepad2,
       Gpu,
@@ -318,6 +329,7 @@
           'input': 'Gamepad2',
           'av': 'Volume2',
           'network': 'NetworkIcon',
+          'sds': 'Clipboard',
           'files': 'FileCog',
           'advanced': 'Sliders',
           'nv': 'Gpu',

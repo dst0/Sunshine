@@ -35,6 +35,10 @@
 #include "platform/common.h"
 #include "process.h"
 #include "rtsp.h"
+#include "sds/auth.h"
+#include "sds/http.h"
+#include "sds/permissions.h"
+#include "sds/sds.h"
 #include "string_hash.h"
 #include "system_tray.h"
 #include "utility.h"
@@ -114,6 +118,10 @@ namespace nvhttp {
         if (verify && !verify(session->connection->socket->native_handle())) {
           this->write(session, on_verify_failed);
         } else {
+          if (verify) {
+            // SDS-MERGE: replace with nvhttp::verified_client_cert once hardening lands
+            sds::remember_verified_connection(session->connection->socket->native_handle(), session->request->remote_endpoint(), session->request->local_endpoint(), session->connection);
+          }
           this->read(session);
         }
       } else if (this->on_error) {
@@ -184,6 +192,7 @@ namespace nvhttp {
     std::string uuid;  ///< Persistent Moonlight client UUID associated with the certificate.
     std::string cert;  ///< Certificate PEM string or path.
     bool enabled = true;  ///< Whether this persisted client entry may connect.
+    std::vector<std::string> permissions;  ///< Granted secure-desktop-stream permissions (canonical names).
   };
 
   /**
@@ -290,6 +299,13 @@ namespace nvhttp {
       named_cert_node.put("cert"s, named_cert.cert);
       named_cert_node.put("uuid"s, named_cert.uuid);
       named_cert_node.put("enabled"s, named_cert.enabled);
+      pt::ptree permission_nodes;
+      for (const auto &permission : named_cert.permissions) {
+        pt::ptree permission_node;
+        permission_node.put_value(permission);
+        permission_nodes.push_back(std::make_pair(""s, permission_node));
+      }
+      named_cert_node.add_child("permissions"s, permission_nodes);
       named_cert_nodes.push_back(std::make_pair(""s, named_cert_node));
     }
     root.add_child("root.named_devices"s, named_cert_nodes);
@@ -426,6 +442,15 @@ namespace nvhttp {
         named_cert.cert = el.get_child("cert").get_value<std::string>();
         named_cert.uuid = el.get_child("uuid").get_value<std::string>();
         named_cert.enabled = el.get<bool>("enabled", true);
+        if (const auto permission_nodes = el.get_child_optional("permissions"); permission_nodes) {
+          std::vector<std::string> names;
+          for (const auto &[_, permission_node] : *permission_nodes) {
+            names.push_back(permission_node.get_value<std::string>());
+          }
+          named_cert.permissions = sds::normalize_permissions(names);
+        } else {
+          named_cert.permissions = sds::normalize_permissions(config::sds.default_permissions);
+        }
         client.named_devices.emplace_back(named_cert);
       }
     }
@@ -461,6 +486,7 @@ namespace nvhttp {
     named_cert.name = name;
     named_cert.cert = crypto::pem(certificate);
     named_cert.uuid = uuid_util::uuid_t::generate().string();
+    named_cert.permissions = sds::normalize_permissions(config::sds.default_permissions);
     const auto uuid = named_cert.uuid;
 
     std::lock_guard lock {client_auth_mutex()};
@@ -1306,6 +1332,12 @@ namespace nvhttp {
     tree.put("root.currentgame", current_appid);
     tree.put("root.state", current_appid > 0 ? "SUNSHINE_SERVER_BUSY" : "SUNSHINE_SERVER_FREE");
 
+    // secure-desktop-stream feature discovery (DESIGN 3.1), only for paired HTTPS clients.
+    if constexpr (std::is_same_v<SunshineHTTPS, T>) {
+      tree.put("root.sdsVersion", sds::PROTOCOL_VERSION);
+      tree.put("root.sdsFeatures", sds::server_features());
+    }
+
     std::ostringstream data;
 
     pt::write_xml(data, tree);
@@ -1321,6 +1353,7 @@ namespace nvhttp {
       named_cert_node["name"] = named_cert.name;
       named_cert_node["uuid"] = named_cert.uuid;
       named_cert_node["enabled"] = named_cert.enabled;
+      named_cert_node["permissions"] = named_cert.permissions;
       named_cert_nodes.push_back(named_cert_node);
     }
 
@@ -1743,6 +1776,8 @@ namespace nvhttp {
       resume(host_audio, resp, req);
     };
     https_server.resource["^/cancel$"]["GET"] = cancel;
+    sds::start();
+    sds::http::register_routes(https_server);  // SDS-MERGE: keep max_request_streambuf_size >= sds::max_request_body_size()
 
     https_server.config.reuse_address = true;
     https_server.config.address = net::get_bind_address(address_family);
@@ -1753,6 +1788,7 @@ namespace nvhttp {
     http_server.resource["^/pair$"]["GET"] = [](auto resp, auto req) {
       pair<SimpleWeb::HTTP>(resp, req);
     };
+    sds::http::register_plain_http_guard(http_server);
 
     http_server.config.reuse_address = true;
     http_server.config.address = net::get_bind_address(address_family);
@@ -1780,6 +1816,8 @@ namespace nvhttp {
     // Wait for any event
     shutdown_event->view();
 
+    // Release parked long-polls and in-flight sds responses while the servers still exist.
+    sds::stop();
     https_server.stop();
     http_server.stop();
 
@@ -1850,6 +1888,39 @@ namespace nvhttp {
     return {true, {}};
   }
 
+  std::optional<client_info_t> find_enabled_client(const std::string_view cert_pem) {
+    if (cert_pem.empty()) {
+      return std::nullopt;
+    }
+    std::lock_guard lock {client_auth_mutex()};
+    std::optional<client_info_t> found;
+    for (const auto &named_cert : client_root.named_devices) {
+      if (named_cert.cert != cert_pem) {
+        continue;
+      }
+      if (found || !named_cert.enabled) {
+        // Duplicate or disabled identities fail closed, like the TLS verify callback.
+        return std::nullopt;
+      }
+      found = client_info_t {named_cert.uuid, named_cert.name, named_cert.permissions};
+    }
+    return found;
+  }
+
+  bool set_client_permissions(const std::string_view uuid, const std::vector<std::string> &permissions) {
+    std::lock_guard lock {client_auth_mutex()};
+    for (auto &named_cert : client_root.named_devices) {
+      if (named_cert.uuid == uuid) {
+        named_cert.permissions = sds::normalize_permissions(permissions);
+        if (!config::sunshine.flags[config::flag::FRESH_STATE]) {
+          save_state();
+        }
+        return true;
+      }
+    }
+    return false;
+  }
+
 #ifdef SUNSHINE_TESTS
   namespace test_support {
     std::unique_ptr<SimpleWeb::ServerBase<SunshineHTTPS>> make_https_server(
@@ -1869,6 +1940,54 @@ namespace nvhttp {
       auto server = std::make_unique<test_https_server_t>(certificate_file, private_key_file);
       handler_scope = server->handler_runner;
       return server;
+    }
+
+    std::unique_ptr<SimpleWeb::ServerBase<SunshineHTTPS>> make_verifying_https_server(
+      const std::string &certificate_file,
+      const std::string &private_key_file,
+      std::shared_ptr<SimpleWeb::ScopeRunner> &handler_scope
+    ) {
+      /**
+       * @brief Expose the production HTTPS handler scope to tests.
+       */
+      class test_https_server_t: public SunshineHTTPSServer {
+      public:
+        using SunshineHTTPSServer::handler_runner;
+        using SunshineHTTPSServer::SunshineHTTPSServer;
+      };
+
+      auto server = std::make_unique<test_https_server_t>(certificate_file, private_key_file);
+      handler_scope = server->handler_runner;
+      // Same acceptance rule as the production verify callback in start().
+      server->verify = [](SSL *ssl) {
+        crypto::x509_t x509 {
+#if OPENSSL_VERSION_MAJOR >= 3
+          SSL_get1_peer_certificate(ssl)
+#else
+          SSL_get_peer_certificate(ssl)
+#endif
+        };
+        if (!x509) {
+          return 0;
+        }
+        std::lock_guard lock {client_auth_mutex()};
+        return verify_client_certificate(x509.get()) == nullptr ? 1 : 0;
+      };
+      server->on_verify_failed = [](resp_https_t resp, req_https_t req) {
+        pt::ptree tree;
+        tree.put("root.<xmlattr>.status_code"s, 401);
+        tree.put("root.<xmlattr>.query"s, req->path);
+        tree.put("root.<xmlattr>.status_message"s, "The client is not authorized. Certificate verification failed."s);
+        std::ostringstream data;
+        pt::write_xml(data, tree);
+        resp->write(data.str());
+        resp->close_connection_after_response = true;
+      };
+      return server;
+    }
+
+    void serverinfo_https(resp_https_t response, req_https_t request) {
+      serverinfo<SunshineHTTPS>(std::move(response), std::move(request));
     }
 
     void pair_http(

@@ -373,6 +373,34 @@ namespace nvhttp {
   nlohmann::json get_all_clients();
 
   /**
+   * @brief Paired-client identity used by the secure-desktop-stream endpoints.
+   */
+  struct client_info_t {
+    std::string uuid;  ///< Persistent client UUID.
+    std::string name;  ///< Friendly client name.
+    std::vector<std::string> permissions;  ///< Granted permissions (canonical names).
+  };
+
+  /**
+   * @brief Find the single enabled paired client with exactly this canonical certificate.
+   *
+   * @param cert_pem Canonical PEM certificate.
+   * @return Client, or no value when unknown, disabled or ambiguous.
+   */
+  std::optional<client_info_t> find_enabled_client(std::string_view cert_pem);
+
+  /**
+   * @brief Replace a client's secure-desktop-stream permissions and persist them.
+   *
+   * Unknown names are dropped; the list is stored in canonical order.
+   *
+   * @param uuid Client UUID.
+   * @param permissions Permission names.
+   * @return `true` when the client exists.
+   */
+  bool set_client_permissions(std::string_view uuid, const std::vector<std::string> &permissions);
+
+  /**
    * @brief Remove all paired clients.
    * @examples
    * nvhttp::erase_all_clients();
@@ -404,6 +432,33 @@ namespace nvhttp {
       const std::string &certificate_file,
       const std::string &private_key_file,
       std::shared_ptr<SimpleWeb::ScopeRunner> &handler_scope
+    );
+
+    /**
+     * @brief Create the production HTTPS server with paired-client certificate verification enabled.
+     *
+     * The verify callback applies the same acceptance rule as the one installed by start().
+     *
+     * @param certificate_file Path to the server certificate PEM file.
+     * @param private_key_file Path to the matching private key PEM file.
+     * @param handler_scope Receives the scope runner that prevents destruction during callbacks.
+     * @return HTTPS server ready for test endpoint configuration.
+     */
+    std::unique_ptr<SimpleWeb::ServerBase<SunshineHTTPS>> make_verifying_https_server(
+      const std::string &certificate_file,
+      const std::string &private_key_file,
+      std::shared_ptr<SimpleWeb::ScopeRunner> &handler_scope
+    );
+
+    /**
+     * @brief Dispatch an HTTPS server-info request through the production handler.
+     *
+     * @param response HTTPS response object to populate.
+     * @param request HTTPS request data from the test client.
+     */
+    void serverinfo_https(
+      std::shared_ptr<typename SimpleWeb::ServerBase<SunshineHTTPS>::Response> response,
+      std::shared_ptr<typename SimpleWeb::ServerBase<SunshineHTTPS>::Request> request
     );
 
     /**

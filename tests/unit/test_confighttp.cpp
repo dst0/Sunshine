@@ -345,6 +345,7 @@ protected:
     server->resource["^/pairing-test$"]["POST"] = confighttp::savePin;
     server->resource["^/portal-token-reset-test$"]["POST"] = confighttp::resetPortalToken;
     server->resource["^/api/apps$"]["POST"] = confighttp::saveApp;
+    server->resource["^/api/clients/permissions$"]["POST"] = confighttp::updateClientPermissions;
     server->default_resource["GET"] = confighttp::getFallbackPage;
 
     // Start server
@@ -2247,4 +2248,51 @@ TEST_F(ConfigHttpTest, SaveAppOmitsNullOptionalFieldsAndPreservesConfiguredValue
     EXPECT_FALSE(app.at("prep-cmd").at(0).contains("undo"));
     EXPECT_FALSE(app.at("prep-cmd").at(0).contains("elevated"));
   }
+}
+
+TEST_F(ConfigHttpTest, ClientPermissionsApiValidatesAndPersists) {
+  const auto saved_state_file = config::nvhttp.file_state;
+  const auto saved_fresh_state = config::sunshine.flags[config::flag::FRESH_STATE];
+  config::nvhttp.file_state = (test_web_dir / "client_permissions_state.json").string();
+  config::sunshine.flags[config::flag::FRESH_STATE] = false;
+  nvhttp::test_support::reset_client_state();
+  const auto restore = util::fail_guard([&]() {
+    nvhttp::test_support::reset_client_state();
+    config::nvhttp.file_state = saved_state_file;
+    config::sunshine.flags[config::flag::FRESH_STATE] = saved_fresh_state;
+  });
+  const auto uuid = nvhttp::test_support::add_client("permissions client", crypto::gen_creds("Permissions Client", 2048).x509, true);
+  ASSERT_FALSE(uuid.empty());
+
+  SimpleWeb::CaseInsensitiveMultimap unauthenticated;
+  unauthenticated.emplace("Content-Type", "application/json");
+  const auto denied = client->request("POST", "/api/clients/permissions", nlohmann::json {{"uuid", uuid}, {"permissions", {"mic"}}}.dump(), unauthenticated);
+  EXPECT_EQ(denied->status_code, "401 Unauthorized");
+
+  const std::array invalid_bodies {
+    std::string {"not json"},
+    nlohmann::json::array().dump(),
+    nlohmann::json {{"uuid", uuid}}.dump(),
+    nlohmann::json {{"permissions", nlohmann::json::array()}}.dump(),
+    nlohmann::json {{"uuid", uuid}, {"permissions", "mic"}}.dump(),
+    nlohmann::json {{"uuid", uuid}, {"permissions", {1}}}.dump(),
+    nlohmann::json {{"uuid", uuid}, {"permissions", {"mic", "root"}}}.dump(),
+  };
+  for (const auto &body : invalid_bodies) {
+    const auto response = client->request("POST", "/api/clients/permissions", body, authenticated_json_headers());
+    EXPECT_EQ(response->status_code, "400 Bad Request") << body;
+  }
+
+  const auto unknown = client->request("POST", "/api/clients/permissions", nlohmann::json {{"uuid", "missing"}, {"permissions", {"mic"}}}.dump(), authenticated_json_headers());
+  ASSERT_EQ(unknown->status_code, "200 OK");
+  EXPECT_FALSE(nlohmann::json::parse(unknown->content.string()).at("status").get<bool>());
+
+  const auto updated = client->request("POST", "/api/clients/permissions", nlohmann::json {{"uuid", uuid}, {"permissions", {"file_upload", "clipboard_read", "file_upload"}}}.dump(), authenticated_json_headers());
+  ASSERT_EQ(updated->status_code, "200 OK");
+  const auto body = nlohmann::json::parse(updated->content.string());
+  EXPECT_TRUE(body.at("status").get<bool>());
+  EXPECT_EQ(body.at("permissions"), nlohmann::json::array({"clipboard_read", "file_upload"}));
+  const auto clients = nvhttp::get_all_clients();
+  ASSERT_EQ(clients.size(), 1U);
+  EXPECT_EQ(clients.at(0).at("permissions"), nlohmann::json::array({"clipboard_read", "file_upload"}));
 }

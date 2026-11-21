@@ -42,6 +42,7 @@
 #include "nvhttp.h"
 #include "platform/permissions.h"
 #include "process.h"
+#include "sds/sds.h"
 #include "system_tray.h"
 #include "upnp.h"
 #include "video.h"
@@ -437,6 +438,9 @@ int main(int argc, char *argv[]) {
 
   // If any of the following fail, we log an error and continue event though sunshine will not function correctly.
   // This allows access to the UI to fix configuration problems or view the logs.
+
+  // The clipboard backend must exist before platf::init() so portal capture sessions request clipboard access.
+  sds::prepare_clipboard_backend();
 
   auto platf_deinit_guard = platf::init();
   if (!platf_deinit_guard) {

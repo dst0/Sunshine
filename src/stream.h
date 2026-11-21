@@ -94,5 +94,18 @@ namespace stream {
      * @return PEM certificate associated with the session's client.
      */
     const std::string &client_cert(session_t &session);
+
+#ifdef SUNSHINE_TESTS
+    namespace test_support {
+      /**
+       * @brief Create a session object in a given state without starting any worker thread.
+       *
+       * @param client_cert Client certificate of the session.
+       * @param state Initial state.
+       * @return Session suitable for rtsp_stream::test_support::insert_session().
+       */
+      std::shared_ptr<session_t> make_session(std::string client_cert, state_e state);
+    }  // namespace test_support
+#endif
   }  // namespace session
 }  // namespace stream

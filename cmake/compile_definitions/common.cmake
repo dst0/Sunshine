@@ -130,6 +130,50 @@ endif()
 
 list(APPEND PLATFORM_TARGET_FILES ${NVENC_SOURCES})
 
+# secure-desktop-stream host core (clipboard core, file transfer, /sds/v1 endpoints)
+set(SDS_SOURCES
+        "${CMAKE_SOURCE_DIR}/src/sds/auth.cpp"
+        "${CMAKE_SOURCE_DIR}/src/sds/auth.h"
+        "${CMAKE_SOURCE_DIR}/src/sds/clipboard.cpp"
+        "${CMAKE_SOURCE_DIR}/src/sds/clipboard.h"
+        "${CMAKE_SOURCE_DIR}/src/sds/clipboard_backend.h"
+        "${CMAKE_SOURCE_DIR}/src/sds/events.cpp"
+        "${CMAKE_SOURCE_DIR}/src/sds/events.h"
+        "${CMAKE_SOURCE_DIR}/src/sds/files.cpp"
+        "${CMAKE_SOURCE_DIR}/src/sds/files.h"
+        "${CMAKE_SOURCE_DIR}/src/sds/fs.h"
+        "${CMAKE_SOURCE_DIR}/src/sds/fs_common.cpp"
+        "${CMAKE_SOURCE_DIR}/src/sds/http.cpp"
+        "${CMAKE_SOURCE_DIR}/src/sds/http.h"
+        "${CMAKE_SOURCE_DIR}/src/sds/nfc_data.h"
+        "${CMAKE_SOURCE_DIR}/src/sds/permissions.cpp"
+        "${CMAKE_SOURCE_DIR}/src/sds/permissions.h"
+        "${CMAKE_SOURCE_DIR}/src/sds/reply.h"
+        "${CMAKE_SOURCE_DIR}/src/sds/sds.cpp"
+        "${CMAKE_SOURCE_DIR}/src/sds/sds.h"
+        "${CMAKE_SOURCE_DIR}/src/sds/text.cpp"
+        "${CMAKE_SOURCE_DIR}/src/sds/text.h"
+        "${CMAKE_SOURCE_DIR}/src/sds/worker.cpp"
+        "${CMAKE_SOURCE_DIR}/src/sds/worker.h")
+if(WIN32)
+    list(APPEND SDS_SOURCES "${CMAKE_SOURCE_DIR}/src/sds/fs_windows.cpp")
+    list(APPEND PLATFORM_LIBRARIES ole32)
+else()
+    list(APPEND SDS_SOURCES "${CMAKE_SOURCE_DIR}/src/sds/fs_posix.cpp")
+endif()
+# Platform clipboard backends (src/platform/<os>/clipboard*.cpp) define sds::clipboard::make_backend();
+# without one, link the fallback that reports the clipboard as unavailable.
+set(SDS_HAS_PLATFORM_CLIPBOARD OFF)
+foreach(sds_platform_source IN LISTS PLATFORM_TARGET_FILES)
+    if(sds_platform_source MATCHES "/src/platform/[^/]+/clipboard[^/]*\\.(cpp|mm)$")
+        set(SDS_HAS_PLATFORM_CLIPBOARD ON)
+    endif()
+endforeach()
+if(NOT SDS_HAS_PLATFORM_CLIPBOARD)
+    list(APPEND SDS_SOURCES "${CMAKE_SOURCE_DIR}/src/sds/clipboard_backend_none.cpp")
+endif()
+list(APPEND PLATFORM_TARGET_FILES ${SDS_SOURCES})
+
 set(SUNSHINE_TARGET_FILES
         "${CMAKE_SOURCE_DIR}/third-party/moonlight-common-c/src/Input.h"
         "${CMAKE_SOURCE_DIR}/third-party/moonlight-common-c/src/Rtsp.h"

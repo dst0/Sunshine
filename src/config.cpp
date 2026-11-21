@@ -5,6 +5,7 @@
 // standard includes
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <charconv>
 #include <cstdint>
 #include <filesystem>
@@ -12,6 +13,7 @@
 #include <fstream>
 #include <functional>
 #include <iostream>
+#include <limits>
 #include <thread>
 #include <unordered_map>
 #include <utility>
@@ -30,6 +32,7 @@
 #include "nvhttp.h"
 #include "platform/common.h"
 #include "rtsp.h"
+#include "sds/permissions.h"
 #include "utility.h"
 
 #ifdef _WIN32
@@ -889,6 +892,26 @@ namespace config {
   };
 
   /**
+   * @brief Default secure-desktop-stream settings (DESIGN 4.3) used before file and CLI overrides.
+   */
+  sds_t sds {
+    true,  // clipboard
+    true,  // file_transfer
+    true,  // mic_passthrough
+    1024 * 1024,  // clipboard_text_max: 1 MiB
+    16 * 1024 * 1024,  // clipboard_image_max: 16 MiB
+    10,  // clipboard_rate per second
+    4ull * 1024 * 1024 * 1024,  // file_max: 4 GiB
+    4 * 1024 * 1024,  // file_chunk_max: 4 MiB
+    2,  // file_uploads_max_concurrent
+    1024ull * 1024 * 1024,  // file_min_free_space: 1 GiB
+    std::chrono::seconds {120},  // file_upload_idle_timeout
+    {},  // file_inbox_dir: user's Downloads/Moonlight
+    {},  // file_outbox_dir: inbox/Outbox
+    {},  // sds_default_permissions: none
+  };
+
+  /**
    * @brief Return whether a character terminates a configuration line.
    *
    * @param ch Character currently being classified by the parser.
@@ -1650,6 +1673,159 @@ namespace config {
     return true;
   }
 
+  std::optional<std::uint64_t> parse_byte_size(std::string_view text) {
+    const auto trim = [](std::string_view value) {
+      const auto first = value.find_first_not_of(" \t\"");
+      if (first == std::string_view::npos) {
+        return std::string_view {};
+      }
+      return value.substr(first, value.find_last_not_of(" \t\"") - first + 1);
+    };
+    text = trim(text);
+    std::uint64_t number = 0;
+    const auto [end, ec] = std::from_chars(text.data(), text.data() + text.size(), number);
+    if (ec != std::errc {} || end == text.data()) {
+      return std::nullopt;
+    }
+    std::string suffix;
+    for (const char ch : trim(std::string_view {end, static_cast<std::size_t>(text.data() + text.size() - end)})) {
+      suffix.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(ch))));
+    }
+    unsigned shift = 0;
+    if (suffix.empty() || suffix == "b") {
+      shift = 0;
+    } else if (suffix == "k" || suffix == "kb" || suffix == "kib") {
+      shift = 10;
+    } else if (suffix == "m" || suffix == "mb" || suffix == "mib") {
+      shift = 20;
+    } else if (suffix == "g" || suffix == "gb" || suffix == "gib") {
+      shift = 30;
+    } else if (suffix == "t" || suffix == "tb" || suffix == "tib") {
+      shift = 40;
+    } else {
+      return std::nullopt;
+    }
+    if (shift && number > (std::numeric_limits<std::uint64_t>::max() >> shift)) {
+      return std::nullopt;
+    }
+    return number << shift;
+  }
+
+  /**
+   * @brief Consume a byte-size setting and keep it only when inside an inclusive range.
+   *
+   * @param vars Parsed configuration entries; consumed keys are erased.
+   * @param name Configuration key to consume.
+   * @param destination Destination updated when the value parses and is in range.
+   * @param range Inclusive accepted range.
+   */
+  template<class T>
+  void byte_size_between(config_map_t &vars, const std::string &name, T &destination, const std::pair<std::uint64_t, std::uint64_t> &range) {
+    std::string tmp;
+    string_f(vars, name, tmp);
+    if (tmp.empty()) {
+      return;
+    }
+    const auto parsed = parse_byte_size(tmp);
+    if (!parsed || *parsed < range.first || *parsed > range.second) {
+      BOOST_LOG(warning) << "Ignoring invalid value for '"sv << name << "': "sv << tmp;
+      return;
+    }
+    destination = static_cast<T>(*parsed);
+  }
+
+  /**
+   * @brief Consume a positive integer setting with an optional unit suffix (`10/s`, `120s`).
+   *
+   * @param vars Parsed configuration entries; consumed keys are erased.
+   * @param name Configuration key to consume.
+   * @param suffix Accepted unit suffix.
+   * @param range Inclusive accepted range.
+   * @return Parsed value, or no value when absent or invalid.
+   */
+  std::optional<int> unit_int_between(config_map_t &vars, const std::string &name, std::string_view suffix, const std::pair<int, int> &range) {
+    std::string tmp;
+    string_f(vars, name, tmp);
+    if (tmp.empty()) {
+      return std::nullopt;
+    }
+    std::string_view value {tmp};
+    while (!value.empty() && (value.back() == ' ' || value.back() == '"')) {
+      value.remove_suffix(1);
+    }
+    while (!value.empty() && (value.front() == ' ' || value.front() == '"')) {
+      value.remove_prefix(1);
+    }
+    if (value.ends_with(suffix)) {
+      value.remove_suffix(suffix.size());
+    }
+    int parsed = 0;
+    const auto [end, ec] = std::from_chars(value.data(), value.data() + value.size(), parsed);
+    if (ec != std::errc {} || end != value.data() + value.size() || parsed < range.first || parsed > range.second) {
+      BOOST_LOG(warning) << "Ignoring invalid value for '"sv << name << "': "sv << tmp;
+      return std::nullopt;
+    }
+    return parsed;
+  }
+
+  /**
+   * @brief Consume an absolute directory setting.
+   *
+   * @param vars Parsed configuration entries; consumed keys are erased.
+   * @param name Configuration key to consume.
+   * @param destination Destination updated when the value is empty or an absolute path.
+   */
+  void absolute_dir_f(config_map_t &vars, const std::string &name, std::string &destination) {
+    std::string tmp;
+    string_f(vars, name, tmp);
+    if (tmp.empty()) {
+      return;
+    }
+    if (!fs::path {tmp}.is_absolute()) {
+      BOOST_LOG(warning) << "Ignoring '"sv << name << "': the path must be absolute"sv;
+      return;
+    }
+    destination = std::move(tmp);
+  }
+
+  /**
+   * @brief Apply the secure-desktop-stream settings (clipboard, file transfer, microphone).
+   *
+   * @param vars Parsed configuration entries; consumed keys are erased.
+   */
+  void apply_sds_config(config_map_t &vars) {
+    constexpr std::uint64_t KiB = 1024;
+    constexpr std::uint64_t MiB = 1024 * KiB;
+    constexpr std::uint64_t GiB = 1024 * MiB;
+    constexpr std::uint64_t TiB = 1024 * GiB;
+
+    bool_f(vars, "clipboard", sds.clipboard);
+    bool_f(vars, "file_transfer", sds.file_transfer);
+    bool_f(vars, "mic_passthrough", sds.mic_passthrough);
+    byte_size_between(vars, "clipboard_text_max", sds.clipboard_text_max, {1, 16 * MiB});
+    byte_size_between(vars, "clipboard_image_max", sds.clipboard_image_max, {1, 64 * MiB});
+    if (const auto rate = unit_int_between(vars, "clipboard_rate", "/s"sv, {1, 1000}); rate) {
+      sds.clipboard_rate = *rate;
+    }
+    byte_size_between(vars, "file_max", sds.file_max, {1, 16 * TiB});
+    byte_size_between(vars, "file_chunk_max", sds.file_chunk_max, {64 * KiB, 32 * MiB});
+    if (const auto uploads = unit_int_between(vars, "file_uploads_max_concurrent", ""sv, {1, 16}); uploads) {
+      sds.file_uploads_max_concurrent = *uploads;
+    }
+    byte_size_between(vars, "file_min_free_space", sds.file_min_free_space, {0, 16 * TiB});
+    if (const auto timeout = unit_int_between(vars, "file_upload_idle_timeout", "s"sv, {10, 86400}); timeout) {
+      sds.file_upload_idle_timeout = std::chrono::seconds {*timeout};
+    }
+    absolute_dir_f(vars, "file_inbox_dir", sds.file_inbox_dir);
+    absolute_dir_f(vars, "file_outbox_dir", sds.file_outbox_dir);
+
+    std::string default_permissions;
+    string_f(vars, "sds_default_permissions", default_permissions);
+    if (!default_permissions.empty()) {
+      sds.default_permissions = ::sds::parse_permission_list(default_permissions);
+    }
+  }
+
   /**
    * @brief Apply parsed configuration entries to the global runtime configuration.
    *
@@ -1657,6 +1833,7 @@ namespace config {
    */
   void apply_config(config_map_t &&vars) {
     log_config_settings(vars, true);
+    apply_sds_config(vars);
 
     int_f(vars, "qp", video.qp);
     int_between_f(vars, "hevc_mode", video.hevc_mode, {0, 3});

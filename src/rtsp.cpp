@@ -14,6 +14,7 @@ extern "C" {
 #include <array>
 #include <cctype>
 #include <format>
+#include <mutex>
 #include <set>
 #include <unordered_map>
 #include <utility>
@@ -636,6 +637,22 @@ namespace rtsp_stream {
     }
 
     /**
+     * @brief Check whether a running session belongs to a client certificate.
+     *
+     * @param cert Canonical PEM certificate.
+     * @return `true` when a session for the certificate is RUNNING.
+     */
+    bool has_running_session(std::string_view cert) {
+      auto lg = _session_slots.lock();
+      for (const auto &slot : *_session_slots) {
+        if (stream::session::client_cert(*slot) == cert && stream::session::state(*slot) == stream::session::state_e::RUNNING) {
+          return true;
+        }
+      }
+      return false;
+    }
+
+    /**
      * @brief Removes the provided session from the set of sessions.
      * @param session The session to remove.
      */
@@ -720,6 +737,63 @@ namespace rtsp_stream {
     server.clear_by_cert(cert);
     input::terminate_gamepads(cert);
   }
+
+  bool has_running_session(std::string_view cert_pem) {
+    if (cert_pem.empty()) {
+      return false;
+    }
+    return server.has_running_session(cert_pem);
+  }
+
+  namespace {
+    /**
+     * @brief Mutex protecting the session observer.
+     *
+     * @return Mutex.
+     */
+    std::mutex &session_observer_mutex() {
+      static std::mutex mutex;
+      return mutex;
+    }
+
+    /**
+     * @brief Installed session observer.
+     *
+     * @return Observer storage.
+     */
+    session_observer_t &session_observer() {
+      static session_observer_t observer;
+      return observer;
+    }
+  }  // namespace
+
+  void set_session_observer(session_observer_t observer) {
+    std::lock_guard lock {session_observer_mutex()};
+    session_observer() = std::move(observer);
+  }
+
+  void notify_session_state(std::string_view cert_pem, bool running) {
+    session_observer_t observer;
+    {
+      std::lock_guard lock {session_observer_mutex()};
+      observer = session_observer();
+    }
+    if (observer) {
+      observer(cert_pem, running);
+    }
+  }
+
+#ifdef SUNSHINE_TESTS
+  namespace test_support {
+    void insert_session(const std::shared_ptr<stream::session_t> &session) {
+      server.insert(session);
+    }
+
+    void remove_session(const std::shared_ptr<stream::session_t> &session) {
+      server.remove(session);
+    }
+  }  // namespace test_support
+#endif
 
   /**
    * @brief Send the serialized response over the active socket.
