@@ -75,6 +75,7 @@ set(PLATFORM_TARGET_FILES
         "${CMAKE_SOURCE_DIR}/src/platform/windows/audio.cpp"
         "${CMAKE_SOURCE_DIR}/src/platform/windows/utf_utils.cpp"
         "${CMAKE_SOURCE_DIR}/src/platform/windows/utf_utils.h"
+        "${CMAKE_SOURCE_DIR}/src/platform/windows/clipboard.cpp"
         "${CMAKE_SOURCE_DIR}/src/sds/clipboard_backend.h"
         "${CMAKE_SOURCE_DIR}/src/sds/clipboard_backend_util.h"
         "${CMAKE_SOURCE_DIR}/src/sds/clipboard_backend_util.cpp"
@@ -103,6 +104,8 @@ list(PREPEND PLATFORM_LIBRARIES
         libwinpthread.a
         minhook::minhook
         ntdll
+        ole32  # shared clipboard: COM and CreateStreamOnHGlobal for WIC
+        windowscodecs  # shared clipboard: WIC PNG encode/decode
         setupapi
         shlwapi
         synchronization.lib
