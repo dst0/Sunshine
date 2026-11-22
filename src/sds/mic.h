@@ -216,11 +216,14 @@ namespace sds::mic {
     /**
      * @brief Construct a jitter buffer.
      *
+     * macOS can deliver five 20 ms Opus frames together in a 100 ms capture callback.
+     * The defaults buffer through the next burst with headroom for arrival jitter.
+     *
      * @param target_frames Frames buffered before playout (re)starts.
      * @param max_frames Maximum frames buffered ahead of playout (older ones are skipped).
      * @param max_concealed Consecutive concealed frames before playout stops until rebuffered.
      */
-    explicit jitter_buffer_t(std::size_t target_frames = 2, std::size_t max_frames = 3, std::size_t max_concealed = 5);
+    explicit jitter_buffer_t(std::size_t target_frames = 7, std::size_t max_frames = 12, std::size_t max_concealed = 5);
 
     /**
      * @brief Queue an authenticated frame.

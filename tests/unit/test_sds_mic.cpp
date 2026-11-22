@@ -515,6 +515,35 @@ TEST(SdsMicJitterTest, StopsAfterSustainedLossAndRestartsAfterRebuffering) {
   EXPECT_TRUE(jitter.playing());
 }
 
+TEST(SdsMicJitterTest, DefaultRebuffersAfterDrainingQueuedAudioAndConcealingLoss) {
+  using action = sds::mic::jitter_buffer_t::action_e;
+  sds::mic::jitter_buffer_t jitter;
+  for (std::uint8_t seq = 0; seq < 10; ++seq) {
+    ASSERT_TRUE(jitter.push(seq, {seq}));
+  }
+  for (std::uint8_t expected = 0; expected < 10; ++expected) {
+    const auto step = jitter.pop();
+    ASSERT_EQ(step.action, action::decode);
+    EXPECT_EQ(step.payload, std::vector<std::uint8_t> {expected});
+  }
+  for (int i = 0; i < 5; ++i) {
+    EXPECT_EQ(jitter.pop().action, action::plc);
+  }
+  EXPECT_EQ(jitter.pop().action, action::none);
+  EXPECT_FALSE(jitter.playing());
+  EXPECT_FALSE(jitter.push(9, {9}));
+
+  for (std::uint8_t seq = 50; seq < 56; ++seq) {
+    ASSERT_TRUE(jitter.push(seq, {seq}));
+    EXPECT_EQ(jitter.pop().action, action::none);
+  }
+  ASSERT_TRUE(jitter.push(56, {56}));
+  const auto step = jitter.pop();
+  EXPECT_EQ(step.action, action::decode);
+  EXPECT_EQ(step.payload, std::vector<std::uint8_t> {50});
+  EXPECT_TRUE(jitter.playing());
+}
+
 TEST(SdsMicJitterTest, BoundsLatencyBySkippingOldFrames) {
   using action = sds::mic::jitter_buffer_t::action_e;
   sds::mic::jitter_buffer_t jitter {2, 3, 5};
@@ -529,6 +558,64 @@ TEST(SdsMicJitterTest, BoundsLatencyBySkippingOldFrames) {
   }
   EXPECT_FALSE(jitter.push(3, {3}));
   EXPECT_EQ(jitter.size(), 0u);
+}
+
+TEST(SdsMicJitterTest, PreservesMacCaptureBurstsWithBoundedJitter) {
+  using action = sds::mic::jitter_buffer_t::action_e;
+  constexpr std::uint32_t frames_per_burst = 5;
+  constexpr std::uint32_t bursts = 100;
+  constexpr auto frames = frames_per_burst * bursts;
+  const auto payload_for = [](std::uint32_t sequence) {
+    return std::vector<std::uint8_t> {static_cast<std::uint8_t>(sequence >> 8), static_cast<std::uint8_t>(sequence)};
+  };
+
+  for (int late_ms : {0, 7}) {
+    for (int tick_phase_ms = 0; tick_phase_ms < 20; ++tick_phase_ms) {
+      for (bool receive_first : {false, true}) {
+        SCOPED_TRACE(::testing::Message() << "late_ms=" << late_ms << ", phase=" << tick_phase_ms << ", receive_first=" << receive_first);
+        sds::mic::jitter_buffer_t jitter;
+        std::uint32_t sent = 0;
+        std::uint32_t decoded = 0;
+        for (int tick = tick_phase_ms; tick < 10200 && decoded < frames; tick += 20) {
+          while (sent < frames) {
+            const auto burst = static_cast<int>(sent / frames_per_burst);
+            // Every other burst is late; the next arrives early enough to maintain 50 frames/s.
+            const auto arrival = burst * 100 + (burst % 2) * late_ms;
+            if (arrival > tick || (arrival == tick && !receive_first)) {
+              break;
+            }
+            for (std::uint32_t i = 0; i < frames_per_burst; ++i, ++sent) {
+              ASSERT_TRUE(jitter.push(sent, payload_for(sent)));
+            }
+          }
+          const auto step = jitter.pop();
+          if (decoded == 0 && step.action == action::none) {
+            continue;  // initial buffering
+          }
+          ASSERT_EQ(step.action, action::decode);
+          ASSERT_EQ(step.payload, payload_for(decoded));
+          ++decoded;
+        }
+        EXPECT_EQ(decoded, frames);
+        EXPECT_EQ(jitter.size(), 0u);
+      }
+    }
+  }
+}
+
+TEST(SdsMicJitterTest, DefaultBoundsLatencyDuringBurstOverload) {
+  using action = sds::mic::jitter_buffer_t::action_e;
+  sds::mic::jitter_buffer_t jitter;
+  for (std::uint8_t seq = 0; seq < 25; ++seq) {
+    ASSERT_TRUE(jitter.push(seq, {seq}));
+  }
+  for (std::uint8_t seq = 13; seq < 25; ++seq) {
+    const auto step = jitter.pop();
+    ASSERT_EQ(step.action, action::decode);
+    EXPECT_EQ(step.payload, std::vector<std::uint8_t> {seq});
+  }
+  EXPECT_EQ(jitter.size(), 0u);
+  EXPECT_FALSE(jitter.push(0, {0}));
 }
 
 TEST(SdsMicRingTest, PrefillUnderrunAndOverflow) {
@@ -774,7 +861,7 @@ TEST_F(SdsMicTest, DeactivationWaitsForInFlightPlayoutThenStopsFurtherWrites) {
   ASSERT_EQ(session.start(), 0);
   ASSERT_EQ(session.handle_datagram(make_ping(test_ping_payload), client, t0), result_e::ping_bound);
   sds::mic::packet_cipher_t cipher {test_key};
-  for (std::uint32_t seq = 0; seq < 2; ++seq) {
+  for (std::uint32_t seq = 0; seq < 10; ++seq) {
     ASSERT_EQ(session.handle_datagram(cipher.encrypt(seq, seq * 960, vector1_opus), client, t0 + seq * 20ms), result_e::accepted);
   }
   auto tick = std::async(std::launch::async, [&]() {
@@ -807,7 +894,7 @@ TEST_F(SdsMicTest, RevocationStopsBufferedAudioAndTheVirtualSink) {
     ASSERT_EQ(h.session->start(), 0);
     ASSERT_EQ(h.session->handle_datagram(make_ping(test_ping_payload), client, t0), result_e::ping_bound);
     sds::mic::packet_cipher_t cipher {test_key};
-    for (std::uint32_t seq = 0; seq < 3; ++seq) {
+    for (std::uint32_t seq = 0; seq < 10; ++seq) {
       ASSERT_EQ(h.session->handle_datagram(cipher.encrypt(seq, seq * 960, vector1_opus), client, t0 + seq * 20ms), result_e::accepted);
     }
     if (mode == 0) {
@@ -876,16 +963,18 @@ TEST_F(SdsMicTest, TickDecodesConcealsAndWritesToTheSink) {
   auto send = [&](std::uint32_t seq) {
     return h.session->handle_datagram(encryptor.encrypt(seq, seq * 960, std::vector<std::uint8_t> {static_cast<std::uint8_t>(seq + 10)}), client, t0 + seq * 20ms);
   };
-  ASSERT_EQ(send(0), result_e::accepted);
-  ASSERT_EQ(send(1), result_e::accepted);
+  for (std::uint32_t seq : {0, 1, 3, 4, 5, 6, 7}) {
+    ASSERT_EQ(send(seq), result_e::accepted);  // 2 is lost
+  }
   h.session->tick();  // 0
   h.session->tick();  // 1
-  ASSERT_EQ(send(3), result_e::accepted);  // 2 is lost
   h.session->tick();  // 2 via FEC
-  h.session->tick();  // 3
+  for (int seq = 3; seq <= 7; ++seq) {
+    h.session->tick();
+  }
   h.session->tick();  // PLC
 
-  ASSERT_EQ(h.calls->size(), 5u);
+  ASSERT_EQ(h.calls->size(), 9u);
   EXPECT_FALSE((*h.calls)[0].fec);
   EXPECT_EQ((*h.calls)[0].packet, std::vector<std::uint8_t> {10});
   EXPECT_EQ((*h.calls)[1].packet, std::vector<std::uint8_t> {11});
@@ -893,10 +982,10 @@ TEST_F(SdsMicTest, TickDecodesConcealsAndWritesToTheSink) {
   EXPECT_EQ((*h.calls)[2].packet, std::vector<std::uint8_t> {13});
   EXPECT_FALSE((*h.calls)[3].fec);
   EXPECT_EQ((*h.calls)[3].packet, std::vector<std::uint8_t> {13});
-  EXPECT_TRUE((*h.calls)[4].packet.empty());  // PLC
+  EXPECT_TRUE(h.calls->back().packet.empty());  // PLC
 
   auto samples = h.sink->copy();
-  ASSERT_EQ(samples.size(), 5u * sds::mic::FRAME_SAMPLES);
+  ASSERT_EQ(samples.size(), 9u * sds::mic::FRAME_SAMPLES);
   EXPECT_EQ(samples[0], 10);
   EXPECT_EQ(samples[2 * sds::mic::FRAME_SAMPLES], 13);
   EXPECT_EQ(samples.back(), -1);
