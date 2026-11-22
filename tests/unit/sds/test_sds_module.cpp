@@ -14,6 +14,7 @@
 #include <chrono>
 #include <filesystem>
 #include <future>
+#include <fstream>
 #include <map>
 #include <mutex>
 #include <set>
@@ -24,7 +25,14 @@
 
 // local includes
 #include <src/config.h>
+#include <src/sds/file_clipboard.h>
 #include <src/sds/sds.h>
+
+#ifdef __linux__
+  #include <cstdlib>
+  #include <sys/stat.h>
+  #include <unistd.h>
+#endif
 #include <src/utility.h>
 
 namespace fs = std::filesystem;
@@ -360,6 +368,65 @@ TEST_F(SdsModuleTest, NativeFileClipboardBaselineNeverSendsDataAndEpochEndsOnRec
   EXPECT_EQ(call(file_clipboard_put, push).status, 409);
   EXPECT_EQ(clipboard->write_count(), 0);
 }
+
+#ifdef __linux__
+TEST_F(SdsModuleTest, NativeFileClipboardReadsCompleteLocalCopyAndRejectsNonFiles) {
+  const auto allowed = [] { return true; };
+  const auto path = base / "synthetic.bin";
+  ASSERT_TRUE(std::ofstream(path, std::ios::binary).write("A\0B", 3));
+  const auto prefix = "copy\nfile://";
+  const auto native = prefix + path.string();
+  const auto bundle = sds::file_clipboard::read_offer(native, allowed);
+  ASSERT_TRUE(bundle);
+  const auto expected = nlohmann::json::parse(R"({"files":[{"name":"synthetic.bin","data":"QQBC"}]})");
+  EXPECT_EQ(*bundle, expected);
+  EXPECT_FALSE(sds::file_clipboard::read_offer(native, [] { return false; }));
+  EXPECT_FALSE(sds::file_clipboard::read_offer("cut\nfile://" + path.string(), allowed));
+  EXPECT_FALSE(sds::file_clipboard::read_offer("copy\nfile://localhost" + path.string(), allowed));
+  fs::create_symlink(path, base / "symlink.bin");
+  EXPECT_FALSE(sds::file_clipboard::read_offer(prefix + (base / "symlink.bin").string(), allowed));
+  EXPECT_FALSE(sds::file_clipboard::read_offer(prefix + base.string(), allowed));
+  ASSERT_EQ(mkfifo((base / "pipe").c_str(), 0600), 0);
+  EXPECT_FALSE(sds::file_clipboard::read_offer(prefix + (base / "pipe").string(), allowed));
+  EXPECT_FALSE(sds::file_clipboard::read_offer(native + "\nfile://" + (base / "pipe").string(), allowed));
+}
+
+TEST_F(SdsModuleTest, NativeFileClipboardStagesPrivateFilesAndRejectsUnsafeBundles) {
+  const auto *runtime = std::getenv("XDG_RUNTIME_DIR");
+  if (!geteuid() || !runtime || runtime != "/run/user/" + std::to_string(geteuid())) {
+    GTEST_SKIP() << "Needs the non-root user's actual private Linux runtime directory";
+  }
+  constexpr auto bundle = R"({"files":[{"name":"synthetic.bin","data":"QQBC"},{"name":"empty.txt","data":""}]})";
+  const auto allowed = [] { return true; };
+  auto staged = sds::file_clipboard::stage(bundle, allowed);
+  ASSERT_TRUE(staged);
+  const auto offer = sds::file_clipboard::native_offer(*staged);
+  ASSERT_TRUE(offer.starts_with("copy\nfile://"));
+  const auto end = offer.find('\n', 5);
+  ASSERT_NE(end, std::string_view::npos);
+  const fs::path path = std::string {offer.substr(12, end - 12)};
+  struct stat file {};
+  ASSERT_EQ(stat(path.c_str(), &file), 0);
+  EXPECT_EQ(file.st_mode & 0777, 0600u);
+  EXPECT_EQ(file.st_size, 3);
+  EXPECT_FALSE(sds::file_clipboard::read_offer(offer, allowed)) << "receiving then recopying a staged path never echoes";
+  auto stop = std::atomic_int {0};
+  EXPECT_FALSE(sds::file_clipboard::stage(bundle, [&] { return stop++ < 3; }));
+  for (const auto invalid : {
+         R"({"files":[{"name":"../escape","data":"QQBC"}]})",
+         R"({"files":[{"name":"a","data":"YR=="}]})",
+         R"({"files":[{"name":"a","name":"b","data":"QQBC"}]})",
+         R"({"files":[{"name":"É.txt","data":""},{"name":"é.txt","data":""}]})",
+         R"({"files":[[["unbounded"]]]})",
+         R"({"files":[{"name":"a","data":0}]})",
+       }) {
+    EXPECT_FALSE(sds::file_clipboard::stage(invalid, allowed));
+  }
+  staged.reset();
+  EXPECT_FALSE(fs::exists(path));
+  EXPECT_FALSE(fs::exists(path.parent_path()));
+}
+#endif
 
 TEST_F(SdsModuleTest, PipelineStatusesAreWiredThroughTheDispatcher) {
   EXPECT_EQ(call(sds::op_e::capabilities, req("stranger")).status, 401);
