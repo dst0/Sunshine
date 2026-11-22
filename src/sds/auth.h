@@ -25,6 +25,7 @@ namespace sds {
   enum class feature_e {
     clipboard,  ///< Shared clipboard (`clipboard`).
     files,  ///< File transfer (`file_transfer`).
+    file_clipboard,  ///< Native file clipboard on an explicitly isolated Linux desktop.
     mic,  ///< Microphone passthrough (`mic_passthrough`).
   };
 
@@ -36,6 +37,9 @@ namespace sds {
     events,  ///< `GET /sds/v1/events`.
     clipboard_get,  ///< `GET /sds/v1/clipboard`.
     clipboard_put,  ///< `PUT /sds/v1/clipboard`.
+    file_clipboard_baseline,  ///< Read generation and stream epoch, never data.
+    file_clipboard_get,  ///< Read a new native file copy.
+    file_clipboard_put,  ///< Offer files to the native file manager.
     upload_create,  ///< `POST /sds/v1/files/uploads`.
     upload_chunk,  ///< `PUT /sds/v1/files/uploads/{id}`.
     upload_complete,  ///< `POST /sds/v1/files/uploads/{id}/complete`.

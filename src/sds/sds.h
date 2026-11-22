@@ -33,6 +33,7 @@ namespace sds {
   struct options_t {
     bool clipboard = true;  ///< `clipboard` switch.
     bool file_transfer = true;  ///< `file_transfer` switch.
+    bool file_clipboard = false;  ///< Explicit opt-in for the isolated X11 desktop.
     bool mic_passthrough = true;  ///< `mic_passthrough` switch.
     std::size_t clipboard_text_max = 1024 * 1024;  ///< `clipboard_text_max`.
     std::size_t clipboard_image_max = 16 * 1024 * 1024;  ///< `clipboard_image_max`.
@@ -73,6 +74,8 @@ namespace sds {
     std::string content_type;  ///< `Content-Type`.
     std::string client_seq;  ///< `X-SDS-Client-Seq`.
     std::string body;  ///< Request body.
+    std::string file_clipboard_seq {};  ///< `X-SDS-Clipboard-Seq`.
+    std::string file_clipboard_epoch {};  ///< `X-SDS-Clipboard-Epoch`.
   };
 
   /**

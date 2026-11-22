@@ -18,6 +18,7 @@
 
 // local includes
 #include <src/sds/auth.h>
+#include <src/sds/file_clipboard.h>
 
 using namespace std::literals;
 
@@ -204,6 +205,44 @@ TEST_F(SdsAuthorizeTest, MissingPermissionIsForbiddenPerEndpoint) {
   clients[PAIRED].permissions.reset();
   EXPECT_TRUE(check(sds::op_e::capabilities).ok()) << "capabilities needs steps 1-4 only";
   EXPECT_TRUE(check(sds::op_e::events).ok());
+}
+
+TEST_F(SdsAuthorizeTest, NativeFileClipboardRequiresBothPermissionsPerDirectionAndAnActiveStream) {
+  using enum sds::op_e;
+  using enum sds::permission_e;
+  EXPECT_EQ(check(file_clipboard_baseline).status, 404);
+  features.insert(sds::feature_e::file_clipboard);
+  auto &permissions = clients[PAIRED].permissions;
+  permissions.reset();
+  const auto grant = [&](sds::permission_e permission) { permissions.set(static_cast<std::size_t>(permission)); };
+  for (const auto permission : {clipboard_write, file_upload, clipboard_read, file_download}) {
+    permissions.reset();
+    grant(permission);
+    EXPECT_EQ(check(file_clipboard_baseline).status, 403);
+    EXPECT_EQ(check(file_clipboard_get).status, 403);
+    EXPECT_EQ(check(file_clipboard_put).status, 403);
+  }
+  permissions.reset();
+  grant(clipboard_write);
+  grant(file_upload);
+  EXPECT_TRUE(check(file_clipboard_baseline).ok());
+  EXPECT_EQ(check(file_clipboard_get).status, 403);
+  EXPECT_TRUE(check(file_clipboard_put, sds::file_clipboard::wire_max, "application/json").ok());
+  EXPECT_EQ(check(file_clipboard_put, sds::file_clipboard::wire_max + 1, "application/json").status, 413);
+  permissions.reset();
+  grant(clipboard_read);
+  grant(file_download);
+  EXPECT_TRUE(check(file_clipboard_baseline).ok());
+  EXPECT_TRUE(check(file_clipboard_get).ok());
+  EXPECT_EQ(check(file_clipboard_put).status, 403);
+  streaming.clear();
+  EXPECT_EQ(check(file_clipboard_get).status, 409);
+  streaming.insert(PAIRED);
+  features.erase(sds::feature_e::clipboard);
+  EXPECT_EQ(check(file_clipboard_baseline).status, 404);
+  features.insert(sds::feature_e::clipboard);
+  features.erase(sds::feature_e::files);
+  EXPECT_EQ(check(file_clipboard_baseline).status, 404);
 }
 
 TEST_F(SdsAuthorizeTest, ClipboardRateLimitAppliesToBothDirections) {

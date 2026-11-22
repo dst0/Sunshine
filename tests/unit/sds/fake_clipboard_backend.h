@@ -28,6 +28,8 @@ namespace test_utils::sds {
     int starts = 0;  ///< Successful start() calls.
     int stops = 0;  ///< stop() calls.
     int reads = 0;  ///< read() calls.
+    bool native_file_clipboard = false;  ///< Allow tests to model the isolated X11 native selection.
+    std::uint64_t generation = 1;
     bool started = false;  ///< Currently watching.
     bool fail_start = false;  ///< Make start() fail.
     bool fail_write = false;  ///< Make write() fail.
@@ -43,6 +45,7 @@ namespace test_utils::sds {
       {
         std::lock_guard lock {mutex};
         content = std::move(item);
+        ++generation;
         callback = on_change;
       }
       if (callback) {
@@ -116,6 +119,16 @@ namespace test_utils::sds {
         callback();
       }
       return 0;
+    }
+
+    [[nodiscard]] bool supports_file_clipboard() const override {
+      const std::lock_guard lock {state_->mutex};
+      return state_->native_file_clipboard;
+    }
+
+    std::optional<std::uint64_t> file_clipboard_generation() override {
+      const std::lock_guard lock {state_->mutex};
+      return state_->started ? std::optional {state_->generation} : std::nullopt;
     }
 
     [[nodiscard]] std::string_view name() const override {

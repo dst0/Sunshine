@@ -139,6 +139,8 @@ set(SDS_SOURCES
         "${CMAKE_SOURCE_DIR}/src/sds/clipboard_backend.h"
         "${CMAKE_SOURCE_DIR}/src/sds/events.cpp"
         "${CMAKE_SOURCE_DIR}/src/sds/events.h"
+        "${CMAKE_SOURCE_DIR}/src/sds/file_clipboard.cpp"
+        "${CMAKE_SOURCE_DIR}/src/sds/file_clipboard.h"
         "${CMAKE_SOURCE_DIR}/src/sds/files.cpp"
         "${CMAKE_SOURCE_DIR}/src/sds/files.h"
         "${CMAKE_SOURCE_DIR}/src/sds/fs.h"

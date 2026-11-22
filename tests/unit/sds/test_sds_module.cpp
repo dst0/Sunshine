@@ -316,6 +316,51 @@ TEST_F(SdsModuleTest, ClipboardIsUnavailableWithoutBackendOrWhenDisabled) {
   EXPECT_EQ(clipboard->starts, 0) << "a disabled clipboard never creates or starts a backend";
 }
 
+TEST_F(SdsModuleTest, NativeFileClipboardBaselineNeverSendsDataAndEpochEndsOnReconnect) {
+  using enum sds::op_e;
+  options.file_clipboard = true;
+  {
+    const std::lock_guard lock {clipboard->mutex};
+    clipboard->native_file_clipboard = true;
+  }
+  start();
+  sds::on_stream_state(CERT_A, true);
+  sds::drain_for_test();
+  EXPECT_NE(sds::server_features().find("file_clipboard"), std::string::npos);
+  set_permission(CERT_A, sds::permission_e::file_download, false);
+  const auto baseline = call(file_clipboard_get);
+  ASSERT_EQ(baseline.status, 204);
+  EXPECT_FALSE(baseline.json);
+  EXPECT_TRUE(baseline.body.empty());
+  const auto epoch = header(baseline, "X-SDS-Clipboard-Epoch");
+  const auto seq = header(baseline, "X-SDS-Clipboard-Seq");
+  ASSERT_EQ(epoch.size(), 32);
+  ASSERT_FALSE(seq.empty());
+  auto pull = req(CERT_A, {{"after", seq}});
+  pull.file_clipboard_epoch = epoch;
+  EXPECT_EQ(call(file_clipboard_get, pull).status, 403);
+  set_permission(CERT_A, sds::permission_e::file_download, true);
+  EXPECT_EQ(call(file_clipboard_get, pull).status, 204);
+
+  set_streaming(CERT_A, false);
+  sds::on_stream_state(CERT_A, false);
+  EXPECT_EQ(call(file_clipboard_get, pull).status, 409);
+  set_streaming(CERT_A, true);
+  sds::on_stream_state(CERT_A, true);
+  sds::drain_for_test();
+  const auto reconnect = call(file_clipboard_get);
+  ASSERT_EQ(reconnect.status, 204);
+  EXPECT_EQ(header(reconnect, "X-SDS-Clipboard-Seq"), seq);
+  EXPECT_NE(header(reconnect, "X-SDS-Clipboard-Epoch"), epoch);
+  EXPECT_EQ(call(file_clipboard_get, pull).status, 409);
+  auto push = req(CERT_A, {}, R"({"files":[{"name":"synthetic.txt","data":"eA=="}]})");
+  push.content_type = "application/json";
+  push.file_clipboard_seq = seq;
+  push.file_clipboard_epoch = epoch;
+  EXPECT_EQ(call(file_clipboard_put, push).status, 409);
+  EXPECT_EQ(clipboard->write_count(), 0);
+}
+
 TEST_F(SdsModuleTest, PipelineStatusesAreWiredThroughTheDispatcher) {
   EXPECT_EQ(call(sds::op_e::capabilities, req("stranger")).status, 401);
   set_streaming(CERT_A, false);

@@ -28,6 +28,7 @@
 #include "clipboard_linux.h"
 #include "portal_session.h"
 #include "src/logging.h"
+#include "src/sds/file_clipboard.h"
 
 using namespace std::literals;
 
@@ -259,6 +260,11 @@ namespace sds::clipboard {
   }  // namespace
 
   std::unique_ptr<backend_t> make_backend() {
+#ifdef SUNSHINE_BUILD_X11_CLIPBOARD
+    if (file_clipboard::private_x11_enabled()) {
+      return x11::make_backend();
+    }
+#endif
     bool usable = false;
 #ifdef SUNSHINE_BUILD_PORTAL
     // Creating a backend means the feature is enabled: RemoteDesktop sessions created from now

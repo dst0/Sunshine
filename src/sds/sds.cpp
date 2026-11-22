@@ -16,6 +16,7 @@
 // local includes
 #include "clipboard.h"
 #include "events.h"
+#include "file_clipboard.h"
 #include "sds.h"
 #include "src/config.h"
 #include "src/logging.h"
@@ -263,6 +264,9 @@ namespace sds {
         hooks.post = [this](std::function<void()> job) {
           return control_->post(std::move(job));
         };
+        if (options_.file_clipboard && backend && backend->supports_file_clipboard()) {
+          file_clipboard_backend_ = backend.get();
+        }
         clipboard_ = std::make_unique<clipboard::core_t>(
           std::move(backend),
           clipboard::limits_t {options_.clipboard_text_max, options_.clipboard_image_max},
@@ -312,6 +316,7 @@ namespace sds {
         }
         events_.shutdown();
         control_->post([this]() {
+          reset_file_clipboard();
           clipboard_->shutdown();
         });
         io_->post([this]() {
@@ -345,6 +350,8 @@ namespace sds {
             return options_.clipboard && clipboard_->available();
           case feature_e::files:
             return options_.file_transfer;
+          case feature_e::file_clipboard:
+            return file_clipboard_backend_ && options_.clipboard && options_.file_transfer;
           case feature_e::mic:
             return options_.mic_passthrough && mic_available.load();
         }
@@ -370,6 +377,9 @@ namespace sds {
         if (feature_available(feature_e::files)) {
           add("files"sv);
         }
+        if (feature_available(feature_e::file_clipboard)) {
+          add("file_clipboard"sv);
+        }
         if (feature_available(feature_e::mic)) {
           add("mic"sv);
         }
@@ -384,6 +394,9 @@ namespace sds {
        * @param respond Completion callback.
        */
       void handle(op_e op, request_t request, reply_fn respond) {
+        if (op == op_e::file_clipboard_get && !request.query.contains("after")) {
+          op = op_e::file_clipboard_baseline;
+        }
         const auto authority = request.cert_pem ? request_authority(*request.cert_pem) : authority_t {};
         request_view_t view;
         view.cert_pem = request.cert_pem;
@@ -421,6 +434,11 @@ namespace sds {
             return;
           case op_e::clipboard_put:
             clipboard_put(client, std::move(request), authority, std::move(respond));
+            return;
+          case op_e::file_clipboard_baseline:
+          case op_e::file_clipboard_get:
+          case op_e::file_clipboard_put:
+            handle_file_clipboard(op, client, std::move(request), authority, std::move(respond));
             return;
           case op_e::upload_create:
           case op_e::upload_chunk:
@@ -699,7 +717,7 @@ namespace sds {
        */
       reply_t capabilities(const client_t &client) const {
         nlohmann::json features = nlohmann::json::array();
-        for (const auto &[feature, name] : {std::pair {feature_e::clipboard, "clipboard"sv}, std::pair {feature_e::files, "files"sv}, std::pair {feature_e::mic, "mic"sv}}) {
+        for (const auto &[feature, name] : {std::pair {feature_e::clipboard, "clipboard"sv}, std::pair {feature_e::files, "files"sv}, std::pair {feature_e::file_clipboard, "file_clipboard"sv}, std::pair {feature_e::mic, "mic"sv}}) {
           if (feature_available(feature)) {
             features.push_back(name);
           }
@@ -859,6 +877,196 @@ namespace sds {
         }
       }
 
+      struct file_clipboard_session_t {
+        std::string cert;
+        std::string epoch;
+        std::uint64_t floor;
+      };
+
+      bool only_file_clipboard_stream(const std::string &cert) const {
+        const std::lock_guard lock {active_mutex_};
+        return active_.size() == 1 && active_.contains(cert);
+      }
+
+      void reset_file_clipboard() {
+        file_clipboard_session_.reset();
+        if (file_clipboard_owned_) {
+          file_clipboard_backend_->retire_file_clipboard(*file_clipboard_owned_);
+          file_clipboard_owned_.reset();
+        }
+        // Keep the small, private lease until its timer fires: a file manager can
+        // have already requested the URI and still be reading the staged bytes.
+      }
+
+      static reply_t stale_file_clipboard() {
+        return reply_t::failure(409, "clipboard_conflict", "file clipboard has changed or the stream ended");
+      }
+
+      static reply_t file_clipboard_reply(std::string_view epoch, std::uint64_t seq, std::optional<nlohmann::json> bundle = std::nullopt) {
+        reply_t result;
+        result.status = bundle ? 200 : 204;
+        result.json = std::move(bundle);
+        result.headers.emplace_back("X-SDS-Clipboard-Seq", std::to_string(seq));
+        result.headers.emplace_back("X-SDS-Clipboard-Epoch", epoch);
+        return result;
+      }
+
+      void handle_file_clipboard(op_e op, const client_t &client, request_t request, const authority_t &authority, reply_fn respond) {
+        const bool put = op == op_e::file_clipboard_put;
+        const bool baseline = op == op_e::file_clipboard_baseline;
+        const auto after = query_value(request, "after");
+        const auto seq = put ? parse_u64(request.file_clipboard_seq) : after ? parse_u64(*after) : std::nullopt;
+        if ((!put && !request.body.empty()) || request.query.size() != (after ? 1u : 0u) ||
+            (put && after) || (!baseline && !seq) ||
+            (!put && !request.file_clipboard_seq.empty()) ||
+            (baseline ? !request.file_clipboard_epoch.empty() : !files::is_id(request.file_clipboard_epoch))) {
+          respond(reply_t::failure(400, "bad_request", "invalid file clipboard request"));
+          return;
+        }
+        if (put && parse_content_type(request.content_type).first != "application/json") {
+          respond(reply_t::failure(415, "unsupported_media_type", "file clipboard requires application/json"));
+          return;
+        }
+        const auto reservation = reserve_work(client.cert, put ? request.body.capacity() : baseline ? 0 : file_clipboard::wire_max);
+        if (!reservation) {
+          admission_rejected(respond);
+          return;
+        }
+        if (!control_->post([this, op, put, baseline, cert = client.cert, seq, epoch = std::move(request.file_clipboard_epoch), body = std::move(request.body), authority, reservation, respond]() mutable {
+              if (auto failure = deferred_failure(cert, op, authority)) {
+                respond(std::move(*failure));
+                return;
+              }
+              if (!only_file_clipboard_stream(cert)) {
+                respond(stale_file_clipboard());
+                return;
+              }
+              const auto before = file_clipboard_backend_->file_clipboard_generation();
+              if (!before) {
+                respond(unavailable());
+                return;
+              }
+              if (baseline) {
+                if (auto failure = deferred_failure(cert, op, authority)) {
+                  respond(std::move(*failure));
+                  return;
+                }
+                if (!file_clipboard_session_ || file_clipboard_session_->cert != cert) {
+                  auto token = file_clipboard::new_epoch();
+                  if (!token) {
+                    respond(unavailable());
+                    return;
+                  }
+                  file_clipboard_session_ = file_clipboard_session_t {cert, std::move(*token), *before};
+                } else {
+                  file_clipboard_session_->floor = *before;
+                }
+                respond(file_clipboard_reply(file_clipboard_session_->epoch, *before));
+                return;
+              }
+              if (!file_clipboard_session_ || file_clipboard_session_->cert != cert || file_clipboard_session_->epoch != epoch ||
+                  *seq < file_clipboard_session_->floor || *seq > *before || (put && *seq != *before)) {
+                respond(stale_file_clipboard());
+                return;
+              }
+              if (!put && *seq == *before) {
+                respond(file_clipboard_reply(epoch, *before));
+                return;
+              }
+              if (put && file_clipboard_leases_.size() >= 4) {
+                admission_rejected(respond);
+                return;
+              }
+              std::optional<clipboard::item_t> item;
+              if (!put) {
+                item = file_clipboard_backend_->read(clipboard::limits_t {0, 0, true}, options_.clipboard_read_timeout);
+                if (file_clipboard_backend_->file_clipboard_generation() != before) {
+                  respond(stale_file_clipboard());
+                  return;
+                }
+                if (!item || !item->file_offer) {
+                  if (auto failure = deferred_failure(cert, op, authority)) {
+                    respond(std::move(*failure));
+                  } else {
+                    respond(file_clipboard_reply(epoch, *before));
+                  }
+                  return;
+                }
+              }
+              if (!io_->post([this, op, put, cert, epoch, before = *before, authority, body = std::move(body), item = std::move(item), reservation, respond]() {
+                    const auto allowed = [&]() {
+                      return !deferred_failure(cert, op, authority) && only_file_clipboard_stream(cert);
+                    };
+                    if (!allowed()) {
+                      respond(stale_file_clipboard());
+                      return;
+                    }
+                    auto staged = put ? file_clipboard::stage(body, allowed) : nullptr;
+                    auto bundle = !put ? file_clipboard::read_offer(*item->file_offer, allowed) : std::nullopt;
+                    if (!control_->post([this, op, put, cert, epoch, before, authority, staged = std::move(staged), bundle = std::move(bundle), reservation, respond]() mutable {
+                          if (auto failure = deferred_failure(cert, op, authority)) {
+                            respond(std::move(*failure));
+                            return;
+                          }
+                          if (!only_file_clipboard_stream(cert) || !file_clipboard_session_ || file_clipboard_session_->epoch != epoch ||
+                              before < file_clipboard_session_->floor || file_clipboard_backend_->file_clipboard_generation() != before) {
+                            respond(stale_file_clipboard());
+                            return;
+                          }
+                          if (!put) {
+                            if (auto failure = deferred_failure(cert, op, authority)) {
+                              respond(std::move(*failure));
+                            } else {
+                              respond(file_clipboard_reply(epoch, before, std::move(bundle)));
+                            }
+                            return;
+                          }
+                          if (!staged) {
+                            respond(reply_t::failure(422, "invalid_file_bundle", "file bundle cannot be safely staged"));
+                            return;
+                          }
+                          if (file_clipboard_leases_.size() >= 4) {
+                            admission_rejected(respond);
+                            return;
+                          }
+                          const auto committed = file_clipboard_backend_->publish_file_clipboard(before, std::string {file_clipboard::native_offer(*staged)}, [this, cert, op, authority]() {
+                            return !deferred_failure(cert, op, authority) && only_file_clipboard_stream(cert);
+                          });
+                          if (!committed) {
+                            respond(stale_file_clipboard());
+                            return;
+                          }
+                          if (file_clipboard_owned_) {
+                            control_->post_at(worker_t::clock::now() + 15s, [this, previous = *file_clipboard_owned_]() {
+                              file_clipboard_leases_.erase(previous);
+                            });
+                          }
+                          file_clipboard_owned_ = *committed;
+                          file_clipboard_leases_.emplace(*committed, std::move(staged));
+                          control_->post_at(worker_t::clock::now() + 3min, [this, seq = *committed]() {
+                            if (file_clipboard_owned_ == seq) {
+                              file_clipboard_backend_->retire_file_clipboard(seq);
+                              file_clipboard_owned_.reset();
+                            }
+                            file_clipboard_leases_.erase(seq);
+                          });
+                          if (auto failure = deferred_failure(cert, op, authority)) {
+                            reset_file_clipboard();
+                            respond(std::move(*failure));
+                            return;
+                          }
+                          respond(file_clipboard_reply(epoch, *committed));
+                        })) {
+                      respond(unavailable());
+                    }
+                  })) {
+                respond(unavailable());
+              }
+            })) {
+          respond(unavailable());
+        }
+      }
+
       /**
        * @brief Upload and outbox operations on the file worker.
        *
@@ -972,6 +1180,7 @@ namespace sds {
               return;
             }
           }
+          reset_file_clipboard();
           refresh_clipboard_watching();
           const auto client = deps_.find_client(cert);
           if (client && client->permissions.test(static_cast<std::size_t>(permission_e::clipboard_read)) && feature_available(feature_e::clipboard)) {
@@ -989,6 +1198,7 @@ namespace sds {
           std::lock_guard lock {active_mutex_};
           active_.erase(cert);
         }
+        reset_file_clipboard();
         events_.end_stream(cert);
         clipboard_rate_.forget(cert);
         clipboard_->forget_client(cert);
@@ -1002,6 +1212,7 @@ namespace sds {
        * @param cert Client certificate.
        */
       void handle_client_changed(const std::string &cert) {
+        if (file_clipboard_session_ && file_clipboard_session_->cert == cert) reset_file_clipboard();
         const auto client = deps_.find_client(cert);
         const bool may_upload = client && client->permissions.test(static_cast<std::size_t>(permission_e::file_upload));
         if (!may_upload) {
@@ -1075,6 +1286,10 @@ namespace sds {
       rate_limiter_t clipboard_rate_;  ///< Clipboard token buckets.
       event_hub_t events_;  ///< Event queues and parked polls.
       std::unique_ptr<clipboard::core_t> clipboard_;  ///< Clipboard core (control worker).
+      clipboard::backend_t *file_clipboard_backend_ = nullptr;  ///< Owned by clipboard_.
+      std::optional<file_clipboard_session_t> file_clipboard_session_;  ///< Control worker only.
+      std::optional<std::uint64_t> file_clipboard_owned_;  ///< Last published selection.
+      std::map<std::uint64_t, std::shared_ptr<const file_clipboard::stage_t>> file_clipboard_leases_;
       std::unique_ptr<files::manager_t> files_;  ///< File core (file worker).
       auth_context_t auth_;  ///< Authorization dependencies.
       std::shared_ptr<pending_state_t> pending_ = std::make_shared<pending_state_t>();  ///< One request budget for both workers.
@@ -1122,6 +1337,7 @@ namespace sds {
     options_t options;
     options.clipboard = config::sds.clipboard;
     options.file_transfer = config::sds.file_transfer;
+    options.file_clipboard = file_clipboard::private_x11_enabled();
     options.mic_passthrough = config::sds.mic_passthrough;
     options.clipboard_text_max = config::sds.clipboard_text_max;
     options.clipboard_image_max = config::sds.clipboard_image_max;
@@ -1208,7 +1424,8 @@ namespace sds {
   std::size_t max_request_body_size() {
     const auto runtime = current();
     const auto options = runtime ? runtime->options() : options_from_config();
-    return std::max({options.files.chunk_max, options.clipboard_image_max, options.clipboard_text_max}) + SMALL_BODY_MAX;
+    return std::max({options.files.chunk_max, options.clipboard_image_max, options.clipboard_text_max,
+                     options.file_clipboard ? file_clipboard::wire_max : 0u}) + SMALL_BODY_MAX;
   }
 
   void set_mic_available(bool available) {

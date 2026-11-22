@@ -159,6 +159,8 @@ namespace sds::http {
         list.push_back({"GET", std::regex {"^/sds/v1/events$"}, op_e::events});
         list.push_back({"GET", std::regex {"^/sds/v1/clipboard$"}, op_e::clipboard_get});
         list.push_back({"PUT", std::regex {"^/sds/v1/clipboard$"}, op_e::clipboard_put});
+        list.push_back({"GET", std::regex {"^/sds/v1/file-clipboard$"}, op_e::file_clipboard_get});
+        list.push_back({"PUT", std::regex {"^/sds/v1/file-clipboard$"}, op_e::file_clipboard_put});
         list.push_back({"POST", std::regex {"^/sds/v1/files/uploads$"}, op_e::upload_create});
         list.push_back({"PUT", std::regex {"^/sds/v1/files/uploads/" + id + "$"}, op_e::upload_chunk});
         list.push_back({"DELETE", std::regex {"^/sds/v1/files/uploads/" + id + "$"}, op_e::upload_cancel});
@@ -295,6 +297,18 @@ namespace sds::http {
       }
       if (const auto it = request->header.find("X-SDS-Client-Seq"); it != request->header.end()) {
         fields.client_seq = it->second;
+      }
+      if (matched->op == op_e::file_clipboard_get || matched->op == op_e::file_clipboard_put) {
+        if (request->header.count("X-SDS-Clipboard-Seq") > 1 || request->header.count("X-SDS-Clipboard-Epoch") > 1 || request->header.count("Content-Type") > 1) {
+          respond(reply_t::failure(400, "bad_request", "duplicate file clipboard header"));
+          return;
+        }
+        if (const auto it = request->header.find("X-SDS-Clipboard-Seq"); it != request->header.end()) {
+          fields.file_clipboard_seq = it->second;
+        }
+        if (const auto it = request->header.find("X-SDS-Clipboard-Epoch"); it != request->header.end()) {
+          fields.file_clipboard_epoch = it->second;
+        }
       }
       fields.body = request->content.string();
 

@@ -45,6 +45,7 @@
 #include "clipboard_linux.h"
 #include "src/logging.h"
 #include "src/sds/clipboard_backend_util.h"
+#include "src/sds/file_clipboard.h"
 
 using namespace std::literals;
 
@@ -117,6 +118,7 @@ namespace sds::clipboard::x11 {
       Atom text_utf8;  ///< text/plain;charset=utf-8.
       Atom text_utf8_upper;  ///< text/plain;charset=UTF-8 (spelling used by some toolkits).
       Atom image_png;  ///< image/png.
+      Atom file_offer;  ///< x-special/gnome-copied-files.
       Atom time_property;  ///< Property used to obtain a server timestamp.
       std::array<Atom, property_pool_size> properties;  ///< Properties that receive converted selections.
     };
@@ -150,6 +152,7 @@ namespace sds::clipboard::x11 {
         targets,  ///< TARGETS.
         text,  ///< The chosen text target.
         image,  ///< image/png.
+        files,  ///< x-special/gnome-copied-files.
       };
 
       std::shared_ptr<read_state_t> state;  ///< Caller's result slot.
@@ -163,6 +166,7 @@ namespace sds::clipboard::x11 {
       std::size_t cap = 0;  ///< Byte cap for the current conversion.
       std::vector<std::uint8_t> buffer;  ///< INCR data received so far.
       Atom text_target = None;  ///< Text target chosen from TARGETS.
+      Atom file_target = None;
       Atom image_target = None;  ///< Image target chosen from TARGETS.
       item_t out;  ///< Completed representations.
     };
@@ -286,6 +290,7 @@ namespace sds::clipboard::x11 {
           const_cast<char *>("text/plain;charset=utf-8"),
           const_cast<char *>("text/plain;charset=UTF-8"),
           const_cast<char *>("image/png"),
+          const_cast<char *>("x-special/gnome-copied-files"),
           const_cast<char *>("SDS_CLIPBOARD_TIME"),
         };
         for (std::size_t i = 0; i < pool_names.size(); ++i) {
@@ -296,8 +301,8 @@ namespace sds::clipboard::x11 {
         if (!XInternAtoms(dpy, names.data(), static_cast<int>(names.size()), False, atoms.data())) {
           return fail("Cannot intern atoms"sv);
         }
-        atoms_ = {atoms[0], atoms[1], atoms[2], atoms[3], atoms[4], atoms[5], atoms[6], atoms[7], atoms[8], atoms[9], atoms[10], {}};
-        std::copy(atoms.begin() + 11, atoms.end(), atoms_.properties.begin());
+        atoms_ = {atoms[0], atoms[1], atoms[2], atoms[3], atoms[4], atoms[5], atoms[6], atoms[7], atoms[8], atoms[9], atoms[10], atoms[11], {}};
+        std::copy(atoms.begin() + 12, atoms.end(), atoms_.properties.begin());
 
         XSetWindowAttributes attributes {};
         attributes.event_mask = PropertyChangeMask;
@@ -378,6 +383,7 @@ namespace sds::clipboard::x11 {
         auto future = result->get_future();
         auto owned = std::make_shared<owned_t>();
         owned->item = item;
+        owned->item.file_offer.reset();
         if (item.text) {
           owned->latin1 = util::utf8_to_latin1_lossy(*item.text);
         }
@@ -395,11 +401,68 @@ namespace sds::clipboard::x11 {
         return future.get();
       }
 
+      [[nodiscard]] bool supports_file_clipboard() const override { return true; }
+
+      std::optional<std::uint64_t> file_clipboard_generation() override {
+        return file_transaction([](x11_backend_t &self) { return std::optional {self.generation_}; });
+      }
+
+      std::optional<std::uint64_t> publish_file_clipboard(std::uint64_t expected, std::string offer, std::function<bool()> allowed) override {
+        if (!offer.starts_with("copy\n") || offer.size() > file_clipboard::offer_max) return {};
+        const auto deadline = steady::now() + write_wait;
+        auto owned = std::make_shared<owned_t>();
+        owned->item.file_offer = std::move(offer);
+        return file_transaction([expected, owned = std::move(owned), allowed = std::move(allowed), deadline](x11_backend_t &self) {
+          if (self.generation_ != expected || steady::now() >= deadline || !allowed()) return std::optional<std::uint64_t> {};
+          const auto time = self.server_time();
+          if (time == CurrentTime || steady::now() >= deadline || !allowed() || self.take_ownership(owned, time) != 0) return std::optional<std::uint64_t> {};
+          return std::optional {self.generation_};
+        });
+      }
+
+      void retire_file_clipboard(std::uint64_t generation) override {
+        file_transaction([generation](x11_backend_t &self) {
+          if (self.generation_ == generation && self.owned_ && self.owned_->item.file_offer) {
+            self.take_ownership(std::make_shared<owned_t>());
+          }
+          return std::optional {self.generation_};
+        });
+      }
+
       [[nodiscard]] std::string_view name() const override {
         return "x11"sv;
       }
 
     private:
+      // Drain native generation notifications while the server is grabbed. No other X11
+      // connection can change selection ownership between the comparison and publication.
+      std::optional<std::uint64_t> file_transaction(std::function<std::optional<std::uint64_t>(x11_backend_t &)> fn) {
+        auto result = std::make_shared<std::promise<std::optional<std::uint64_t>>>();
+        auto future = result->get_future();
+        const auto deadline = steady::now() + write_wait;
+        if (!post({[this, result, fn = std::move(fn), deadline]() {
+              if (steady::now() >= deadline) {
+                result->set_value(std::nullopt);
+                return;
+              }
+              XGrabServer(dpy_);
+              struct ungrab_t {
+                Display *display;
+                ~ungrab_t() { XUngrabServer(display); XFlush(display); }
+              } ungrab {dpy_};
+              XSync(dpy_, False);
+              XEvent event;
+              while (XCheckTypedEvent(dpy_, xfixes_event_base_ + XFixesSelectionNotify, &event)) {
+                handle_event(event);
+              }
+              result->set_value(steady::now() < deadline ? fn(*this) : std::nullopt);
+            }, [result]() { result->set_value(std::nullopt); }}) ||
+            future.wait_until(deadline) != std::future_status::ready) {
+          return std::nullopt;
+        }
+        return future.get();
+      }
+
       /**
        * @brief Mark a read finished and wake its caller.
        */
@@ -623,6 +686,7 @@ namespace sds::clipboard::x11 {
         if (event.type == xfixes_event_base_ + XFixesSelectionNotify) {
           const auto &notify = reinterpret_cast<const XFixesSelectionNotifyEvent &>(event);
           if (notify.selection == atoms_.clipboard && notify.owner != window_) {
+            ++generation_;
             notifier_.notify();
           }
           return;
@@ -632,7 +696,8 @@ namespace sds::clipboard::x11 {
             serve(event.xselectionrequest);
             break;
           case SelectionClear:
-            if (event.xselectionclear.window == window_ && event.xselectionclear.selection == atoms_.clipboard) {
+            if (event.xselectionclear.window == window_ && event.xselectionclear.selection == atoms_.clipboard &&
+                XGetSelectionOwner(dpy_, atoms_.clipboard) != window_) {
               owning_ = false;
               owned_.reset();
             }
@@ -692,7 +757,7 @@ namespace sds::clipboard::x11 {
        *
        * @return 0 on success, -1 on failure.
        */
-      int take_ownership(std::shared_ptr<const owned_t> owned) {
+      int take_ownership(std::shared_ptr<const owned_t> owned, Time sampled = CurrentTime) {
         if (owned->item.empty()) {
           if (owning_ && XGetSelectionOwner(dpy_, atoms_.clipboard) == window_) {
             XSetSelectionOwner(dpy_, atoms_.clipboard, None, own_time_);
@@ -703,7 +768,7 @@ namespace sds::clipboard::x11 {
           owned_.reset();
           return 0;
         }
-        const Time time = server_time();
+        const Time time = sampled == CurrentTime ? server_time() : sampled;
         if (time == CurrentTime) {
           BOOST_LOG(warning) << "[clipboard/x11] Could not get a server timestamp"sv;
           return -1;
@@ -713,6 +778,7 @@ namespace sds::clipboard::x11 {
           BOOST_LOG(warning) << "[clipboard/x11] Could not take CLIPBOARD ownership"sv;
           return -1;
         }
+        ++generation_;
         owned_ = std::move(owned);
         own_time_ = time;
         owning_ = true;
@@ -735,6 +801,9 @@ namespace sds::clipboard::x11 {
             return std::pair {bytes(owned_->latin1), Atom {XA_STRING}};
           }
         }
+        if (item.file_offer && target == atoms_.file_offer) {
+          return std::pair {bytes(*item.file_offer), target};
+        }
         if (item.png && target == atoms_.image_png) {
           return std::pair {std::span<const std::uint8_t>(*item.png), target};
         }
@@ -751,6 +820,9 @@ namespace sds::clipboard::x11 {
           std::vector<Atom> list {atoms_.targets, atoms_.timestamp, atoms_.multiple};
           if (owned_->item.text) {
             list.insert(list.end(), {atoms_.utf8_string, atoms_.text_utf8, Atom {XA_STRING}});
+          }
+          if (owned_->item.file_offer) {
+            list.push_back(atoms_.file_offer);
           }
           if (owned_->item.png) {
             list.push_back(atoms_.image_png);
@@ -912,7 +984,9 @@ namespace sds::clipboard::x11 {
           auto &op = *reads_.front();
           if (owning_ && owned_) {
             // Our own content: no round trip through the server
-            item_t item = owned_->item;
+            item_t item = op.limits.file_offer ? item_t {} : owned_->item;
+            // Never re-export a network file offer as a local copy or text.
+            item.file_offer.reset();
             util::apply_limits(item, op.limits);
             finish(item.empty() ? std::nullopt : std::optional {std::move(item)});
             continue;
@@ -948,6 +1022,11 @@ namespace sds::clipboard::x11 {
               }
             }
             break;
+          case read_op_t::stage_e::files:
+            if (data && !data->empty()) {
+              op.out.file_offer = std::string(reinterpret_cast<const char *>(data->data()), data->size());
+            }
+            break;
           case read_op_t::stage_e::image:
             if (data && data->size() <= op.limits.image_max && util::has_png_signature(*data)) {
               op.out.png = std::move(data);
@@ -955,6 +1034,11 @@ namespace sds::clipboard::x11 {
             break;
         }
 
+        if (op.stage == read_op_t::stage_e::targets && op.file_target != None) {
+          op.stage = read_op_t::stage_e::files;
+          request(op, op.file_target, file_clipboard::offer_max);
+          return;
+        }
         if (op.stage != read_op_t::stage_e::image && op.stage != read_op_t::stage_e::text && op.text_target != None) {
           op.stage = read_op_t::stage_e::text;
           // UTF-8 targets may carry a trailing NUL; Latin-1 only grows when converted
@@ -977,7 +1061,7 @@ namespace sds::clipboard::x11 {
         op.image_target = None;
         if (!targets) {
           // No TARGETS support: ask for UTF-8 text directly
-          op.text_target = atoms_.utf8_string;
+          if (!op.limits.file_offer) op.text_target = atoms_.utf8_string;
           return;
         }
         const auto *list = reinterpret_cast<const unsigned long *>(targets->data);
@@ -985,6 +1069,10 @@ namespace sds::clipboard::x11 {
         auto has = [&](Atom a) {
           return std::ranges::find(offered, a) != offered.end();
         };
+        if (op.limits.file_offer) {
+          if (has(atoms_.file_offer)) op.file_target = atoms_.file_offer;
+          return;
+        }
         for (const Atom candidate : {atoms_.utf8_string, atoms_.text_utf8, atoms_.text_utf8_upper, Atom {XA_STRING}}) {
           if (has(candidate)) {
             op.text_target = candidate;
@@ -1189,6 +1277,7 @@ namespace sds::clipboard::x11 {
       std::shared_ptr<const owned_t> owned_;
       Time own_time_ = CurrentTime;
       bool owning_ = false;
+      std::uint64_t generation_ = 1;
       std::deque<std::unique_ptr<read_op_t>> reads_;
       std::vector<outgoing_t> outgoing_;
       std::vector<drain_t> draining_;

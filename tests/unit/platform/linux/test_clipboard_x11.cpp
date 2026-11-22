@@ -747,6 +747,39 @@ TEST_F(X11ClipboardTest, ReadReturnsNothingWithoutOwner) {
   EXPECT_FALSE(backend_->read(big_limits, 1s));
 }
 
+TEST_F(X11ClipboardTest, NativeFileSelectionUsesAtomicGenerationAndDoesNotEcho) {
+  const std::string target = "x-special/gnome-copied-files";
+  const std::string local = "copy\nfile:///synthetic/local.txt";
+  const std::string remote = "copy\nfile:///synthetic/remote.txt";
+  const auto baseline = backend_->file_clipboard_generation();
+  ASSERT_TRUE(baseline);
+  ASSERT_TRUE(peer_.own({.data = {{target, to_bytes(local)}}}));
+  const auto latest = backend_->file_clipboard_generation();
+  ASSERT_TRUE(latest);
+  ASSERT_GT(*latest, *baseline);
+  const auto selection = backend_->read({0, 0, true}, 3s);
+  ASSERT_TRUE(selection);
+  EXPECT_EQ(selection->file_offer, local);
+  EXPECT_FALSE(backend_->read(big_limits, 3s));
+  EXPECT_FALSE(backend_->publish_file_clipboard(*baseline, remote, [] { return true; }));
+  EXPECT_FALSE(backend_->publish_file_clipboard(*latest, remote, [] { return false; }));
+  EXPECT_EQ(peer_.owner(), peer_.window());
+  const auto applied = backend_->publish_file_clipboard(*latest, remote, [] { return true; });
+  ASSERT_TRUE(applied);
+  EXPECT_GT(*applied, *latest);
+  const auto native = peer_.convert(target);
+  ASSERT_TRUE(native);
+  EXPECT_EQ(to_string(native->first), remote);
+  EXPECT_FALSE(backend_->read({0, 0, true}, 3s));
+  EXPECT_FALSE(backend_->read(big_limits, 3s));
+  ASSERT_TRUE(peer_.own({.data = {{"UTF8_STRING", to_bytes("newer text")}}}));
+  backend_->retire_file_clipboard(*applied);
+  EXPECT_EQ(peer_.owner(), peer_.window());
+  const auto newest = backend_->read(big_limits, 3s);
+  ASSERT_TRUE(newest);
+  EXPECT_EQ(newest->text, "newer text");
+}
+
 TEST_F(X11ClipboardTest, ServesTextTargetsToOtherClient) {
   const std::string text = "caf\xC3\xA9 \xE2\x9C\x93 \xF0\x9F\x8E\x89";
   ASSERT_EQ(backend_->write({.text = text, .png = std::nullopt}), 0);

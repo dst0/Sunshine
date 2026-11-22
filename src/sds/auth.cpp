@@ -10,6 +10,7 @@
 
 // local includes
 #include "auth.h"
+#include "file_clipboard.h"
 
 namespace sds {
   namespace {
@@ -21,6 +22,7 @@ namespace sds {
       any_data_feature,  ///< At least one of clipboard or files (event stream).
       clipboard,  ///< Clipboard.
       files,  ///< File transfer.
+      file_clipboard,  ///< The explicitly enabled native file clipboard.
     };
 
     /**
@@ -39,6 +41,7 @@ namespace sds {
       small,  ///< SMALL_BODY_MAX.
       clipboard,  ///< Depends on the content type.
       chunk,  ///< `file_chunk_max` body.
+      file_clipboard,  ///< Bounded native file bundle.
       range,  ///< `file_chunk_max` for the requested download length; small body.
     };
 
@@ -68,6 +71,11 @@ namespace sds {
           return {feature_rule_e::clipboard, permission_e::clipboard_read, limit_rule_e::clipboard_rate, size_rule_e::small};
         case op_e::clipboard_put:
           return {feature_rule_e::clipboard, permission_e::clipboard_write, limit_rule_e::clipboard_rate, size_rule_e::clipboard};
+        case op_e::file_clipboard_baseline:
+        case op_e::file_clipboard_get:
+          return {feature_rule_e::file_clipboard, std::nullopt, limit_rule_e::clipboard_rate, size_rule_e::small};
+        case op_e::file_clipboard_put:
+          return {feature_rule_e::file_clipboard, std::nullopt, limit_rule_e::clipboard_rate, size_rule_e::file_clipboard};
         case op_e::upload_create:
           return {feature_rule_e::files, permission_e::file_upload, limit_rule_e::upload_concurrency, size_rule_e::small};
         case op_e::upload_chunk:
@@ -119,6 +127,8 @@ namespace sds {
           return available(feature_e::clipboard);
         case feature_rule_e::files:
           return available(feature_e::files);
+        case feature_rule_e::file_clipboard:
+          return available(feature_e::clipboard) && available(feature_e::files) && available(feature_e::file_clipboard);
       }
       return false;
     }
@@ -133,6 +143,8 @@ namespace sds {
      */
     std::size_t body_limit(const auth_context_t &context, const request_view_t &request, size_rule_e rule) {
       switch (rule) {
+        case size_rule_e::file_clipboard:
+          return file_clipboard::wire_max;
         case size_rule_e::clipboard:
           {
             const auto media_type = parse_content_type(request.content_type).first;
@@ -258,7 +270,15 @@ namespace sds {
     }
 
     // 5. Per-client permission.
-    if (rule.permission && (*rule.permission == permission_e::count || !client->permissions.test(static_cast<std::size_t>(*rule.permission)))) {
+    const auto allowed = [&client](permission_e permission) {
+      return permission != permission_e::count && client->permissions.test(static_cast<std::size_t>(permission));
+    };
+    const bool can_pull = allowed(permission_e::clipboard_read) && allowed(permission_e::file_download);
+    const bool can_push = allowed(permission_e::clipboard_write) && allowed(permission_e::file_upload);
+    if ((rule.permission && !allowed(*rule.permission)) ||
+        (op == op_e::file_clipboard_get && !can_pull) ||
+        (op == op_e::file_clipboard_put && !can_push) ||
+        (op == op_e::file_clipboard_baseline && !can_pull && !can_push)) {
       auto result = fail(403, "forbidden", "permission not granted");
       result.client = std::move(*client);
       return result;

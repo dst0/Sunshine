@@ -25,14 +25,17 @@ namespace sds::clipboard {
   struct limits_t {
     std::size_t text_max;  ///< maximum UTF-8 bytes
     std::size_t image_max;  ///< maximum PNG bytes
+    bool file_offer = false;  ///< Read only the native file-copy selection.
   };
 
   struct item_t {
     std::optional<std::string> text;  ///< valid UTF-8 without NUL bytes
     std::optional<std::vector<std::uint8_t>> png;  ///< PNG file bytes
 
+    std::optional<std::string> file_offer {};  ///< Validated native file selection payload.
+
     [[nodiscard]] bool empty() const {
-      return !text && !png;
+      return !text && !png && !file_offer;
     }
   };
 
@@ -57,6 +60,13 @@ namespace sds::clipboard {
      * @return 0 on success, negative on failure.
      */
     virtual int write(const item_t &item) = 0;
+
+    // Only the isolated X11 backend implements native file selections. All operations
+    // share that backend’s X11 event thread and native change counter.
+    [[nodiscard]] virtual bool supports_file_clipboard() const { return false; }
+    virtual std::optional<std::uint64_t> file_clipboard_generation() { return std::nullopt; }
+    virtual std::optional<std::uint64_t> publish_file_clipboard(std::uint64_t, std::string, std::function<bool()>) { return std::nullopt; }
+    virtual void retire_file_clipboard(std::uint64_t) {}
 
     [[nodiscard]] virtual std::string_view name() const = 0;
   };
