@@ -404,7 +404,7 @@ namespace sds::clipboard::x11 {
       [[nodiscard]] bool supports_file_clipboard() const override { return true; }
 
       std::optional<std::uint64_t> file_clipboard_generation() override {
-        return file_transaction([](x11_backend_t &self) { return std::optional {self.generation_}; });
+        return file_transaction([](x11_backend_t &self, file_transaction_t &) { return std::optional {self.generation_}; });
       }
 
       std::optional<std::uint64_t> publish_file_clipboard(std::uint64_t expected, std::string offer, std::function<bool()> allowed) override {
@@ -412,16 +412,18 @@ namespace sds::clipboard::x11 {
         const auto deadline = steady::now() + write_wait;
         auto owned = std::make_shared<owned_t>();
         owned->item.file_offer = std::move(offer);
-        return file_transaction([expected, owned = std::move(owned), allowed = std::move(allowed), deadline](x11_backend_t &self) {
+        return file_transaction([expected, owned = std::move(owned), allowed = std::move(allowed), deadline](x11_backend_t &self, file_transaction_t &transaction) {
           if (self.generation_ != expected || steady::now() >= deadline || !allowed()) return std::optional<std::uint64_t> {};
           const auto time = self.server_time();
-          if (time == CurrentTime || steady::now() >= deadline || !allowed() || self.take_ownership(owned, time) != 0) return std::optional<std::uint64_t> {};
+          if (time == CurrentTime || !allowed() || !transaction.claim(deadline) || self.take_ownership(owned, time) != 0) {
+            return std::optional<std::uint64_t> {};
+          }
           return std::optional {self.generation_};
         });
       }
 
       void retire_file_clipboard(std::uint64_t generation) override {
-        file_transaction([generation](x11_backend_t &self) {
+        file_transaction([generation](x11_backend_t &self, file_transaction_t &) {
           if (self.generation_ == generation && self.owned_ && self.owned_->item.file_offer) {
             self.take_ownership(std::make_shared<owned_t>());
           }
@@ -434,13 +436,32 @@ namespace sds::clipboard::x11 {
       }
 
     private:
+      // A timed-out caller can cancel uncommitted work. Once XSetSelectionOwner can
+      // be issued, wait for the actual result so it cannot succeed after a failed
+      // response drops the private staging lease.
+      struct file_transaction_t {
+        enum class state_e { pending, canceled, committing };
+        std::atomic<state_e> state {state_e::pending};
+
+        bool claim(steady::time_point deadline) {
+          auto expected = state_e::pending;
+          return steady::now() < deadline && state.compare_exchange_strong(expected, state_e::committing);
+        }
+
+        bool cancel() {
+          auto expected = state_e::pending;
+          return state.compare_exchange_strong(expected, state_e::canceled);
+        }
+      };
+
       // Drain native generation notifications while the server is grabbed. No other X11
       // connection can change selection ownership between the comparison and publication.
-      std::optional<std::uint64_t> file_transaction(std::function<std::optional<std::uint64_t>(x11_backend_t &)> fn) {
+      std::optional<std::uint64_t> file_transaction(std::function<std::optional<std::uint64_t>(x11_backend_t &, file_transaction_t &)> fn) {
+        auto transaction = std::make_shared<file_transaction_t>();
         auto result = std::make_shared<std::promise<std::optional<std::uint64_t>>>();
         auto future = result->get_future();
         const auto deadline = steady::now() + write_wait;
-        if (!post({[this, result, fn = std::move(fn), deadline]() {
+        if (!post({[this, result, transaction, fn = std::move(fn), deadline]() {
               if (steady::now() >= deadline) {
                 result->set_value(std::nullopt);
                 return;
@@ -455,9 +476,11 @@ namespace sds::clipboard::x11 {
               while (XCheckTypedEvent(dpy_, xfixes_event_base_ + XFixesSelectionNotify, &event)) {
                 handle_event(event);
               }
-              result->set_value(steady::now() < deadline ? fn(*this) : std::nullopt);
-            }, [result]() { result->set_value(std::nullopt); }}) ||
-            future.wait_until(deadline) != std::future_status::ready) {
+              result->set_value(steady::now() < deadline ? fn(*this, *transaction) : std::nullopt);
+            }, [result]() { result->set_value(std::nullopt); }})) {
+          return std::nullopt;
+        }
+        if (future.wait_until(deadline) != std::future_status::ready && transaction->cancel()) {
           return std::nullopt;
         }
         return future.get();
