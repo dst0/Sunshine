@@ -430,6 +430,7 @@ namespace config {
     std::string file_inbox_dir;  ///< Inbox directory; empty means the user's Downloads/Moonlight.
     std::string file_outbox_dir;  ///< Outbox directory; empty means the inbox's Outbox subdirectory.
     std::vector<std::string> default_permissions;  ///< Permissions granted to newly paired clients.
+    std::string mic_device;  ///< Windows render endpoint feeding the virtual microphone.
   };
 
   /**

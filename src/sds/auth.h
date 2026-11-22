@@ -166,9 +166,10 @@ namespace sds {
    * @param context Dependencies and limits.
    * @param request Request fields.
    * @param op Operation being requested.
+   * @param charge_limits Whether to consume rate/concurrency admission; false revalidates deferred work.
    * @return Authorization outcome.
    */
-  auth_result_t authorize(const auth_context_t &context, const request_view_t &request, op_e op);
+  auth_result_t authorize(const auth_context_t &context, const request_view_t &request, op_e op, bool charge_limits = true);
 
   /**
    * @brief Split a `Content-Type` header into a lowercase media type and charset.

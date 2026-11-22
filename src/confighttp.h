@@ -80,7 +80,6 @@ namespace confighttp {
    * @return True when the request passes validation and processing may continue.
    */
   bool check_content_type(const resp_https_t &response, const req_https_t &request, const std::string_view &contentType);
-  std::string generate_csrf_token(const std::string &client_id);
   /**
    * @brief Validate CSRF token.
    *

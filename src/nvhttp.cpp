@@ -128,6 +128,10 @@ namespace nvhttp {
             return;
           }
         }
+        if (on_connection_authenticated && !on_connection_authenticated(session->request)) {
+          session->connection->close();
+          return;
+        }
         this->read(session);
       } else if (this->on_error) {
         this->on_error(session->request, ec);
@@ -148,9 +152,13 @@ namespace nvhttp {
             this->accept();
           }
 
-          auto session = std::make_shared<Session>(config.max_request_streambuf_size, connection);
+          auto session = std::make_shared<Session>(config.max_request_streambuf_size, connection, config.max_request_header_size);
 
           if (!ec) {
+            if (on_connection_accepted && !on_connection_accepted(session->request)) {
+              connection->close();
+              return;
+            }
             boost::asio::ip::tcp::no_delay option(true);
             SimpleWeb::error_code option_error;
             session->connection->socket->lowest_layer().set_option(option, option_error);
@@ -1094,17 +1102,7 @@ namespace nvhttp {
     BOOST_LOG(debug) << "METHOD :: "sv << request->method;
     BOOST_LOG(debug) << "DESTINATION :: "sv << request->path;
 
-    for (auto &[name, val] : request->header) {
-      BOOST_LOG(debug) << name << " -- " << val;
-    }
-
-    BOOST_LOG(debug) << " [--] "sv;
-
-    for (auto &[name, val] : request->parse_query_string()) {
-      BOOST_LOG(debug) << name << " -- " << val;
-    }
-
-    BOOST_LOG(debug) << " [--] "sv;
+    // Headers and query fields can carry pairing material and session keys.
   }
 
   /**

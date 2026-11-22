@@ -75,6 +75,14 @@ namespace sds {
     void stop();
 
     /**
+     * @brief Wait for shutdown to begin without guessing worker scheduling delays.
+     *
+     * @param timeout Maximum wait.
+     * @return True when stop() has marked the worker as stopping.
+     */
+    bool wait_until_stopping(std::chrono::milliseconds timeout);
+
+    /**
      * @brief Block until every job queued before this call has run.
      *
      * Must not be called from the worker thread itself.

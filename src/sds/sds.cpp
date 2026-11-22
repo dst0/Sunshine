@@ -7,6 +7,7 @@
 #include <atomic>
 #include <charconv>
 #include <future>
+#include <map>
 #include <mutex>
 #include <set>
 #include <utility>
@@ -157,6 +158,62 @@ namespace sds {
     }
 
     /**
+     * @brief Request jobs and retained payload bytes charged to one budget.
+     */
+    struct pending_usage_t {
+      std::size_t jobs = 0;  ///< Queued or executing jobs.
+      std::size_t bytes = 0;  ///< Retained request-body capacity.
+    };
+
+    /**
+     * @brief Shared admission state across the clipboard and file workers.
+     */
+    struct pending_state_t {
+      std::mutex mutex;  ///< Protects usage.
+      pending_usage_t total;  ///< Runtime-wide usage.
+      std::map<std::string, pending_usage_t, std::less<>> clients;  ///< Per-client usage.
+    };
+
+    /**
+     * @brief Releases admission after execution, exceptions or a rejected worker post.
+     */
+    struct pending_reservation_t {
+      std::shared_ptr<pending_state_t> state;  ///< State outlives every retained job.
+      std::string cert;  ///< Charged client.
+      std::size_t bytes = 0;  ///< Charged body capacity.
+      bool admitted = false;  ///< Set only after the counters were incremented.
+
+      /**
+       * @brief Return both the global and client reservation exactly once.
+       */
+      ~pending_reservation_t() {
+        if (!admitted) {
+          return;
+        }
+        std::lock_guard lock {state->mutex};
+        --state->total.jobs;
+        state->total.bytes -= bytes;
+        const auto it = state->clients.find(cert);
+        --it->second.jobs;
+        it->second.bytes -= bytes;
+        if (it->second.jobs == 0) {
+          state->clients.erase(it);
+        }
+      }
+    };
+
+    /**
+     * @brief Why queued work lost the authority captured at admission.
+     */
+    enum class authority_e {
+      current,  ///< The original stream and client authority are still valid.
+      stream_ended,  ///< The last stream ended, even if a later stream reconnects.
+      client_changed,  ///< Pairing, enabled state or permissions changed.
+    };
+
+    using authority_t = std::shared_ptr<std::atomic<authority_e>>;  ///< Revocable authority of admitted jobs.
+
+    /**
      * @brief Module state between start() and stop().
      */
     class runtime_t {
@@ -186,7 +243,8 @@ namespace sds {
         if (options_.clipboard) {
           backend = deps_.make_clipboard_backend();
         }
-        BOOST_LOG(info) << "sds: clipboard "sv << (!options_.clipboard ? "disabled"sv : backend ? backend->name() : "unavailable (no backend)"sv)
+        BOOST_LOG(info) << "sds: clipboard "sv << (!options_.clipboard ? "disabled"sv : backend ? backend->name() :
+                                                                                                  "unavailable (no backend)"sv)
                         << ", file transfer "sv << (options_.file_transfer ? "enabled"sv : "disabled"sv);
 
         control_ = std::make_unique<worker_t>("sds");
@@ -326,6 +384,7 @@ namespace sds {
        * @param respond Completion callback.
        */
       void handle(op_e op, request_t request, reply_fn respond) {
+        const auto authority = request.cert_pem ? request_authority(*request.cert_pem) : authority_t {};
         request_view_t view;
         view.cert_pem = request.cert_pem;
         view.body_size = request.body.size();
@@ -338,6 +397,9 @@ namespace sds {
 
         auto auth = authorize(auth_, view, op);
         if (!auth.ok()) {
+          if (request.cert_pem) {
+            release_unused_authority(*request.cert_pem, authority);
+          }
           auto reply = reply_t::failure(auth.status, std::move(auth.error), std::move(auth.message));
           if (auth.retry_after) {
             reply.headers.emplace_back("Retry-After", std::to_string(*auth.retry_after));
@@ -355,10 +417,10 @@ namespace sds {
             poll_events(client, request, std::move(respond));
             return;
           case op_e::clipboard_get:
-            clipboard_get(client, request, std::move(respond));
+            clipboard_get(client, request, authority, std::move(respond));
             return;
           case op_e::clipboard_put:
-            clipboard_put(client, std::move(request), std::move(respond));
+            clipboard_put(client, std::move(request), authority, std::move(respond));
             return;
           case op_e::upload_create:
           case op_e::upload_chunk:
@@ -366,7 +428,7 @@ namespace sds {
           case op_e::upload_cancel:
           case op_e::outbox_list:
           case op_e::outbox_read:
-            file_op(op, client, std::move(request), std::move(respond));
+            file_op(op, client, std::move(request), authority, std::move(respond));
             return;
         }
         respond(reply_t::failure(404, "not_found", "unknown operation"));
@@ -379,6 +441,15 @@ namespace sds {
        * @param running Stream state.
        */
       void stream_state(std::string cert, bool running) {
+        if (!running) {
+          // New request capture uses the same mutex: its work cannot enter I/O ahead of
+          // cleanup belonging to the stream that just ended. Never wait for a worker here.
+          std::lock_guard lock {authority_mutex_};
+          invalidate_authority_locked(cert, authority_e::stream_ended);
+          io_->post([this, cert]() { files_->end_client(cert); });
+          control_->post([this, cert = std::move(cert)]() { handle_stream_state(cert, false); });
+          return;
+        }
         control_->post([this, cert = std::move(cert), running]() {
           handle_stream_state(cert, running);
         });
@@ -390,6 +461,7 @@ namespace sds {
        * @param cert Client certificate.
        */
       void client_changed(std::string cert) {
+        invalidate_authority(cert, authority_e::client_changed);
         control_->post([this, cert = std::move(cert)]() {
           handle_client_changed(cert);
         });
@@ -413,6 +485,16 @@ namespace sds {
        */
       bool post_io(std::function<void()> job) {
         return io_->post(std::move(job));
+      }
+
+      /**
+       * @brief Queue a job on the clipboard worker (tests).
+       *
+       * @param job Job.
+       * @return `false` when stopping.
+       */
+      bool post_control(std::function<void()> job) {
+        return control_->post(std::move(job));
       }
 
       /**
@@ -448,6 +530,131 @@ namespace sds {
       }
 
     private:
+      /**
+       * @brief Reserve bounded request work; internal lifecycle jobs bypass this budget.
+       *
+       * @param cert Paired client.
+       * @param bytes Retained body capacity.
+       * @return Reservation, or null when the global or client budget is full.
+       */
+      std::shared_ptr<pending_reservation_t> reserve_work(const std::string &cert, std::size_t bytes) {
+        constexpr std::size_t GLOBAL_JOBS = 32;
+        constexpr std::size_t GLOBAL_BYTES = 128 * 1024 * 1024;
+        constexpr std::size_t CLIENT_JOBS = 4;
+        constexpr std::size_t CLIENT_BYTES = 64 * 1024 * 1024;
+        auto reservation = std::make_shared<pending_reservation_t>();
+        reservation->state = pending_;
+        reservation->cert = cert;
+        reservation->bytes = bytes;
+        std::lock_guard lock {pending_->mutex};
+        const auto found = pending_->clients.find(cert);
+        const auto client = found == pending_->clients.end() ? pending_usage_t {} : found->second;
+        if (pending_->total.jobs >= GLOBAL_JOBS || client.jobs >= CLIENT_JOBS || bytes > GLOBAL_BYTES - pending_->total.bytes || bytes > CLIENT_BYTES - client.bytes) {
+          return nullptr;
+        }
+        auto &usage = pending_->clients[cert];
+        ++usage.jobs;
+        usage.bytes += bytes;
+        ++pending_->total.jobs;
+        pending_->total.bytes += bytes;
+        reservation->admitted = true;
+        return reservation;
+      }
+
+      /**
+       * @brief Get the revocable authority shared by currently admitted client requests.
+       *
+       * @param cert Paired client.
+       * @return Authority retained by deferred work.
+       */
+      authority_t request_authority(const std::string &cert) {
+        std::lock_guard lock {authority_mutex_};
+        auto &authority = authorities_[cert];
+        if (!authority) {
+          authority = std::make_shared<std::atomic<authority_e>>(authority_e::current);
+        }
+        return authority;
+      }
+
+      /**
+       * @brief Forget unused authority from a rejected request without retaining unknown identities.
+       *
+       * @param cert Certificate supplied by the request.
+       * @param authority Provisional request authority.
+       */
+      void release_unused_authority(const std::string &cert, const authority_t &authority) {
+        std::lock_guard lock {authority_mutex_};
+        const auto found = authorities_.find(cert);
+        if (found != authorities_.end() && found->second == authority && authority.use_count() == 2) {
+          authorities_.erase(found);
+        }
+      }
+
+      /**
+       * @brief Invalidate old jobs synchronously before queueing lifecycle cleanup.
+       *
+       * @param cert Client certificate.
+       * @param reason Stream end or client change.
+       */
+      void invalidate_authority(const std::string &cert, authority_e reason) {
+        std::lock_guard lock {authority_mutex_};
+        invalidate_authority_locked(cert, reason);
+      }
+
+      /**
+       * @brief Revoke authority while its caller holds authority_mutex_.
+       *
+       * @param cert Client certificate.
+       * @param reason Stream end or client change.
+       */
+      void invalidate_authority_locked(const std::string &cert, authority_e reason) {
+        const auto found = authorities_.find(cert);
+        if (found != authorities_.end()) {
+          found->second->store(reason);
+          authorities_.erase(found);
+        }
+      }
+
+      /**
+       * @brief Revalidate live authorization and the original authority without charging limits again.
+       *
+       * @param cert Client certificate.
+       * @param op Operation.
+       * @param authority Authority captured at admission.
+       * @return Failure reply, or no value when the side effect may proceed.
+       */
+      std::optional<reply_t> deferred_failure(const std::string &cert, op_e op, const authority_t &authority) {
+        if (shut_down_) {
+          return unavailable();
+        }
+        request_view_t view;
+        view.cert_pem = cert;
+        auto auth = authorize(auth_, view, op, false);
+        if (!auth.ok()) {
+          return reply_t::failure(auth.status, std::move(auth.error), std::move(auth.message));
+        }
+        switch (authority->load()) {
+          case authority_e::stream_ended:
+            return reply_t::failure(409, "no_active_stream", "request belongs to an ended stream");
+          case authority_e::client_changed:
+            return reply_t::failure(403, "forbidden", "client authorization changed after admission");
+          case authority_e::current:
+            return std::nullopt;
+        }
+        return reply_t::failure(403, "forbidden", "invalid request authority");
+      }
+
+      /**
+       * @brief Reply when a bounded worker queue cannot retain more requests.
+       *
+       * @param respond Completion callback.
+       */
+      static void admission_rejected(const reply_fn &respond) {
+        auto reply = reply_t::failure(429, "rate_limited", "too much pending work");
+        reply.headers.emplace_back("Retry-After", "1");
+        respond(std::move(reply));
+      }
+
       /**
        * @brief Queue an event only while the client's stream is tracked as active.
        *
@@ -593,9 +800,10 @@ namespace sds {
        *
        * @param client Caller.
        * @param request Request.
+       * @param authority Authority captured before initial authorization.
        * @param respond Completion callback.
        */
-      void clipboard_get(const client_t &client, const request_t &request, reply_fn respond) {
+      void clipboard_get(const client_t &client, const request_t &request, const authority_t &authority, reply_fn respond) {
         std::optional<std::uint64_t> seq;
         if (const auto value = query_value(request, "seq"); value) {
           seq = parse_u64(*value);
@@ -610,8 +818,17 @@ namespace sds {
           respond(reply_t::failure(400, "bad_request", "type must be text/plain or image/png"));
           return;
         }
-        if (!control_->post([this, cert = client.cert, seq, type = *type, respond]() {
-              respond(shut_down_ ? unavailable() : to_reply(clipboard_->get(cert, seq, type)));
+        const auto reservation = reserve_work(client.cert, 0);
+        if (!reservation) {
+          admission_rejected(respond);
+          return;
+        }
+        if (!control_->post([this, cert = client.cert, seq, type = *type, authority, reservation, respond]() {
+              if (auto failure = deferred_failure(cert, op_e::clipboard_get, authority)) {
+                respond(std::move(*failure));
+                return;
+              }
+              respond(to_reply(clipboard_->get(cert, seq, type)));
             })) {
           respond(unavailable());
         }
@@ -622,11 +839,21 @@ namespace sds {
        *
        * @param client Caller.
        * @param request Request (body moved).
+       * @param authority Authority captured before initial authorization.
        * @param respond Completion callback.
        */
-      void clipboard_put(const client_t &client, request_t request, reply_fn respond) {
-        if (!control_->post([this, cert = client.cert, content_type = std::move(request.content_type), client_seq = std::move(request.client_seq), body = std::move(request.body), respond]() mutable {
-              respond(shut_down_ ? unavailable() : to_reply(clipboard_->put(cert, content_type, std::move(body), client_seq)));
+      void clipboard_put(const client_t &client, request_t request, const authority_t &authority, reply_fn respond) {
+        const auto reservation = reserve_work(client.cert, request.body.capacity());
+        if (!reservation) {
+          admission_rejected(respond);
+          return;
+        }
+        if (!control_->post([this, cert = client.cert, content_type = std::move(request.content_type), client_seq = std::move(request.client_seq), body = std::move(request.body), authority, reservation, respond]() mutable {
+              if (auto failure = deferred_failure(cert, op_e::clipboard_put, authority)) {
+                respond(std::move(*failure));
+                return;
+              }
+              respond(to_reply(clipboard_->put(cert, content_type, std::move(body), client_seq)));
             })) {
           respond(unavailable());
         }
@@ -638,9 +865,10 @@ namespace sds {
        * @param op Operation.
        * @param client Caller.
        * @param request Request (body moved).
+       * @param authority Authority captured before initial authorization.
        * @param respond Completion callback.
        */
-      void file_op(op_e op, const client_t &client, request_t request, reply_fn respond) {
+      void file_op(op_e op, const client_t &client, request_t request, const authority_t &authority, reply_fn respond) {
         std::optional<std::uint64_t> offset;
         std::optional<std::uint64_t> length;
         if (const auto value = query_value(request, "offset"); value) {
@@ -662,9 +890,14 @@ namespace sds {
           return;
         }
 
-        if (!io_->post([this, op, cert = client.cert, id = std::move(request.id), body = std::move(request.body), offset, length, respond]() {
-              if (shut_down_) {
-                respond(unavailable());
+        const auto reservation = reserve_work(client.cert, request.body.capacity());
+        if (!reservation) {
+          admission_rejected(respond);
+          return;
+        }
+        if (!io_->post([this, op, cert = client.cert, id = std::move(request.id), body = std::move(request.body), offset, length, authority, reservation, respond]() {
+              if (auto failure = deferred_failure(cert, op, authority)) {
+                respond(std::move(*failure));
                 return;
               }
               switch (op) {
@@ -675,16 +908,30 @@ namespace sds {
                   respond(files_->write_chunk(cert, id, offset, body));
                   return;
                 case op_e::upload_complete:
-                  respond(files_->complete(cert, id));
+                  respond(files_->complete(cert, id, [this, cert, authority]() {
+                    return deferred_failure(cert, op_e::upload_complete, authority);
+                  }));
                   return;
                 case op_e::upload_cancel:
                   respond(files_->cancel(cert, id));
                   return;
                 case op_e::outbox_list:
-                  respond(files_->list_outbox());
+                  {
+                    auto reply = files_->list_outbox();
+                    if (auto failure = deferred_failure(cert, op, authority)) {
+                      reply = std::move(*failure);
+                    }
+                    respond(std::move(reply));
+                  }
                   return;
                 case op_e::outbox_read:
-                  respond(files_->read_outbox(id, offset.value_or(0), length));
+                  {
+                    auto reply = files_->read_outbox(id, offset.value_or(0), length);
+                    if (auto failure = deferred_failure(cert, op, authority)) {
+                      reply = std::move(*failure);
+                    }
+                    respond(std::move(reply));
+                  }
                   return;
                 default:
                   respond(reply_t::failure(404, "not_found", "unknown operation"));
@@ -719,7 +966,11 @@ namespace sds {
           }
           {
             std::lock_guard lock {active_mutex_};
-            active_.insert(cert);
+            // Several sessions may share this certificate. Only the first
+            // active notification should announce the current clipboard.
+            if (!active_.insert(cert).second) {
+              return;
+            }
           }
           refresh_clipboard_watching();
           const auto client = deps_.find_client(cert);
@@ -734,10 +985,6 @@ namespace sds {
           return;
         }
 
-        if (deps_.stream_active(cert)) {
-          // Another session of the same client is still running.
-          return;
-        }
         {
           std::lock_guard lock {active_mutex_};
           active_.erase(cert);
@@ -746,9 +993,6 @@ namespace sds {
         clipboard_rate_.forget(cert);
         clipboard_->forget_client(cert);
         refresh_clipboard_watching();
-        io_->post([this, cert]() {
-          files_->end_client(cert);
-        });
         BOOST_LOG(debug) << "sds: cleared state of a client whose stream ended"sv;
       }
 
@@ -833,6 +1077,9 @@ namespace sds {
       std::unique_ptr<clipboard::core_t> clipboard_;  ///< Clipboard core (control worker).
       std::unique_ptr<files::manager_t> files_;  ///< File core (file worker).
       auth_context_t auth_;  ///< Authorization dependencies.
+      std::shared_ptr<pending_state_t> pending_ = std::make_shared<pending_state_t>();  ///< One request budget for both workers.
+      std::mutex authority_mutex_;  ///< Protects authorities_.
+      std::map<std::string, authority_t, std::less<>> authorities_;  ///< Current revocable request authority per client.
       mutable std::mutex active_mutex_;  ///< Protects active_.
       std::set<std::string, std::less<>> active_;  ///< Clients with a running stream.
       bool outbox_polling_ = false;  ///< Outbox timer armed (file worker).
@@ -977,6 +1224,11 @@ namespace sds {
   bool post_to_file_worker_for_test(std::function<void()> job) {
     const auto runtime = current();
     return runtime && runtime->post_io(std::move(job));
+  }
+
+  bool post_to_control_worker_for_test(std::function<void()> job) {
+    const auto runtime = current();
+    return runtime && runtime->post_control(std::move(job));
   }
 
   test_state_t state_for_test(std::string_view cert_pem) {

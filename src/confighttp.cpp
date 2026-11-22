@@ -26,6 +26,7 @@
 #include <boost/filesystem.hpp>
 #include <lizardbyte/common/env.h>
 #include <nlohmann/json.hpp>
+#include <openssl/rand.h>
 #include <Simple-Web-Server/crypto.hpp>
 #include <Simple-Web-Server/server_https.hpp>
 
@@ -43,6 +44,7 @@
 
   #include <CoreFoundation/CoreFoundation.h>
 #endif
+
 
 // local includes
 #include "config.h"
@@ -574,17 +576,8 @@ namespace confighttp {
     BOOST_LOG(debug) << "METHOD :: "sv << request->method;
     BOOST_LOG(debug) << "DESTINATION :: "sv << request->path;
 
-    for (auto &[name, val] : request->header) {
-      BOOST_LOG(debug) << name << " -- " << (name == "Authorization" ? "CREDENTIALS REDACTED" : val);
-    }
-
-    BOOST_LOG(debug) << " [--] "sv;
-
-    for (auto &[name, val] : request->parse_query_string()) {
-      BOOST_LOG(debug) << name << " -- " << val;
-    }
-
-    BOOST_LOG(debug) << " [--] "sv;
+    // Authorization and CSRF tokens can appear in headers or query fields.
+    // Keep only the method and route in the request log.
   }
 
   /**
@@ -811,11 +804,14 @@ namespace confighttp {
   /**
    * @brief Generate a new CSRF token for a client.
    * @param client_id A unique identifier for the client (e.g., session ID or username).
-   * @return The generated CSRF token.
+   * @return The generated CSRF token, or no value if the random generator fails.
    */
-  std::string generate_csrf_token(const std::string &client_id) {
-    // Generate a cryptographically secure random token
-    std::string token = crypto::rand_alphabet(CSRF_TOKEN_SIZE);
+  static std::optional<std::string> generate_csrf_token(const std::string &client_id) {
+    std::array<unsigned char, CSRF_TOKEN_SIZE> bytes {};
+    if (RAND_bytes(bytes.data(), static_cast<int>(bytes.size())) != 1) {
+      return std::nullopt;
+    }
+    auto token = util::hex_vec(bytes);
 
     std::scoped_lock lock(csrf_tokens_mutex);
 
@@ -910,7 +906,6 @@ namespace confighttp {
     // GET /api/csrf-token and send it in the X-CSRF-Token header.
     const bool has_origin = origin_it != request->header.end();
     const bool has_referer = referer_it != request->header.end();
-    const std::string_view blocked_origin = has_origin ? std::string_view {origin_it->second} : (has_referer ? std::string_view {referer_it->second} : "(no Origin or Referer header)"sv);
     // Extract token from X-CSRF-Token header
     const auto header_it = request->header.find("X-CSRF-Token");
     if (header_it == request->header.end()) {
@@ -919,8 +914,8 @@ namespace confighttp {
       const auto query_it = query_params.find("csrf_token");
       if (query_it == query_params.end()) {
         auto address = net::addr_to_normalized_string(request->remote_endpoint().address());
-        BOOST_LOG(error) << "Web UI: ["sv << address << "] -- CSRF protection blocked request from origin: "sv << blocked_origin;
-        BOOST_LOG(error) << "Web UI: To allow this origin, add it to the 'csrf_allowed_origins' option in your Sunshine configuration"sv;
+        BOOST_LOG(error) << "Web UI: ["sv << address << "] -- CSRF protection blocked request: "sv
+                         << (has_origin || has_referer ? "browser origin not allowed"sv : "no Origin or Referer header"sv);
         bad_request(response, "Missing CSRF token");
         return false;
       }
@@ -1093,11 +1088,15 @@ namespace confighttp {
 
     print_req(request);
 
-    std::string client_id = get_client_id(request);
-    std::string token = generate_csrf_token(client_id);
+    const auto token = generate_csrf_token(get_client_id(request));
+    if (!token) {
+      BOOST_LOG(error) << "Web UI: could not generate CSRF token"sv;
+      response->write(SimpleWeb::StatusCode::server_error_internal_server_error);
+      return;
+    }
 
     nlohmann::json output_tree;
-    output_tree["csrf_token"] = token;
+    output_tree["csrf_token"] = *token;
     send_response(response, output_tree);
   }
 
@@ -1316,7 +1315,6 @@ namespace confighttp {
       nlohmann::json output_tree;
       nlohmann::json input_tree = nlohmann::json::parse(ss);
       std::string file = file_handler::read_file(config::stream.file_apps.c_str());
-      BOOST_LOG(info) << file;
       nlohmann::json file_tree = nlohmann::json::parse(file);
 
       normalize_optional_app_fields(input_tree);
@@ -1350,9 +1348,9 @@ namespace confighttp {
 
       output_tree["status"] = true;
       send_response(response, output_tree);
-    } catch (std::exception &e) {
-      BOOST_LOG(warning) << "SaveApp: "sv << e.what();
-      bad_request(response, e.what());
+    } catch (const std::exception &) {
+      BOOST_LOG(warning) << "SaveApp: could not process application configuration"sv;
+      bad_request(response, "Could not process application configuration");
     }
   }
 
@@ -2012,9 +2010,9 @@ namespace confighttp {
       }
 
       send_response(response, output_tree);
-    } catch (std::exception &e) {
-      BOOST_LOG(warning) << "SavePassword: "sv << e.what();
-      bad_request(response, e.what());
+    } catch (const std::exception &) {
+      BOOST_LOG(warning) << "SavePassword: could not process credential change"sv;
+      bad_request(response, "Could not process credential change");
     }
   }
 

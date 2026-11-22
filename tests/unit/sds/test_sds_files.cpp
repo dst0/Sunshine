@@ -17,7 +17,10 @@
 #include <string>
 #include <vector>
 
-#ifndef _WIN32
+#ifdef _WIN32
+  // platform includes
+  #include <windows.h>
+#else
   // platform includes
   #include <sys/stat.h>
   #include <unistd.h>
@@ -253,6 +256,49 @@ TEST_F(SdsFilesTest, CollisionSpaceExhaustedIsConflict) {
   EXPECT_FALSE(fs::exists(part(id)));
 }
 
+TEST_F(SdsFilesTest, RechecksAuthorizationAfterIntegrityWorkAndDiscardsDeniedUpload) {
+  const std::string data = "synthetic payload";
+  const auto created = create(CLIENT_A, "revoked.txt", data);
+  ASSERT_EQ(created.status, 201);
+  const auto id = created.json->at("id").get<std::string>();
+  ASSERT_EQ(manager->write_chunk(CLIENT_A, id, 0, data).status, 200);
+  int checks = 0;
+  const auto completed = manager->complete(CLIENT_A, id, [&]() -> std::optional<sds::reply_t> {
+    ++checks;
+    EXPECT_EQ(test_utils::sds::read_file(part(id)), data);
+    EXPECT_FALSE(fs::exists(options.inbox / "revoked.txt"));
+    return sds::reply_t::failure(409, "no_active_stream", "stream ended during completion");
+  });
+  EXPECT_EQ(checks, 1);
+  EXPECT_EQ(completed.status, 409);
+  EXPECT_EQ(completed.error, "no_active_stream");
+  EXPECT_EQ(manager->total_uploads(), 0u);
+  EXPECT_FALSE(fs::exists(part(id)));
+  EXPECT_FALSE(fs::exists(options.inbox / "revoked.txt"));
+}
+
+TEST_F(SdsFilesTest, RechecksAuthorizationForEachCollisionAttempt) {
+  const std::string data = "synthetic payload";
+  const auto created = create(CLIENT_A, "report.txt", data);
+  ASSERT_EQ(created.status, 201);
+  const auto id = created.json->at("id").get<std::string>();
+  ASSERT_EQ(manager->write_chunk(CLIENT_A, id, 0, data).status, 200);
+  test_utils::sds::write_file(options.inbox / "report.txt", "original");
+  int checks = 0;
+  const auto completed = manager->complete(CLIENT_A, id, [&]() -> std::optional<sds::reply_t> {
+    if (++checks == 1) {
+      return std::nullopt;
+    }
+    return sds::reply_t::failure(403, "forbidden", "upload permission revoked");
+  });
+  EXPECT_EQ(checks, 2);
+  EXPECT_EQ(completed.status, 403);
+  EXPECT_EQ(test_utils::sds::read_file(options.inbox / "report.txt"), "original");
+  EXPECT_FALSE(fs::exists(options.inbox / "report (1).txt"));
+  EXPECT_FALSE(fs::exists(part(id)));
+  EXPECT_EQ(manager->total_uploads(), 0u);
+}
+
 TEST_F(SdsFilesTest, ConcurrencyLimitIsPerClient) {
   const auto first = create(CLIENT_A, "1", "a");
   const auto second = create(CLIENT_A, "2", "b");
@@ -427,6 +473,49 @@ TEST_F(SdsFilesTest, DefaultFoldersAreDerivedFromTheInbox) {
   ASSERT_EQ(manager->list_outbox().status, 200);
   EXPECT_TRUE(fs::is_directory(options.inbox / "Outbox"));
 }
+
+#ifdef _WIN32
+TEST_F(SdsFilesTest, ReceivedFileHasInternetZoneBeforeItIsPublished) {
+  const std::string data = "synthetic payload";
+  const auto created = create(CLIENT_A, "download.txt", data);
+  ASSERT_EQ(created.status, 201);
+  const auto id = created.json->at("id").get<std::string>();
+  ASSERT_EQ(manager->write_chunk(CLIENT_A, id, 0, data).status, 200);
+  bool checked_before_publication = false;
+  const auto completed = manager->complete(CLIENT_A, id, [&]() -> std::optional<sds::reply_t> {
+    checked_before_publication = true;
+    const auto part_zone = fs::path(part(id).wstring() + L":Zone.Identifier");
+    EXPECT_EQ(test_utils::sds::read_file(part_zone), "[ZoneTransfer]\r\nZoneId=3\r\n");
+    EXPECT_FALSE(fs::exists(options.inbox / "download.txt"));
+    return std::nullopt;
+  });
+  EXPECT_TRUE(checked_before_publication);
+  ASSERT_EQ(completed.status, 201);
+  EXPECT_EQ(completed.json->at("name"), "download.txt");
+  const auto zone = fs::path((options.inbox / "download.txt").wstring() + L":Zone.Identifier");
+  EXPECT_EQ(test_utils::sds::read_file(zone), "[ZoneTransfer]\r\nZoneId=3\r\n");
+  EXPECT_EQ(test_utils::sds::read_file(options.inbox / "download.txt"), data);
+}
+
+TEST_F(SdsFilesTest, FailedInternetZoneMarkingDiscardsPartWithoutPublishing) {
+  const std::string data = "synthetic payload";
+  const auto created = create(CLIENT_A, "blocked.txt", data);
+  ASSERT_EQ(created.status, 201);
+  const auto id = created.json->at("id").get<std::string>();
+  ASSERT_EQ(manager->write_chunk(CLIENT_A, id, 0, data).status, 200);
+  const auto stream_path = part(id).wstring() + L":Zone.Identifier";
+  // Stream sharing is independent of the default stream. Allow rename/delete while refusing
+  // the writer needed for MOTW, so this catches the old publish-then-ignore-marking behavior.
+  HANDLE blocker = CreateFileW(stream_path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+  ASSERT_NE(blocker, INVALID_HANDLE_VALUE);
+  const auto completed = manager->complete(CLIENT_A, id);
+  CloseHandle(blocker);
+  EXPECT_EQ(completed.status, 500);
+  EXPECT_EQ(manager->total_uploads(), 0u);
+  EXPECT_FALSE(fs::exists(options.inbox / "blocked.txt"));
+  EXPECT_FALSE(fs::exists(part(id)));
+}
+#endif
 
 #ifndef _WIN32
 TEST_F(SdsFilesTest, ReceivedFilesAndFoldersHaveRestrictiveModes) {

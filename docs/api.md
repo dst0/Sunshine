@@ -19,7 +19,8 @@ State-changing API endpoints (POST, DELETE) are protected against Cross-Site Req
 - Requests without an `Origin` or `Referer` header (as is typical for `curl` and scripts) **require a
   CSRF token**. A missing header does not prove that the request did not come from a browser.
 - Get a token from `GET /api/csrf-token` (authenticated) and send it in the `X-CSRF-Token` header
-  (or the `csrf_token` query parameter). Tokens are valid for one hour.
+  (or the `csrf_token` query parameter for compatibility). Tokens are valid for one hour and consist
+  of 64 hexadecimal characters. Prefer the header so the token stays out of the request URL.
 
 **Example:**
 ```bash

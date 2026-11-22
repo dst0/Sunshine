@@ -17,12 +17,15 @@
 #include <map>
 #include <mutex>
 #include <set>
+#include <stdexcept>
 #include <string>
 #include <thread>
+#include <vector>
 
 // local includes
 #include <src/config.h>
 #include <src/sds/sds.h>
+#include <src/utility.h>
 
 namespace fs = std::filesystem;
 using namespace std::literals;
@@ -241,7 +244,10 @@ TEST(SdsModuleLifecycleTest, RequestsWhileStoppedAreUnavailable) {
   EXPECT_EQ(promise.get_future().get().status, 503);
   EXPECT_EQ(sds::server_features(), "");
   EXPECT_FALSE(sds::state_for_test(CERT_A).running);
-  EXPECT_FALSE(sds::post_to_file_worker_for_test([]() {}));
+  EXPECT_FALSE(sds::post_to_file_worker_for_test([]() {
+  }));
+  EXPECT_FALSE(sds::post_to_control_worker_for_test([]() {
+  }));
   sds::on_stream_state(CERT_A, true);
   sds::on_client_changed(CERT_A);
   sds::drain_for_test();
@@ -433,7 +439,7 @@ TEST_F(SdsModuleTest, StreamEndCompletesParkedPollAndClearsAllClientState) {
   ASSERT_TRUE(sds::state_for_test(CERT_A).parked_poll);
 
   // A stop notification while another session of the client still runs changes nothing.
-  sds::on_stream_state(CERT_A, false);
+  sds::on_stream_state(CERT_A, true);
   sds::drain_for_test();
   EXPECT_TRUE(sds::state_for_test(CERT_A).active);
   EXPECT_EQ(poll.wait_for(10ms), std::future_status::timeout);
@@ -598,6 +604,484 @@ TEST_F(SdsModuleTest, BusyFileWorkerDoesNotBlockClipboardOrEvents) {
   release.set_value();
   ASSERT_EQ(listing.wait_for(5s), std::future_status::ready);
   EXPECT_EQ(listing.get().status, 200);
+}
+
+TEST_F(SdsModuleTest, QueuedDownloadRechecksPermissionStreamAndPairing) {
+  fs::create_directories(options.files.outbox);
+  test_utils::sds::write_file(options.files.outbox / "private.txt", "private payload");
+  const auto listed = call(sds::op_e::outbox_list);
+  ASSERT_EQ(listed.status, 200);
+  const auto id = listed.json->at("files")[0]["id"].get<std::string>();
+  for (int revoke = 0; revoke < 3; ++revoke) {
+    add_client(CERT_A, "uuid-a");
+    std::promise<void> release;
+    auto released = release.get_future().share();
+    bool opened = false;
+    auto cleanup = util::fail_guard([&]() {
+      if (!opened) {
+        release.set_value();
+      }
+    });
+    ASSERT_TRUE(sds::post_to_file_worker_for_test([released]() {
+      released.wait();
+    }));
+    auto request = req(CERT_A);
+    request.id = id;
+    auto queued = call_async(sds::op_e::outbox_read, request);
+    EXPECT_EQ(queued.wait_for(20ms), std::future_status::timeout);
+    if (revoke == 0) {
+      set_permission(CERT_A, sds::permission_e::file_download, false);
+    } else if (revoke == 1) {
+      set_streaming(CERT_A, false);
+    } else {
+      std::lock_guard lock {mutex};
+      clients.erase(CERT_A);
+    }
+    opened = true;
+    release.set_value();
+    ASSERT_EQ(queued.wait_for(5s), std::future_status::ready);
+    const auto denied = queued.get();
+    EXPECT_EQ(denied.status, revoke == 0 ? 403 : revoke == 1 ? 409 :
+                                                               401);
+    EXPECT_NE(denied.body, "private payload");
+  }
+}
+
+TEST_F(SdsModuleTest, QueuedUploadCannotPublishAfterPermissionRevocation) {
+  const std::string data = "authorized before queuing";
+  const nlohmann::json upload {{"name", "revoked.txt"}, {"size", data.size()}, {"sha256", test_utils::sds::sha256_hex(data)}};
+  const auto created = call(sds::op_e::upload_create, req(CERT_A, {}, upload.dump()));
+  ASSERT_EQ(created.status, 201);
+  auto chunk = req(CERT_A, {{"offset", "0"}}, data);
+  chunk.id = created.json->at("id").get<std::string>();
+  ASSERT_EQ(call(sds::op_e::upload_chunk, chunk).status, 200);
+  std::promise<void> release;
+  auto released = release.get_future().share();
+  bool opened = false;
+  auto cleanup = util::fail_guard([&]() {
+    if (!opened) {
+      release.set_value();
+    }
+  });
+  ASSERT_TRUE(sds::post_to_file_worker_for_test([released]() {
+    released.wait();
+  }));
+  auto complete = req(CERT_A);
+  complete.id = chunk.id;
+  auto queued = call_async(sds::op_e::upload_complete, complete);
+  set_permission(CERT_A, sds::permission_e::file_upload, false);
+  opened = true;
+  release.set_value();
+  ASSERT_EQ(queued.wait_for(5s), std::future_status::ready);
+  EXPECT_EQ(queued.get().status, 403);
+  EXPECT_FALSE(fs::exists(options.files.inbox / "revoked.txt"));
+}
+
+TEST_F(SdsModuleTest, QueuedWorkCannotRegainAuthorityAfterReconnectOrPermissionRegrant) {
+  for (const bool reconnect : {false, true}) {
+    std::promise<void> release;
+    auto released = release.get_future().share();
+    bool opened = false;
+    auto cleanup = util::fail_guard([&]() {
+      if (!opened) {
+        release.set_value();
+      }
+    });
+    ASSERT_TRUE(sds::post_to_file_worker_for_test([released]() {
+      released.wait();
+    }));
+    auto old_request = call_async(sds::op_e::outbox_list, req(CERT_A));
+    if (reconnect) {
+      set_streaming(CERT_A, false);
+      sds::on_stream_state(CERT_A, false);
+      set_streaming(CERT_A, true);
+      sds::on_stream_state(CERT_A, true);
+    } else {
+      set_permission(CERT_A, sds::permission_e::file_download, false);
+      sds::on_client_changed(CERT_A);
+      set_permission(CERT_A, sds::permission_e::file_download, true);
+      sds::on_client_changed(CERT_A);
+    }
+    auto new_request = call_async(sds::op_e::outbox_list, req(CERT_A));
+    opened = true;
+    release.set_value();
+    ASSERT_EQ(old_request.wait_for(5s), std::future_status::ready);
+    EXPECT_EQ(old_request.get().status, reconnect ? 409 : 403);
+    ASSERT_EQ(new_request.wait_for(5s), std::future_status::ready);
+    EXPECT_EQ(new_request.get().status, 200) << "new requests use the current authority";
+    sds::drain_for_test();
+  }
+}
+
+TEST_F(SdsModuleTest, AdmissionCapturesAuthorityBeforeTheFirstClientSnapshotCanBecomeStale) {
+  auto checks = std::make_shared<std::atomic_int>(0);
+  stream_override = [this, checks](std::string_view) {
+    if (++*checks == 1) {
+      // authorize() has already copied the paired client's old permissions.
+      set_permission(CERT_A, sds::permission_e::file_download, false);
+      sds::on_client_changed(CERT_A);
+      set_permission(CERT_A, sds::permission_e::file_download, true);
+      sds::on_client_changed(CERT_A);
+    }
+    return true;
+  };
+  const auto stale = call(sds::op_e::outbox_list);
+  stream_override = nullptr;
+  EXPECT_EQ(stale.status, 403);
+  EXPECT_EQ(call(sds::op_e::outbox_list).status, 200);
+}
+
+TEST_F(SdsModuleTest, ObservedZeroActiveTransitionCannotBeErasedByAFreshReconnectQuery) {
+  std::promise<void> release;
+  auto released = release.get_future().share();
+  bool opened = false;
+  auto cleanup = util::fail_guard([&]() { if (!opened) release.set_value(); });
+  ASSERT_TRUE(sds::post_to_file_worker_for_test([released]() { released.wait(); }));
+  auto stale = call_async(sds::op_e::outbox_list, req(CERT_A));
+  // The observer already captured an all-streams-ended event. A newer stream is visible
+  // by the time the callback receives it, so consulting stream_active() here loses history.
+  sds::on_stream_state(CERT_A, false);
+  sds::on_stream_state(CERT_A, true);
+  auto fresh = call_async(sds::op_e::outbox_list, req(CERT_A));
+  opened = true;
+  release.set_value();
+  ASSERT_EQ(stale.wait_for(5s), std::future_status::ready);
+  EXPECT_EQ(stale.get().status, 409);
+  ASSERT_EQ(fresh.wait_for(5s), std::future_status::ready);
+  EXPECT_EQ(fresh.get().status, 200);
+}
+
+TEST_F(SdsModuleTest, ReconnectedUploadSurvivesDelayedCleanupOfTheOldStream) {
+  sds::on_stream_state(CERT_A, true);
+  sds::drain_for_test();
+  std::promise<void> entered;
+  auto started = entered.get_future();
+  std::promise<void> release;
+  auto released = release.get_future().share();
+  bool opened = false;
+  auto cleanup = util::fail_guard([&]() { if (!opened) release.set_value(); });
+  ASSERT_TRUE(sds::post_to_control_worker_for_test([&entered, released]() { entered.set_value(); released.wait(); }));
+  EXPECT_EQ(started.wait_for(5s), std::future_status::ready);
+  set_streaming(CERT_A, false);
+  sds::on_stream_state(CERT_A, false);
+  set_streaming(CERT_A, true);
+  sds::on_stream_state(CERT_A, true);
+  const std::string data = "new stream upload";
+  const nlohmann::json upload {{"name", "reconnected.txt"}, {"size", data.size()}, {"sha256", test_utils::sds::sha256_hex(data)}};
+  const auto created = call(sds::op_e::upload_create, req(CERT_A, {}, upload.dump()));
+  EXPECT_EQ(created.status, 201);
+  opened = true;
+  release.set_value();
+  sds::drain_for_test();
+  ASSERT_EQ(created.status, 201);
+  EXPECT_EQ(sds::state_for_test(CERT_A).open_uploads, 1u);
+  auto chunk = req(CERT_A, {{"offset", "0"}}, data);
+  chunk.id = created.json->at("id").get<std::string>();
+  ASSERT_EQ(call(sds::op_e::upload_chunk, chunk).status, 200);
+  auto complete = req(CERT_A);
+  complete.id = chunk.id;
+  ASSERT_EQ(call(sds::op_e::upload_complete, complete).status, 201);
+  EXPECT_EQ(test_utils::sds::read_file(options.files.inbox / "reconnected.txt"), data);
+}
+
+TEST_F(SdsModuleTest, UploadPublicationRevalidatesPermissionAfterExecutionAuthorization) {
+  const std::string data = "revoke after admission";
+  const nlohmann::json upload {{"name", "late-revoked.txt"}, {"size", data.size()}, {"sha256", test_utils::sds::sha256_hex(data)}};
+  const auto created = call(sds::op_e::upload_create, req(CERT_A, {}, upload.dump()));
+  ASSERT_EQ(created.status, 201);
+  auto chunk = req(CERT_A, {{"offset", "0"}}, data);
+  chunk.id = created.json->at("id").get<std::string>();
+  ASSERT_EQ(call(sds::op_e::upload_chunk, chunk).status, 200);
+  auto checks = std::make_shared<std::atomic_int>(0);
+  stream_override = [this, checks](std::string_view) {
+    // Each authorization reads the paired client before consulting the stream predicate.
+    // Revoke after execution has captured its client, so only the publication check sees it.
+    if (++*checks == 2) {
+      set_permission(CERT_A, sds::permission_e::file_upload, false);
+    }
+    return true;
+  };
+  auto complete = req(CERT_A);
+  complete.id = chunk.id;
+  EXPECT_EQ(call(sds::op_e::upload_complete, complete).status, 403);
+  stream_override = nullptr;
+  EXPECT_FALSE(fs::exists(options.files.inbox / "late-revoked.txt"));
+  EXPECT_EQ(sds::state_for_test(CERT_A).open_uploads, 0u);
+}
+
+TEST_F(SdsModuleTest, DownloadDeliveryRevalidatesPermissionAfterExecutionAuthorization) {
+  fs::create_directories(options.files.outbox);
+  test_utils::sds::write_file(options.files.outbox / "private.txt", "private payload");
+  const auto listing = call(sds::op_e::outbox_list);
+  ASSERT_EQ(listing.status, 200);
+  auto request = req(CERT_A);
+  request.id = listing.json->at("files")[0]["id"].get<std::string>();
+  auto checks = std::make_shared<std::atomic_int>(0);
+  stream_override = [this, checks](std::string_view) {
+    if (++*checks == 2) {
+      set_permission(CERT_A, sds::permission_e::file_download, false);
+    }
+    return true;
+  };
+  const auto denied = call(sds::op_e::outbox_read, request);
+  stream_override = nullptr;
+  EXPECT_EQ(denied.status, 403);
+  EXPECT_NE(denied.body, "private payload");
+}
+
+TEST_F(SdsModuleTest, PendingFileJobsAreBoundedPerClientAndDoNotExcludeOtherClients) {
+  std::promise<void> release;
+  auto released = release.get_future().share();
+  bool opened = false;
+  auto cleanup = util::fail_guard([&]() {
+    if (!opened) {
+      release.set_value();
+    }
+  });
+  ASSERT_TRUE(sds::post_to_file_worker_for_test([released]() {
+    released.wait();
+  }));
+  std::vector<std::future<sds::reply_t>> accepted;
+  int refused = 0;
+  for (int i = 0; i < 128; ++i) {
+    auto reply = call_async(sds::op_e::outbox_list, req(CERT_A));
+    if (reply.wait_for(0ms) == std::future_status::ready) {
+      EXPECT_EQ(reply.get().status, 429);
+      ++refused;
+    } else {
+      accepted.push_back(std::move(reply));
+    }
+  }
+  EXPECT_EQ(accepted.size(), 4u);
+  EXPECT_EQ(refused, 124);
+  auto other = call_async(sds::op_e::outbox_list, req(CERT_B));
+  EXPECT_EQ(other.wait_for(0ms), std::future_status::timeout);
+  EXPECT_EQ(call(sds::op_e::capabilities, req(CERT_B)).status, 200);
+  opened = true;
+  release.set_value();
+  for (auto &reply : accepted) {
+    ASSERT_EQ(reply.wait_for(5s), std::future_status::ready);
+    EXPECT_EQ(reply.get().status, 200);
+  }
+  ASSERT_EQ(other.wait_for(5s), std::future_status::ready);
+  EXPECT_EQ(other.get().status, 200);
+  EXPECT_EQ(call(sds::op_e::outbox_list).status, 200) << "admission capacity is released";
+}
+
+TEST_F(SdsModuleTest, QueuedClipboardRechecksPermissionStreamAndPairing) {
+  sds::on_stream_state(CERT_A, true);
+  sds::drain_for_test();
+  sds::clipboard::item_t host_item;
+  host_item.text = "private clipboard";
+  clipboard->host_set(std::move(host_item));
+  sds::drain_for_test();
+  for (const bool write : {false, true}) {
+    for (int revoke = 0; revoke < 3; ++revoke) {
+      add_client(CERT_A, "uuid-a");
+      std::promise<void> release;
+      auto released = release.get_future().share();
+      bool opened = false;
+      auto cleanup = util::fail_guard([&]() {
+        if (!opened) {
+          release.set_value();
+        }
+      });
+      ASSERT_TRUE(sds::post_to_control_worker_for_test([released]() {
+        released.wait();
+      }));
+      auto request = req(CERT_A, {{"type", "text/plain"}}, write ? "revoked content" : "");
+      request.content_type = "text/plain;charset=utf-8";
+      request.client_seq = std::to_string(revoke + 1);
+      const auto writes = clipboard->write_count();
+      auto queued = call_async(write ? sds::op_e::clipboard_put : sds::op_e::clipboard_get, std::move(request));
+      EXPECT_EQ(queued.wait_for(0ms), std::future_status::timeout);
+      if (revoke == 0) {
+        set_permission(CERT_A, write ? sds::permission_e::clipboard_write : sds::permission_e::clipboard_read, false);
+      } else if (revoke == 1) {
+        set_streaming(CERT_A, false);
+      } else {
+        std::lock_guard lock {mutex};
+        clients.erase(CERT_A);
+      }
+      opened = true;
+      release.set_value();
+      ASSERT_EQ(queued.wait_for(5s), std::future_status::ready);
+      const auto reply = queued.get();
+      EXPECT_EQ(reply.status, revoke == 0 ? 403 : revoke == 1 ? 409 :
+                                                                401);
+      EXPECT_NE(reply.body, "private clipboard");
+      EXPECT_EQ(clipboard->write_count(), writes);
+    }
+  }
+}
+
+TEST_F(SdsModuleTest, PendingBudgetIsSharedAcrossBothWorkers) {
+  std::promise<void> release;
+  auto released = release.get_future().share();
+  bool opened = false;
+  auto cleanup = util::fail_guard([&]() {
+    if (!opened) {
+      release.set_value();
+    }
+  });
+  ASSERT_TRUE(sds::post_to_file_worker_for_test([released]() {
+    released.wait();
+  }));
+  ASSERT_TRUE(sds::post_to_control_worker_for_test([released]() {
+    released.wait();
+  }));
+  std::vector<std::future<sds::reply_t>> accepted;
+  for (int i = 0; i < 3; ++i) {
+    accepted.push_back(call_async(sds::op_e::outbox_list, req(CERT_A)));
+  }
+  accepted.push_back(call_async(sds::op_e::clipboard_get, req(CERT_A, {{"type", "text/plain"}})));
+  auto denied = call_async(sds::op_e::clipboard_get, req(CERT_A, {{"type", "text/plain"}}));
+  EXPECT_EQ(denied.wait_for(100ms), std::future_status::ready);
+  if (denied.wait_for(0ms) == std::future_status::ready) {
+    const auto reply = denied.get();
+    EXPECT_EQ(reply.status, 429);
+    EXPECT_EQ(header(reply, "Retry-After"), "1");
+  }
+  auto other = call_async(sds::op_e::clipboard_get, req(CERT_B, {{"type", "text/plain"}}));
+  EXPECT_EQ(other.wait_for(0ms), std::future_status::timeout);
+  opened = true;
+  release.set_value();
+  for (auto &reply : accepted) {
+    ASSERT_EQ(reply.wait_for(5s), std::future_status::ready);
+    EXPECT_NE(reply.get().status, 429);
+  }
+  ASSERT_EQ(other.wait_for(5s), std::future_status::ready);
+  EXPECT_NE(other.get().status, 429);
+  sds::drain_for_test();
+  EXPECT_NE(call(sds::op_e::clipboard_get, req(CERT_A, {{"type", "text/plain"}})).status, 429);
+}
+
+TEST_F(SdsModuleTest, PendingPayloadBytesAreBoundedPerClientAndGlobally) {
+  constexpr std::size_t MIB = 1024 * 1024;
+  options.files.chunk_max = 32 * MIB;
+  start();
+  add_client("cert-c", "uuid-c");
+  std::promise<void> release;
+  auto released = release.get_future().share();
+  bool opened = false;
+  auto cleanup = util::fail_guard([&]() {
+    if (!opened) {
+      release.set_value();
+    }
+  });
+  ASSERT_TRUE(sds::post_to_file_worker_for_test([released]() {
+    released.wait();
+  }));
+  const auto chunk = [&](const std::string &cert, std::size_t bytes) {
+    auto request = req(cert, {{"offset", "0"}}, std::string(bytes, 'x'));
+    request.id = std::string(32, 'a');
+    return call_async(sds::op_e::upload_chunk, std::move(request));
+  };
+  std::vector<std::future<sds::reply_t>> accepted;
+  for (const auto cert : {CERT_A, CERT_B}) {
+    for (int i = 0; i < 2; ++i) {
+      accepted.push_back(chunk(cert, 32 * MIB));
+      EXPECT_EQ(accepted.back().wait_for(0ms), std::future_status::timeout);
+    }
+    auto denied = chunk(cert, 1);
+    EXPECT_EQ(denied.wait_for(100ms), std::future_status::ready);
+    if (denied.wait_for(0ms) == std::future_status::ready) {
+      const auto reply = denied.get();
+      EXPECT_EQ(reply.status, 429);
+      EXPECT_EQ(header(reply, "Retry-After"), "1");
+    }
+  }
+  auto global_denied = chunk("cert-c", 1);
+  EXPECT_EQ(global_denied.wait_for(100ms), std::future_status::ready);
+  if (global_denied.wait_for(0ms) == std::future_status::ready) {
+    EXPECT_EQ(global_denied.get().status, 429);
+  }
+  opened = true;
+  release.set_value();
+  for (auto &reply : accepted) {
+    ASSERT_EQ(reply.wait_for(5s), std::future_status::ready);
+    EXPECT_EQ(reply.get().status, 404) << "unknown upload is checked after admission";
+  }
+  sds::drain_for_test();
+  auto recovered = chunk(CERT_A, 32 * MIB);
+  ASSERT_EQ(recovered.wait_for(5s), std::future_status::ready);
+  EXPECT_EQ(recovered.get().status, 404) << "error paths release the entire byte reservation";
+}
+
+TEST_F(SdsModuleTest, PendingJobsHaveAGlobalBoundAcrossClients) {
+  sds::on_stream_state(CERT_A, true);
+  sds::drain_for_test();
+  ASSERT_TRUE(sds::state_for_test(CERT_A).active);
+  std::promise<void> release;
+  auto released = release.get_future().share();
+  bool opened = false;
+  auto cleanup = util::fail_guard([&]() {
+    if (!opened) {
+      release.set_value();
+    }
+  });
+  ASSERT_TRUE(sds::post_to_file_worker_for_test([released]() {
+    released.wait();
+  }));
+  std::vector<std::future<sds::reply_t>> accepted;
+  for (int client = 0; client < 8; ++client) {
+    const auto cert = "global-client-" + std::to_string(client);
+    add_client(cert, cert);
+    for (int i = 0; i < 4; ++i) {
+      accepted.push_back(call_async(sds::op_e::outbox_list, req(cert)));
+      EXPECT_EQ(accepted.back().wait_for(0ms), std::future_status::timeout);
+    }
+  }
+  auto denied = call_async(sds::op_e::outbox_list, req(CERT_A));
+  EXPECT_EQ(denied.wait_for(100ms), std::future_status::ready);
+  if (denied.wait_for(0ms) == std::future_status::ready) {
+    EXPECT_EQ(denied.get().status, 429);
+  }
+  // Stream teardown is trusted lifecycle work and must survive a full request budget.
+  set_streaming(CERT_A, false);
+  sds::on_stream_state(CERT_A, false);
+  opened = true;
+  release.set_value();
+  for (auto &reply : accepted) {
+    ASSERT_EQ(reply.wait_for(5s), std::future_status::ready);
+    EXPECT_NE(reply.get().status, 429);
+  }
+  sds::drain_for_test();
+  EXPECT_FALSE(sds::state_for_test(CERT_A).active);
+  set_streaming(CERT_A, true);
+  EXPECT_EQ(call(sds::op_e::outbox_list).status, 200);
+}
+
+TEST_F(SdsModuleTest, ThrowingCompletionCallbacksReleasePendingAdmission) {
+  std::promise<void> release;
+  auto released = release.get_future().share();
+  bool opened = false;
+  auto cleanup = util::fail_guard([&]() {
+    if (!opened) {
+      release.set_value();
+    }
+  });
+  ASSERT_TRUE(sds::post_to_file_worker_for_test([released]() {
+    released.wait();
+  }));
+  std::atomic_int callbacks {0};
+  for (int i = 0; i < 4; ++i) {
+    sds::handle(sds::op_e::outbox_list, req(CERT_A), [&](sds::reply_t reply) {
+      EXPECT_EQ(reply.status, 200);
+      ++callbacks;
+      throw std::runtime_error("synthetic completion failure");
+    });
+  }
+  auto refused = call_async(sds::op_e::outbox_list, req(CERT_A));
+  EXPECT_EQ(refused.wait_for(100ms), std::future_status::ready);
+  if (refused.wait_for(0ms) == std::future_status::ready) {
+    EXPECT_EQ(refused.get().status, 429);
+  }
+  opened = true;
+  release.set_value();
+  sds::drain_for_test();
+  EXPECT_EQ(callbacks.load(), 4);
+  EXPECT_EQ(call(sds::op_e::outbox_list).status, 200);
 }
 
 TEST_F(SdsModuleTest, StopReleasesParkedPollsAndRejectsLateWork) {

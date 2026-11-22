@@ -217,6 +217,79 @@ namespace crypto {
       return encrypt(plaintext, tagged_cipher, tagged_cipher + tag_size, iv);
     }
 
+    int gcm_t::encrypt(const std::string_view &plaintext, std::uint8_t *tag, std::uint8_t *ciphertext, aes_t *iv, const std::string_view &aad) {
+      if (!encrypt_ctx && init_encrypt_gcm(encrypt_ctx, &key, iv, padding)) {
+        return -1;
+      }
+
+      if (EVP_EncryptInit_ex(encrypt_ctx.get(), nullptr, nullptr, nullptr, iv->data()) != 1) {
+        return -1;
+      }
+
+      int aad_outlen;
+      if (!aad.empty() && EVP_EncryptUpdate(encrypt_ctx.get(), nullptr, &aad_outlen, (const std::uint8_t *) aad.data(), (int) aad.size()) != 1) {
+        return -1;
+      }
+
+      int update_outlen = 0;
+      if (!plaintext.empty() && EVP_EncryptUpdate(encrypt_ctx.get(), ciphertext, &update_outlen, (const std::uint8_t *) plaintext.data(), (int) plaintext.size()) != 1) {
+        return -1;
+      }
+
+      int final_outlen;
+      if (EVP_EncryptFinal_ex(encrypt_ctx.get(), ciphertext + update_outlen, &final_outlen) != 1) {
+        return -1;
+      }
+
+      if (EVP_CIPHER_CTX_ctrl(encrypt_ctx.get(), EVP_CTRL_GCM_GET_TAG, tag_size, tag) != 1) {
+        return -1;
+      }
+
+      return update_outlen + final_outlen;
+    }
+
+    int gcm_t::decrypt(const std::string_view &tagged_cipher, std::vector<std::uint8_t> &plaintext, aes_t *iv, const std::string_view &aad) {
+      if (tagged_cipher.size() < tag_size) {
+        return -1;
+      }
+
+      if (!decrypt_ctx && init_decrypt_gcm(decrypt_ctx, &key, iv, padding)) {
+        return -1;
+      }
+
+      if (EVP_DecryptInit_ex(decrypt_ctx.get(), nullptr, nullptr, nullptr, iv->data()) != 1) {
+        return -1;
+      }
+
+      int aad_outlen;
+      if (!aad.empty() && EVP_DecryptUpdate(decrypt_ctx.get(), nullptr, &aad_outlen, (const std::uint8_t *) aad.data(), (int) aad.size()) != 1) {
+        return -1;
+      }
+
+      auto cipher = tagged_cipher.substr(tag_size);
+      auto tag = tagged_cipher.substr(0, tag_size);
+
+      plaintext.resize(round_to_pkcs7_padded(cipher.size()));
+
+      int update_outlen = 0;
+      if (!cipher.empty() && EVP_DecryptUpdate(decrypt_ctx.get(), plaintext.data(), &update_outlen, (const std::uint8_t *) cipher.data(), (int) cipher.size()) != 1) {
+        return -1;
+      }
+
+      if (EVP_CIPHER_CTX_ctrl(decrypt_ctx.get(), EVP_CTRL_GCM_SET_TAG, (int) tag.size(), const_cast<char *>(tag.data())) != 1) {
+        return -1;
+      }
+
+      int final_outlen;
+      if (EVP_DecryptFinal_ex(decrypt_ctx.get(), plaintext.data() + update_outlen, &final_outlen) != 1) {
+        plaintext.clear();
+        return -1;
+      }
+
+      plaintext.resize(update_outlen + final_outlen);
+      return 0;
+    }
+
     int ecb_t::decrypt(const std::string_view &cipher, std::vector<std::uint8_t> &plaintext) {
       auto fg = util::fail_guard([this]() {
         EVP_CIPHER_CTX_reset(decrypt_ctx.get());

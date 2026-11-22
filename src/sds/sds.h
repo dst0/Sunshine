@@ -142,7 +142,7 @@ namespace sds {
    * @brief Session observer: a stream of `cert_pem` started or stopped. Never blocks.
    *
    * @param cert_pem Client certificate of the session.
-   * @param running `true` on start, `false` on stop.
+   * @param running Captured aggregate state: false means this certificate reached zero running streams.
    */
   void on_stream_state(std::string_view cert_pem, bool running);
 
@@ -186,6 +186,14 @@ namespace sds {
    * @return `false` when the module is not running.
    */
   bool post_to_file_worker_for_test(std::function<void()> job);
+
+  /**
+   * @brief Queue a job on the clipboard worker so tests can hold deferred requests.
+   *
+   * @param job Job.
+   * @return `false` when the module is not running.
+   */
+  bool post_to_control_worker_for_test(std::function<void()> job);
 
   /**
    * @brief Diagnostics for tests.

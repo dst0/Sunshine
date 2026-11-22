@@ -8,8 +8,11 @@
 #include <cstring>
 #include <fstream>
 #include <future>
+#include <map>
+#include <mutex>
 #include <optional>
 #include <queue>
+#include <set>
 #include <utility>
 
 // lib includes
@@ -30,6 +33,7 @@
 #include "platform/common.h"
 #include "process.h"
 #include "rtsp.h"
+#include "sds/mic.h"
 #include "stream.h"
 #include "sync.h"
 #include "system_tray.h"
@@ -495,10 +499,29 @@ namespace stream {
     control_server_t control_server;  ///< ENet server for GameStream control packets.
   };
 
+  namespace session {
+    /**
+     * @brief Serialize lifecycle publication and per-certificate session membership.
+     *
+     * @param session Session changing lifecycle state.
+     * @param running Whether to enter RUNNING or STOPPING.
+     * @return True when the requested transition happened.
+     */
+    bool change_running_state(session_t &session, bool running);
+  }
+
   /**
    * @brief Runtime state for one audio/video streaming session.
    */
   struct session_t {
+    /**
+     * @brief Stop microphone callbacks while the session state they inspect is still alive.
+     */
+    ~session_t() {
+      session::change_running_state(*this, false);
+      mic.reset();
+    }
+
     config_t config;  ///< Stream or encoder configuration captured for the worker.
 
     safe::mail_t mail;  ///< Mailbox used to distribute packets and lifecycle events.
@@ -563,6 +586,10 @@ namespace stream {
 
     std::uint32_t launch_session_id;  ///< RTSP launch-session ID associated with this stream.
     std::string client_cert;  ///< PEM certificate for the paired client owning the stream.
+
+    std::optional<sds::mic::session_config_t> mic_config;  ///< Microphone parameters when the client set up the mic stream.
+    std::mutex mic_mutex;  ///< Serializes optional microphone activation with stream teardown.
+    sds::mic::session_handle_t mic;  ///< Running microphone passthrough, stopped with the stream.
     std::string input_session_id;  ///< Stable client identity used to retain input devices across resume.
 
     safe::mail_raw_t::event_t<bool> shutdown_event;  ///< Event raised when the stream should shut down.
@@ -2259,6 +2286,40 @@ namespace stream {
   }
 
   namespace session {
+    namespace {
+      std::mutex lifecycle_mutex;  ///< Orders state transitions and observer delivery.
+      std::map<std::string, std::set<session_t *>, std::less<>> running_by_client;  ///< Exact session identities per certificate.
+    }
+
+    bool change_running_state(session_t &session, bool running) {
+      std::lock_guard lock {lifecycle_mutex};
+      bool any_running = true;
+      if (running) {
+        session.state.store(state_e::RUNNING, std::memory_order_release);
+        running_by_client[session.client_cert].insert(&session);
+      } else {
+        auto expected = state_e::RUNNING;
+        if (!session.state.compare_exchange_strong(expected, state_e::STOPPING)) {
+          return false;
+        }
+        session.shutdown_event->raise(true);
+        const auto found = running_by_client.find(session.client_cert);
+        if (found != running_by_client.end()) {
+          found->second.erase(&session);
+          any_running = !found->second.empty();
+          if (!any_running) {
+            running_by_client.erase(found);
+          }
+        } else {
+          any_running = false;
+        }
+      }
+      // Observers must only enqueue work; they must not reenter lifecycle transitions or RTSP.
+      // The false transition is delivered before a reconnect can publish its new true state.
+      rtsp_stream::notify_session_state(session.client_cert, any_running);
+      return true;
+    }
+
     std::atomic_uint running_sessions;  ///< Running sessions.
 
     /**
@@ -2280,14 +2341,7 @@ namespace stream {
      */
     void stop(session_t &session) {
       while_starting_do_nothing(session.state);
-      auto expected = state_e::RUNNING;
-      auto already_stopping = !session.state.compare_exchange_strong(expected, state_e::STOPPING);
-      if (already_stopping) {
-        return;
-      }
-
-      session.shutdown_event->raise(true);
-      rtsp_stream::notify_session_state(session.client_cert, false);
+      change_running_state(session, false);
     }
 
     /**
@@ -2314,6 +2368,11 @@ namespace stream {
       session.audioThread.join();
       BOOST_LOG(debug) << "Waiting for control to end..."sv;
       session.controlEnd.view();
+      BOOST_LOG(debug) << "Stopping microphone..."sv;
+      {
+        std::lock_guard mic_lock {session.mic_mutex};
+        session.mic.reset();
+      }
       // Reset input on session stop to avoid stuck repeated keys
       BOOST_LOG(debug) << "Resetting Input..."sv;
       input::reset(session.input);
@@ -2339,6 +2398,37 @@ namespace stream {
       }
 
       BOOST_LOG(debug) << "Session ended"sv;
+    }
+
+    /**
+     * @brief Publish the stream lifecycle and activate its optional microphone.
+     *
+     * @param session Streaming session.
+     * @param addr Client network address.
+     */
+    void activate(session_t &session, const boost::asio::ip::address &addr) {
+      {
+        std::lock_guard mic_lock {session.mic_mutex};
+        // The playout thread checks this predicate immediately, so publish RUNNING before it
+        // starts. Teardown takes the same mutex if another worker stops during sink creation.
+        change_running_state(session, true);
+        if (session.mic_config) {
+          auto mic_config = std::move(*session.mic_config);
+          session.mic_config.reset();
+          mic_config.expected_address = net::normalize_address(addr);
+          mic_config.stream_running = [state = &session.state]() {
+            return state->load(std::memory_order_acquire) == state_e::RUNNING;
+          };
+          session.mic = sds::mic::session_handle_t {sds::mic::start_session(std::move(mic_config))};
+          if (auto mic = session.mic.get()) {
+            if (session.state.load(std::memory_order_acquire) != state_e::RUNNING) {
+              mic->deactivate();
+            }
+          } else {
+            BOOST_LOG(warning) << "Microphone passthrough requested but unavailable for this stream"sv;
+          }
+        }
+      }
     }
 
     /**
@@ -2373,8 +2463,7 @@ namespace stream {
       session.audioThread = std::jthread {audioThread, &session};
       session.videoThread = std::jthread {videoThread, &session};
 
-      session.state.store(state_e::RUNNING, std::memory_order_relaxed);
-      rtsp_stream::notify_session_state(session.client_cert, true);
+      activate(session, addr);
 
       // If this is the first session, invoke the platform callbacks
       if (++running_sessions == 1) {
@@ -2456,6 +2545,14 @@ namespace stream {
       session->audio.sequenceNumber = 0;
       session->audio.timestamp = 0;
 
+      if (launch_session.mic_requested) {
+        sds::mic::session_config_t mic_config;
+        mic_config.key = launch_session.gcm_key;
+        mic_config.ping_payload = launch_session.mic_ping_payload;
+        mic_config.client_cert = launch_session.client_cert;
+        session->mic_config = std::move(mic_config);
+      }
+
       session->control.peer = nullptr;
       session->state.store(state_e::STOPPED, std::memory_order_relaxed);
 
@@ -2477,5 +2574,13 @@ namespace stream {
       }
     }  // namespace test_support
 #endif
+
+    namespace test_support {
+      void activate_with_microphone(session_t &session, sds::mic::session_config_t config) {
+        const auto address = config.expected_address;
+        session.mic_config = std::move(config);
+        activate(session, address);
+      }
+    }  // namespace test_support
   }  // namespace session
 }  // namespace stream

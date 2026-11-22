@@ -10,6 +10,7 @@
 #include <chrono>
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -134,9 +135,12 @@ namespace sds::files {
      *
      * @param client Client key.
      * @param id Upload id.
+     * @param before_publish Optional synchronous authorization check, rerun before every rename
+     * attempt after integrity/flush/zone work. Return a denial reply to discard the upload.
+     * The production dispatcher supplies a fresh request/stream-bound authorization check.
      * @return 201 with the final name, 422 on size/hash mismatch, or an error.
      */
-    reply_t complete(const std::string &client, std::string_view id);
+    reply_t complete(const std::string &client, std::string_view id, std::function<std::optional<reply_t>()> before_publish = {});
 
     /**
      * @brief `DELETE /sds/v1/files/uploads/{id}`.

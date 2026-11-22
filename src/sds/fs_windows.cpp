@@ -1,10 +1,10 @@
 /**
  * @file src/sds/fs_windows.cpp
  * @brief Windows inbox/outbox primitives: CreateFileW with FILE_FLAG_OPEN_REPARSE_POINT under the
- *        session user's token, reparse-point and owner checks, no-replace renames and MOTW.
+ *        session user's token, reparse-point and ACL checks, no-replace renames and MOTW.
  *
  * File system access that resolves paths runs while impersonating the active console user, so new
- * files are owned by that user and inherit the profile ACL. Handles opened under impersonation are
+ * files are owned by that user with a protected private DACL. Handles opened under impersonation are
  * used afterwards without it.
  */
 // standard includes
@@ -171,8 +171,10 @@ namespace sds::fs {
      */
     bool effective_user_sid(std::vector<std::uint8_t> &out) {
       HANDLE raw = nullptr;
-      if (!OpenThreadToken(GetCurrentThread(), TOKEN_QUERY, TRUE, &raw) && !OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &raw)) {
-        return false;
+      if (!OpenThreadToken(GetCurrentThread(), TOKEN_QUERY, TRUE, &raw)) {
+        if (GetLastError() != ERROR_NO_TOKEN || !OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &raw)) {
+          return false;
+        }
       }
       handle_t token {raw};
       DWORD size = 0;
@@ -186,6 +188,130 @@ namespace sds::fs {
       out.assign(static_cast<const std::uint8_t *>(user->User.Sid), static_cast<const std::uint8_t *>(user->User.Sid) + length);
       return true;
     }
+
+    /**
+     * @brief Check whether a SID is the effective user or an explicitly trusted OS principal.
+     * @param sid Trustee SID.
+     * @param user Effective user SID.
+     * @return Whether this principal may modify inbox/outbox objects.
+     */
+    bool trusted_sid(PSID sid, const std::vector<std::uint8_t> &user) {
+      return sid && IsValidSid(sid) && (EqualSid(sid, const_cast<std::uint8_t *>(user.data())) || IsWellKnownSid(sid, WinLocalSystemSid) || IsWellKnownSid(sid, WinBuiltinAdministratorsSid));
+    }
+
+    /**
+     * @brief Check the owner and DACL of an open object under the effective user's token.
+     *
+     * Deny ACEs never grant rights. Unknown granting ACE forms are rejected rather than assuming
+     * that callback/object-specific conditions make them safe. Inherit-only ACEs do not apply
+     * to this object; every newly created child gets its own protected DACL.
+     * @param handle Object opened with READ_CONTROL.
+     * @return Error when ownership or writable ACL grants cannot be proved safe.
+     */
+    std::error_code check_security(HANDLE handle) {
+      std::vector<std::uint8_t> user;
+      if (!effective_user_sid(user)) {
+        return std::make_error_code(std::errc::permission_denied);
+      }
+      PSID owner = nullptr;
+      PACL acl = nullptr;
+      PSECURITY_DESCRIPTOR descriptor = nullptr;
+      if (GetSecurityInfo(handle, SE_FILE_OBJECT, OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION, &owner, nullptr, &acl, nullptr, &descriptor) != ERROR_SUCCESS) {
+        return std::make_error_code(std::errc::permission_denied);
+      }
+      bool safe = trusted_sid(owner, user) && acl && IsValidAcl(acl);
+      constexpr ACCESS_MASK mutation = FILE_WRITE_DATA | FILE_APPEND_DATA | FILE_WRITE_EA | FILE_WRITE_ATTRIBUTES | FILE_DELETE_CHILD | DELETE | WRITE_DAC | WRITE_OWNER | GENERIC_WRITE | GENERIC_ALL | MAXIMUM_ALLOWED;
+      for (DWORD index = 0; safe && index < acl->AceCount; ++index) {
+        void *raw = nullptr;
+        if (!GetAce(acl, index, &raw)) {
+          safe = false;
+          break;
+        }
+        const auto *header = static_cast<ACE_HEADER *>(raw);
+        if (header->AceFlags & INHERIT_ONLY_ACE) {
+          continue;
+        }
+        if (header->AceType == ACCESS_DENIED_ACE_TYPE || header->AceType == ACCESS_DENIED_OBJECT_ACE_TYPE || header->AceType == ACCESS_DENIED_CALLBACK_ACE_TYPE || header->AceType == ACCESS_DENIED_CALLBACK_OBJECT_ACE_TYPE) {
+          continue;
+        }
+        if (header->AceType != ACCESS_ALLOWED_ACE_TYPE || header->AceSize < sizeof(ACCESS_ALLOWED_ACE)) {
+          safe = false;
+          break;
+        }
+        const auto *ace = static_cast<ACCESS_ALLOWED_ACE *>(raw);
+        if ((ace->Mask & mutation) && !trusted_sid(const_cast<DWORD *>(&ace->SidStart), user)) {
+          safe = false;
+        }
+      }
+      LocalFree(descriptor);
+      return safe ? std::error_code {} : std::make_error_code(std::errc::permission_denied);
+    }
+
+    /**
+     * @brief Protected creation descriptor granting full access only to user, SYSTEM and Admins.
+     */
+    class private_security_t {
+    public:
+      private_security_t() = default;
+      private_security_t(const private_security_t &) = delete;
+      private_security_t &operator=(const private_security_t &) = delete;
+
+      ~private_security_t() {
+        LocalFree(acl_);
+      }
+
+      /**
+       * @brief Initialize under the effective user's impersonation context.
+       * @param directory Whether ACEs should also inherit to children.
+       * @return Error, or empty when attributes() may be used.
+       */
+      std::error_code initialize(bool directory) {
+        if (!effective_user_sid(user_)) {
+          return std::make_error_code(std::errc::permission_denied);
+        }
+        DWORD size = static_cast<DWORD>(system_.size());
+        if (!CreateWellKnownSid(WinLocalSystemSid, nullptr, system_.data(), &size)) {
+          return last_error();
+        }
+        size = static_cast<DWORD>(admins_.size());
+        if (!CreateWellKnownSid(WinBuiltinAdministratorsSid, nullptr, admins_.data(), &size)) {
+          return last_error();
+        }
+        std::array<EXPLICIT_ACCESSW, 3> grants {};
+        const std::array<PSID, 3> sids {user_.data(), system_.data(), admins_.data()};
+        for (std::size_t i = 0; i < grants.size(); ++i) {
+          grants[i].grfAccessPermissions = FILE_ALL_ACCESS;
+          grants[i].grfAccessMode = SET_ACCESS;
+          grants[i].grfInheritance = directory ? SUB_CONTAINERS_AND_OBJECTS_INHERIT : NO_INHERITANCE;
+          BuildTrusteeWithSidW(&grants[i].Trustee, sids[i]);
+        }
+        const auto result = SetEntriesInAclW(static_cast<ULONG>(grants.size()), grants.data(), nullptr, &acl_);
+        if (result != ERROR_SUCCESS) {
+          return from_win32(result);
+        }
+        if (!InitializeSecurityDescriptor(&descriptor_, SECURITY_DESCRIPTOR_REVISION) || !SetSecurityDescriptorOwner(&descriptor_, user_.data(), FALSE) || !SetSecurityDescriptorDacl(&descriptor_, TRUE, acl_, FALSE) || !SetSecurityDescriptorControl(&descriptor_, SE_DACL_PROTECTED, SE_DACL_PROTECTED)) {
+          return last_error();
+        }
+        attributes_ = {sizeof(SECURITY_ATTRIBUTES), &descriptor_, FALSE};
+        return {};
+      }
+
+      /**
+       * @brief Creation attributes, valid until this object is destroyed.
+       * @return Non-inheritable handle attributes with protected object security.
+       */
+      SECURITY_ATTRIBUTES *attributes() {
+        return &attributes_;
+      }
+
+    private:
+      std::vector<std::uint8_t> user_;  ///< Effective user SID backing storage.
+      std::array<std::uint8_t, SECURITY_MAX_SID_SIZE> system_ {};  ///< SYSTEM SID.
+      std::array<std::uint8_t, SECURITY_MAX_SID_SIZE> admins_ {};  ///< Administrators SID.
+      PACL acl_ = nullptr;  ///< LocalAlloc-backed explicit DACL.
+      SECURITY_DESCRIPTOR descriptor_ {};  ///< Absolute creation descriptor.
+      SECURITY_ATTRIBUTES attributes_ {};  ///< Creation attributes.
+    };
 
     /**
      * @brief Check a name is one plain path component.
@@ -298,8 +424,13 @@ namespace sds::fs {
       }
 
       bool is_regular_non_executable() override {
-        BY_HANDLE_FILE_INFORMATION info {};
-        return GetFileInformationByHandle(handle_.value, &info) && !(info.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_DEVICE));
+        return !as_user([&]() -> std::error_code {
+          BY_HANDLE_FILE_INFORMATION info {};
+          if (!GetFileInformationByHandle(handle_.value, &info) || (info.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_DEVICE))) {
+            return std::make_error_code(std::errc::invalid_argument);
+          }
+          return check_security(handle_.value);
+        });
       }
 
     private:
@@ -326,7 +457,7 @@ namespace sds::fs {
       }
 
       /**
-       * @brief Check type, reparse attribute and owner of the open directory.
+       * @brief Check type, reparse attribute, owner and DACL of the open directory.
        *
        * @return Error, or empty.
        */
@@ -341,18 +472,7 @@ namespace sds::fs {
         if (info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) {
           return std::make_error_code(std::errc::too_many_symbolic_link_levels);
         }
-        PSID owner = nullptr;
-        PSECURITY_DESCRIPTOR descriptor = nullptr;
-        if (GetSecurityInfo(handle_.value, SE_FILE_OBJECT, OWNER_SECURITY_INFORMATION, &owner, nullptr, nullptr, nullptr, &descriptor) != ERROR_SUCCESS) {
-          return std::make_error_code(std::errc::permission_denied);
-        }
-        std::error_code result = std::make_error_code(std::errc::permission_denied);
-        std::vector<std::uint8_t> user;
-        if (owner && effective_user_sid(user) && (EqualSid(owner, reinterpret_cast<PSID>(user.data())) || IsWellKnownSid(owner, WinBuiltinAdministratorsSid))) {
-          result = {};
-        }
-        LocalFree(descriptor);
-        return result;
+        return check_security(handle_.value);
       }
 
       std::error_code verify() override {
@@ -387,9 +507,19 @@ namespace sds::fs {
         }
         const auto path = child(name);
         return as_user([&]() -> std::error_code {
-          handle_t file {CreateFileW(path.c_str(), GENERIC_READ | GENERIC_WRITE | DELETE, FILE_SHARE_READ | FILE_SHARE_DELETE, nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT, nullptr)};
+          private_security_t security;
+          if (const auto ec = security.initialize(false); ec) {
+            return ec;
+          }
+          handle_t file {CreateFileW(path.c_str(), GENERIC_READ | GENERIC_WRITE | DELETE, FILE_SHARE_READ | FILE_SHARE_DELETE, security.attributes(), CREATE_NEW, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT, nullptr)};
           if (!file.valid()) {
             return last_error();
+          }
+          if (const auto ec = check_security(file.value); ec) {
+            // The filesystem must honor object ACLs; never publish a file on an unsupported FS.
+            FILE_DISPOSITION_INFO remove {TRUE};
+            SetFileInformationByHandle(file.value, FileDispositionInfo, &remove, sizeof(remove));
+            return ec;
           }
           out = std::make_unique<windows_file_t>(std::move(file));
           return {};
@@ -409,6 +539,9 @@ namespace sds::fs {
           BY_HANDLE_FILE_INFORMATION info {};
           if (GetFileType(file.value) != FILE_TYPE_DISK || !GetFileInformationByHandle(file.value, &info) || (info.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_DEVICE))) {
             return std::make_error_code(std::errc::invalid_argument);
+          }
+          if (const auto ec = check_security(file.value); ec) {
+            return ec;
           }
           out = std::make_unique<windows_file_t>(std::move(file));
           return {};
@@ -494,9 +627,12 @@ namespace sds::fs {
           if ((data.dwFileAttributes & skipped) || name.starts_with('.') || !text::is_valid_utf8(name)) {
             return;
           }
-          handle_t probe {CreateFileW(child(name).c_str(), FILE_READ_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT, nullptr)};
+          handle_t probe {CreateFileW(child(name).c_str(), FILE_READ_ATTRIBUTES | READ_CONTROL, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT, nullptr)};
           BY_HANDLE_FILE_INFORMATION info {};
           if (!probe.valid() || !GetFileInformationByHandle(probe.value, &info) || (info.dwFileAttributes & skipped)) {
+            return;
+          }
+          if (check_security(probe.value)) {
             return;
           }
           entry_t entry;
@@ -512,16 +648,19 @@ namespace sds::fs {
         }
         const auto path = child(name) + L":Zone.Identifier";
         return as_user([&]() -> std::error_code {
-          handle_t stream {CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr)};
+          handle_t stream {CreateFileW(path.c_str(), GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_DELETE, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT, nullptr)};
           if (!stream.valid()) {
             return last_error();
           }
           static constexpr char zone[] = "[ZoneTransfer]\r\nZoneId=3\r\n";
           DWORD written = 0;
-          if (!WriteFile(stream.value, zone, sizeof(zone) - 1, &written, nullptr) || written != sizeof(zone) - 1) {
+          if (!WriteFile(stream.value, zone, sizeof(zone) - 1, &written, nullptr)) {
             return last_error();
           }
-          return {};
+          if (written != sizeof(zone) - 1) {
+            return std::make_error_code(std::errc::io_error);
+          }
+          return FlushFileBuffers(stream.value) ? std::error_code {} : last_error();
         });
       }
 
@@ -579,6 +718,10 @@ namespace sds::fs {
     std::unique_ptr<windows_directory_t> directory;
     const auto ec = as_user([&]() -> std::error_code {
       if (create) {
+        private_security_t security;
+        if (const auto error = security.initialize(true); error) {
+          return error;
+        }
         std::filesystem::path prefix;
         for (const auto &component : normalized) {
           prefix /= component;
@@ -588,7 +731,7 @@ namespace sds::fs {
           if (GetFileAttributesW(prefix.c_str()) != INVALID_FILE_ATTRIBUTES) {
             continue;
           }
-          if (!CreateDirectoryW(prefix.c_str(), nullptr) && GetLastError() != ERROR_ALREADY_EXISTS) {
+          if (!CreateDirectoryW(prefix.c_str(), security.attributes()) && GetLastError() != ERROR_ALREADY_EXISTS) {
             return last_error();
           }
         }

@@ -11,6 +11,7 @@
 
 // standard includes
 #include <chrono>
+#include <array>
 #include <filesystem>
 #include <format>
 #include <fstream>
@@ -59,6 +60,73 @@ namespace {
     SimpleWeb::CaseInsensitiveMultimap header;  ///< Response headers.
   };
 
+  /** @brief Real TLS peer permitting partial writes, paused reads and explicit resets. */
+  class raw_peer_t {
+  public:
+    /** @brief Connect using synthetic mTLS credentials. */
+    raw_peer_t(unsigned short port, const credential_files_t &credentials):
+        context(make_context(credentials)), socket(io, context) {
+      socket.lowest_layer().open(boost::asio::ip::tcp::v4());
+      socket.lowest_layer().set_option(boost::asio::socket_base::receive_buffer_size(1024));
+      socket.lowest_layer().connect({boost::asio::ip::make_address("127.0.0.1"), port}, error);
+      if (!error) {
+        socket.handshake(boost::asio::ssl::stream_base::client, error);
+      }
+    }
+    ~raw_peer_t() { reset(); }
+    /** @brief Write a header or partial body without waiting for a response. */
+    void send(std::string_view bytes) { boost::asio::write(socket, boost::asio::buffer(bytes), error); }
+    /** @brief Read until closure under a hard test deadline. @return Received byte count. */
+    std::size_t drain(std::chrono::seconds timeout = 5s) {
+      SimpleWeb::error_code ignored;
+      socket.lowest_layer().set_option(boost::asio::socket_base::receive_buffer_size(1024 * 1024), ignored);
+      std::array<char, 64 * 1024> buffer {};
+      std::size_t received = 0;
+      bool finished = false;
+      std::function<void()> read;
+      read = [&]() {
+        socket.async_read_some(boost::asio::buffer(buffer), [&](const SimpleWeb::error_code &ec, std::size_t count) {
+          received += count;
+          if (ec) {
+            error = ec;
+            finished = true;
+          } else { read(); }
+        });
+      };
+      read();
+      io.restart();
+      io.run_for(timeout);
+      if (!finished) {
+        reset();
+        io.restart();
+        io.run();
+        error = boost::asio::error::timed_out;
+      }
+      return received;
+    }
+    /** @brief Force a TCP reset so queued server writes take their error path. */
+    void reset() {
+      SimpleWeb::error_code ignored;
+      if (socket.lowest_layer().is_open()) {
+        socket.lowest_layer().set_option(boost::asio::socket_base::linger(true, 0), ignored);
+        socket.lowest_layer().close(ignored);
+      }
+    }
+    SimpleWeb::error_code error;  ///< Last real socket result.
+  private:
+    /** @brief Load credentials before SSL_new snapshots its context configuration. */
+    static boost::asio::ssl::context make_context(const credential_files_t &credentials) {
+      boost::asio::ssl::context result(boost::asio::ssl::context::tls_client);
+      result.set_verify_mode(boost::asio::ssl::verify_none);
+      result.use_certificate_chain_file(credentials.cert.string());
+      result.use_private_key_file(credentials.key.string(), boost::asio::ssl::context::pem);
+      return result;
+    }
+    boost::asio::io_context io;  ///< Test peer event loop.
+    boost::asio::ssl::context context;  ///< Synthetic credential context.
+    boost::asio::ssl::stream<boost::asio::ip::tcp::socket> socket;  ///< Actual encrypted socket.
+  };
+
   /**
    * @brief Paired HTTPS server with the sds routes and a plain HTTP server with the guard.
    */
@@ -95,6 +163,7 @@ namespace {
       options.clipboard_text_max = 16 * 1024;
       options.clipboard_image_max = 128 * 1024;
       options.files.min_free_space = 0;
+      configure_limits();
       sds::dependencies_t deps;
       deps.stream_active = [this](std::string_view cert) {
         std::lock_guard lock {mutex};
@@ -108,7 +177,9 @@ namespace {
       https_server->config.address = "127.0.0.1";
       https_server->config.port = 0;
       https_server->resource["^/serverinfo$"]["GET"] = nvhttp::test_support::serverinfo_https;
-      sds::http::register_routes(*https_server);
+      configure_transport_limits();
+      transport = sds::http::register_routes(*https_server, transport_limits);
+      configure_transport_server();
       EXPECT_EQ(https_server->config.max_request_streambuf_size, sds::max_request_body_size());
       std::promise<unsigned short> https_port_promise;
       auto https_port_future = https_port_promise.get_future();
@@ -158,6 +229,27 @@ namespace {
       std::error_code ec;
       fs::remove_all(base, ec);
       BaseTest::TearDown();
+    }
+
+    /**
+     * @brief Configure specialized limits before starting the production HTTP adapter.
+     */
+    virtual void configure_limits() {}
+
+    /** @brief Override transport limits for deterministic wire regressions. */
+    virtual void configure_transport_limits() {}
+
+    /** @brief Install fixture-only observers before the HTTP thread starts. */
+    virtual void configure_transport_server() {}
+
+    /** @brief Wait for an observable network lifecycle transition. */
+    bool wait_usage(const std::function<bool(sds::http::transport_usage_t)> &predicate) {
+      const auto deadline = std::chrono::steady_clock::now() + 3s;
+      do {
+        if (predicate(transport->usage())) { return true; }
+        std::this_thread::sleep_for(2ms);
+      } while (std::chrono::steady_clock::now() < deadline);
+      return predicate(transport->usage());
     }
 
     /**
@@ -240,6 +332,8 @@ namespace {
     std::string uuid_a;  ///< UUID of A.
     std::string uuid_b;  ///< UUID of B.
     sds::options_t options;  ///< Module options.
+    sds::http::transport_limits_t transport_limits;  ///< Fixture transport caps.
+    std::shared_ptr<sds::http::transport_budget_t> transport;  ///< Lifetime accounting observer.
     std::mutex mutex;  ///< Protects streaming.
     std::set<std::string> streaming;  ///< Active streams.
     std::shared_ptr<SimpleWeb::ScopeRunner> handler_scope;  ///< HTTPS handler scope.
@@ -250,7 +344,211 @@ namespace {
     unsigned short https_port = 0;  ///< HTTPS port.
     unsigned short http_port = 0;  ///< HTTP port.
   };
+
+  /**
+   * @brief Real mTLS server whose clipboard body cap exceeds the historical 4 MiB limit.
+   */
+  class SdsLargePayloadHttpTest: public SdsHttpTest {
+  protected:
+    void configure_limits() override {
+      options.clipboard_text_max = 6 * 1024 * 1024;
+    }
+  };
+
+  /** @brief Tiny body reservations expose pre-worker memory leaks without large allocations. */
+  class SdsBoundedBodyHttpTest: public SdsHttpTest {
+  protected:
+    void configure_transport_limits() override {
+      transport_limits.connections = 4;
+      transport_limits.client_connections = 3;
+      transport_limits.bytes = 96 * 1024;
+      transport_limits.client_bytes = 64 * 1024;
+      transport_limits.content_timeout = 5;
+    }
+  };
+
+  /** @brief A short body timeout is isolated from quota/collision timing tests. */
+  class SdsBodyTimeoutHttpTest: public SdsBoundedBodyHttpTest {
+  protected:
+    void configure_transport_limits() override {
+      SdsBoundedBodyHttpTest::configure_transport_limits();
+      transport_limits.content_timeout = 1;
+    }
+  };
+
+  /** @brief Exercise the legal case where an application retains a zero-body Request. */
+  class SdsRetainedRequestHttpTest: public SdsHttpTest {
+  protected:
+    void configure_transport_limits() override {
+      transport_limits.connections = 2;
+      transport_limits.client_connections = 1;
+    }
+    void configure_transport_server() override {
+      auto admit = https_server->on_request_header;
+      https_server->on_request_header = [this, admit](auto request) {
+        if (!admit(request)) { return false; }
+        std::lock_guard lock {retained_mutex};
+        retained = request;
+        return true;
+      };
+    }
+    /** @brief Release the independently held Request. */
+    void release_request() {
+      std::lock_guard lock {retained_mutex};
+      retained.reset();
+    }
+    void TearDown() override {
+      release_request();
+      SdsHttpTest::TearDown();
+    }
+    std::mutex retained_mutex;  ///< Protects the test observer.
+    std::shared_ptr<sds::http::https_server_t::Request> retained;  ///< Independent Request owner.
+  };
+
+  /** @brief Two large outputs fit globally, only one fits per certificate. */
+  class SdsBoundedOutputHttpTest: public SdsLargePayloadHttpTest {
+  protected:
+    void configure_transport_limits() override {
+      transport_limits.connections = 5;
+      transport_limits.client_connections = 3;
+      transport_limits.bytes = 20 * 1024 * 1024;
+      transport_limits.client_bytes = 12 * 1024 * 1024;
+      transport_limits.content_timeout = 10;
+    }
+  };
 }  // namespace
+
+TEST_F(SdsBoundedBodyHttpTest, PartialBodiesReserveBeforeBufferingAndReleaseOnReset) {
+  const auto header = std::format("PUT /sds/v1/files/uploads/00000000000000000000000000000000 HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\nx", 24 * 1024);
+  raw_peer_t first(https_port, client_a);
+  ASSERT_FALSE(first.error);
+  first.send(header);
+  ASSERT_TRUE(wait_usage([](auto usage) { return usage.bytes == 48 * 1024 && usage.requests == 1; }));
+  raw_peer_t denied_client(https_port, client_a);
+  denied_client.send(header);
+  EXPECT_EQ(denied_client.drain(), 0u);
+  EXPECT_NE(denied_client.error, boost::asio::error::timed_out);
+  raw_peer_t other(https_port, client_b);
+  other.send(header);
+  ASSERT_TRUE(wait_usage([](auto usage) { return usage.bytes == 96 * 1024 && usage.requests == 2; }));
+  raw_peer_t denied_global(https_port, client_b);
+  denied_global.send("POST /sds/v1/files/uploads HTTP/1.1\r\nHost: localhost\r\nContent-Length: 1\r\n\r\n");
+  EXPECT_EQ(denied_global.drain(), 0u);
+  EXPECT_NE(denied_global.error, boost::asio::error::timed_out);
+  first.reset();
+  ASSERT_TRUE(wait_usage([](auto usage) { return usage.bytes == 48 * 1024 && usage.requests == 1; }));
+  other.reset();
+  EXPECT_TRUE(wait_usage([](auto usage) { return usage.bytes == 0 && usage.requests == 0; }));
+}
+
+TEST_F(SdsRetainedRequestHttpTest, ZeroBodyRequestCanOutliveItsDisconnectedSocket) {
+  {
+    auto peer = client(&client_a);
+    ASSERT_EQ(send(*peer, "PUT", "/sds/v1/clipboard", "", {{"Content-Type", "text/plain;charset=utf-8"}, {"X-SDS-Client-Seq", "1"}}).status, 204);
+  }
+  ASSERT_TRUE(wait_usage([](auto usage) { return usage.connections == 0 && usage.requests == 1 && usage.bytes == 0; }));
+  {
+    auto denied = client(&client_a);
+    EXPECT_EQ(send(*denied, "GET", "/sds/v1/capabilities").status, 0);
+  }
+  release_request();
+  ASSERT_TRUE(wait_usage([](auto usage) { return usage.requests == 0 && usage.bytes == 0; }));
+  {
+    auto admitted = client(&client_a);
+    EXPECT_EQ(send(*admitted, "PUT", "/sds/v1/clipboard", "", {{"Content-Type", "text/plain;charset=utf-8"}, {"X-SDS-Client-Seq", "2"}}).status, 204);
+  }
+  release_request();
+  EXPECT_TRUE(wait_usage([](auto usage) { return usage.connections == 0 && usage.requests == 0 && usage.bytes == 0; }));
+}
+
+TEST_F(SdsBodyTimeoutHttpTest, IncompleteBodyTimeoutReturnsTheReservation) {
+  raw_peer_t peer(https_port, client_a);
+  peer.send("PUT /sds/v1/clipboard HTTP/1.1\r\nHost: localhost\r\nContent-Length: 24576\r\n\r\nx");
+  ASSERT_TRUE(wait_usage([](auto usage) { return usage.bytes == 48 * 1024; }));
+  EXPECT_EQ(peer.drain(), 0u);
+  EXPECT_NE(peer.error, boost::asio::error::timed_out);
+  EXPECT_TRUE(wait_usage([](auto usage) { return usage.bytes == 0 && usage.requests == 0; }));
+}
+
+TEST_F(SdsBoundedBodyHttpTest, IdleTlsConnectionsRespectCertificateAndGlobalCaps) {
+  raw_peer_t first(https_port, client_a);
+  raw_peer_t second(https_port, client_a);
+  raw_peer_t third(https_port, client_a);
+  ASSERT_TRUE(wait_usage([](auto usage) { return usage.connections == 3; }));
+  raw_peer_t denied_client(https_port, client_a);
+  denied_client.send("GET /sds/v1/capabilities HTTP/1.1\r\nHost: localhost\r\n\r\n");
+  EXPECT_EQ(denied_client.drain(), 0u);
+  EXPECT_NE(denied_client.error, boost::asio::error::timed_out);
+  raw_peer_t other(https_port, client_b);
+  ASSERT_FALSE(other.error);
+  ASSERT_TRUE(wait_usage([](auto usage) { return usage.connections == 4; }));
+  raw_peer_t denied_global(https_port, client_b);
+  EXPECT_TRUE(denied_global.error) << "global cap must refuse before TLS processing";
+  first.reset(); second.reset(); third.reset(); other.reset();
+  EXPECT_TRUE(wait_usage([](auto usage) { return usage.connections == 0; }));
+}
+
+TEST_F(SdsHttpTest, AmbiguousFramingAndOversizedHeadersCloseBeforeDispatch) {
+  for (const auto *framing : {"Content-Length: 1\r\nContent-Length: 1\r\n", "Content-Length: 1\r\nTransfer-Encoding: chunked\r\n", "Transfer-Encoding: chunked\r\n", "Transfer-Encoding: gzip\r\n", "Content-Length: 1x\r\n", "Content-Length: +1\r\n", "Content-Length: 184467440737095516160\r\n", "Content-Length : 1\r\n", "Content-Length:\r\n", " invalid-fold\r\nContent-Length: 1\r\n"}) {
+    raw_peer_t peer(https_port, client_a);
+    peer.send(std::string("PUT /sds/v1/clipboard HTTP/1.1\r\nHost: localhost\r\n") + framing + "\r\nx");
+    EXPECT_EQ(peer.drain(), 0u) << framing;
+    EXPECT_NE(peer.error, boost::asio::error::timed_out);
+  }
+  raw_peer_t oversized(https_port, client_a);
+  oversized.send("GET /sds/v1/capabilities HTTP/1.1\r\nHost: localhost\r\nX-Large: " + std::string(64 * 1024, 'x') + "\r\n\r\n");
+  EXPECT_EQ(oversized.drain(), 0u);
+  EXPECT_NE(oversized.error, boost::asio::error::timed_out);
+  EXPECT_TRUE(wait_usage([](auto usage) { return usage.bytes == 0 && usage.requests == 0; }));
+}
+
+TEST_F(SdsBoundedOutputHttpTest, SlowTlsReaderKeepsOutputChargedUntilSendCompletion) {
+  const std::string payload(5 * 1024 * 1024, 's');
+  {
+    auto writer = client(&client_a);
+    ASSERT_EQ(send(*writer, "PUT", "/sds/v1/clipboard", payload, {{"Content-Type", "text/plain;charset=utf-8"}, {"X-SDS-Client-Seq", "1"}}).status, 204);
+  }
+  ASSERT_TRUE(wait_usage([](auto usage) { return usage.bytes == 0; }));
+  raw_peer_t slow(https_port, client_a);
+  slow.send("GET /sds/v1/clipboard?type=text%2Fplain HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+  ASSERT_TRUE(wait_usage([](auto usage) { return usage.bytes == 10 * 1024 * 1024 && usage.requests == 1; }));
+  auto same = client(&client_a);
+  EXPECT_EQ(send(*same, "GET", "/sds/v1/clipboard?type=text%2Fplain").status, 0);
+  auto other = client(&client_b);
+  EXPECT_EQ(send(*other, "GET", "/sds/v1/clipboard?type=text%2Fplain").body, payload);
+  ASSERT_TRUE(wait_usage([](auto usage) { return usage.bytes == 10 * 1024 * 1024; }));
+  EXPECT_GT(slow.drain(), payload.size());
+  EXPECT_NE(slow.error, boost::asio::error::timed_out);
+  EXPECT_TRUE(wait_usage([](auto usage) { return usage.bytes == 0 && usage.requests == 0; }));
+}
+
+TEST_F(SdsBoundedOutputHttpTest, ResetDuringTlsSendReleasesOutputReservation) {
+  const std::string payload(5 * 1024 * 1024, 'r');
+  {
+    auto writer = client(&client_a);
+    ASSERT_EQ(send(*writer, "PUT", "/sds/v1/clipboard", payload, {{"Content-Type", "text/plain;charset=utf-8"}, {"X-SDS-Client-Seq", "1"}}).status, 204);
+  }
+  ASSERT_TRUE(wait_usage([](auto usage) { return usage.bytes == 0; }));
+  raw_peer_t slow(https_port, client_a);
+  slow.send("GET /sds/v1/clipboard?type=text%2Fplain HTTP/1.1\r\nHost: localhost\r\n\r\n");
+  ASSERT_TRUE(wait_usage([](auto usage) { return usage.bytes == 10 * 1024 * 1024; }));
+  slow.reset();
+  EXPECT_TRUE(wait_usage([](auto usage) { return usage.bytes == 0 && usage.requests == 0; }));
+}
+
+TEST_F(SdsLargePayloadHttpTest, ClipboardPayloadAboveFourMiBTraversesTheProductionHttpsServer) {
+  const std::string payload(5 * 1024 * 1024 + 17, 'p');
+  auto a = client(&client_a);
+  const auto put = send(*a, "PUT", "/sds/v1/clipboard", payload, {{"Content-Type", "text/plain;charset=utf-8"}, {"X-SDS-Client-Seq", "1"}});
+  ASSERT_EQ(put.status, 204);
+  auto b = client(&client_b);
+  const auto get = send(*b, "GET", "/sds/v1/clipboard?type=text%2Fplain");
+  ASSERT_EQ(get.status, 200);
+  EXPECT_EQ(get.body.size(), payload.size());
+  EXPECT_EQ(test_utils::sds::sha256_hex(get.body), test_utils::sds::sha256_hex(payload));
+  ASSERT_NE(get.header.find("X-SDS-Host-Seq"), get.header.end());
+  EXPECT_EQ(get.header.find("X-SDS-Host-Seq")->second, "1");
+}
 
 TEST_F(SdsHttpTest, PairedClientGetsCapabilitiesAsJson) {
   auto a = client(&client_a);

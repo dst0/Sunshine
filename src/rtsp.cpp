@@ -30,6 +30,7 @@ extern "C" {
 #include "logging.h"
 #include "network.h"
 #include "rtsp.h"
+#include "sds/mic.h"
 #include "stream.h"
 #include "sync.h"
 #include "video.h"
@@ -950,7 +951,11 @@ namespace rtsp_stream {
     std::stringstream ss;
 
     // Tell the client about our supported features
-    ss << "a=x-ss-general.featureFlags:" << (uint32_t) platf::get_capabilities() << std::endl;
+    auto feature_flags = (uint32_t) platf::get_capabilities();
+    if (sds::mic::should_advertise(session.client_cert)) {
+      feature_flags |= sds::mic::FEATURE_FLAG;
+    }
+    ss << "a=x-ss-general.featureFlags:" << feature_flags << std::endl;
 
     // Always request new control stream encryption if the client supports it
     uint32_t encryption_flags_supported = SS_ENC_CONTROL_V2 | SS_ENC_AUDIO;
@@ -1053,6 +1058,13 @@ namespace rtsp_stream {
       port = net::map_port(stream::VIDEO_STREAM_PORT);
     } else if (type == "control"sv) {
       port = net::map_port(stream::CONTROL_PORT);
+    } else if (type == "mic"sv && sds::mic::should_advertise(session.client_cert)) {
+      // secure-desktop-stream microphone passthrough (DESIGN.md section 7.1)
+      port = net::map_port(sds::mic::PORT_OFFSET);
+      if (session.mic_ping_payload.empty()) {
+        session.mic_ping_payload = sds::mic::generate_ping_payload();
+      }
+      session.mic_requested = true;
     } else {
       cmd_not_found(sock, session, std::move(req));
 
@@ -1077,6 +1089,9 @@ namespace rtsp_stream {
     if (type == "control"sv) {
       payload_option.option = const_cast<char *>("X-SS-Connect-Data");
       payload_option.content = connect_data.data();
+    } else if (type == "mic"sv) {
+      payload_option.option = const_cast<char *>("X-SS-Ping-Payload");
+      payload_option.content = session.mic_ping_payload.data();
     } else {
       payload_option.option = const_cast<char *>("X-SS-Ping-Payload");
       payload_option.content = session.av_ping_payload.data();

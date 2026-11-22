@@ -9,6 +9,7 @@
 
 // test includes
 #include "../tests_common.h"
+#include "../tests_log_checker.h"
 
 // standard includes
 #include <array>
@@ -1036,8 +1037,10 @@ TEST_F(ConfigHttpTest, CSRFTokenGeneration) {
   ASSERT_TRUE(json_body.contains("csrf_token"));
   ASSERT_FALSE(json_body["csrf_token"].get<std::string>().empty());
 
-  // Token should be 32 characters (CSRF_TOKEN_SIZE)
-  ASSERT_EQ(json_body["csrf_token"].get<std::string>().length(), 32);
+  // Tokens consist of 32 random bytes encoded as URL-safe hexadecimal.
+  const auto token = json_body["csrf_token"].get<std::string>();
+  ASSERT_EQ(token.size(), 64);
+  EXPECT_EQ(token.find_first_not_of("0123456789ABCDEF"), std::string::npos);
 }
 
 // Test: CSRF token validation with valid token in header
@@ -1073,6 +1076,19 @@ TEST_F(ConfigHttpTest, CSRFValidationRejectsRequestWithoutOriginRefererOrToken) 
   const auto response = client->request("POST", "/csrf-validate-test", "", headers);
   ASSERT_EQ(response->status_code, "400 Bad Request");
   EXPECT_NE(response->content.string().find("Missing CSRF token"), std::string::npos);
+}
+
+TEST_F(ConfigHttpTest, DeniedCsrfRequestDoesNotLogReferer) {
+  constexpr auto marker = "synthetic-referer-value-for-log-test";
+  SimpleWeb::CaseInsensitiveMultimap headers;
+  headers.emplace("Authorization", create_auth_header("testuser", "testpass"));
+  headers.emplace("Referer", std::string("https://example.invalid/path?value=") + marker);
+
+  const auto response = client->request("POST", "/csrf-validate-test", "", headers);
+  ASSERT_EQ(response->status_code, "400 Bad Request");
+  EXPECT_NE(response->content.string().find("Missing CSRF token"), std::string::npos);
+  ASSERT_TRUE(log_checker::line_contains("test_sunshine.log", "CSRF protection blocked request"));
+  EXPECT_FALSE(log_checker::line_contains("test_sunshine.log", marker));
 }
 
 // Test: an invalid CSRF token is rejected when no allowed Origin/Referer is present
@@ -2175,6 +2191,27 @@ TEST_F(BrowseDirectoryTest, GetWindowsDrives_EntriesHaveCorrectFormat) {
 }
 #endif
 
+TEST_F(ConfigHttpTest, SaveAppDoesNotLogExistingAppConfiguration) {
+  using json = nlohmann::json;
+  constexpr auto marker = "synthetic-app-environment-value-for-log-test";
+  ScopedSaveAppAppsFile apps_file("save_app_log_privacy");
+  {
+    const json initial {{"env", {{"SDS_TEST_VALUE", marker}}}, {"apps", json::array()}};
+    std::ofstream file(config::stream.file_apps);
+    ASSERT_TRUE(file.is_open());
+    file << initial.dump();
+  }
+  const auto headers = authenticated_json_headers();
+  const json input {{"name", "SDS log privacy fixture"}, {"index", -1}};
+  const auto response = client->request("POST", "/api/apps", input.dump(), headers);
+  ASSERT_EQ(response->status_code, "200 OK");
+  std::ifstream file(config::stream.file_apps);
+  const auto saved = json::parse(file);
+  EXPECT_EQ(saved.at("env").at("SDS_TEST_VALUE"), marker);
+  ASSERT_TRUE(log_checker::line_contains("test_sunshine.log", "DESTINATION :: /api/apps"));
+  EXPECT_FALSE(log_checker::line_contains("test_sunshine.log", marker));
+}
+
 TEST_F(ConfigHttpTest, SaveAppNormalizesOptionalImagePath) {
   using json = nlohmann::json;
   ScopedSaveAppAppsFile apps_file("save_app_image_path");
@@ -2388,6 +2425,18 @@ TEST_F(ConfigHttpTest, PasswordEndpointRequiresAuthentication) {
   EXPECT_EQ(response->status_code, "401 Unauthorized");
   EXPECT_FALSE(std::filesystem::exists(config::sunshine.credentials_file));
   EXPECT_EQ(config::sunshine.username, "testuser");
+}
+
+TEST_F(ConfigHttpTest, PasswordEndpointDoesNotDiscloseMalformedInput) {
+  constexpr auto marker = "synthetic-password-value-for-log-test";
+  const auto headers = authenticated_json_headers();
+  const std::string incomplete_json = std::string(R"({"newPassword": ")") + marker;
+  const auto response = client->request("POST", "/api/password", incomplete_json, headers);
+  ASSERT_EQ(response->status_code, "400 Bad Request");
+  ASSERT_TRUE(log_checker::line_contains("test_sunshine.log", "SavePassword:"));
+  EXPECT_FALSE(log_checker::line_contains("test_sunshine.log", marker));
+  EXPECT_EQ(response->content.string().find(marker), std::string::npos);
+  EXPECT_FALSE(std::filesystem::exists(config::sunshine.credentials_file));
 }
 
 // Test: an authenticated user can change the credentials

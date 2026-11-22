@@ -68,15 +68,7 @@ if (WIN32)
     set(gtest_force_shared_crt ON CACHE BOOL "" FORCE)  # cmake-lint: disable=C0103
 endif ()
 
-# modify SUNSHINE_DEFINITIONS
-if (WIN32)
-    list(APPEND
-            SUNSHINE_DEFINITIONS SUNSHINE_SHADERS_DIR="${CMAKE_SOURCE_DIR}/src_assets/windows/assets/shaders/directx")
-elseif (NOT APPLE)
-    list(APPEND SUNSHINE_DEFINITIONS SUNSHINE_SHADERS_DIR="${CMAKE_SOURCE_DIR}/src_assets/linux/assets/shaders/opengl")
-endif ()
-
-set(TEST_DEFINITIONS)  # list will be appended as needed
+# Test fixtures may be relocated when a cross-built test bundle runs on Windows.
 set(SUNSHINE_TEST_SOURCE_DIR
         "${CMAKE_SOURCE_DIR}"
         CACHE PATH "Source fixture directory used by tests")
@@ -84,6 +76,15 @@ set(SUNSHINE_TEST_RUNTIME_DIR
         "${CMAKE_CURRENT_BINARY_DIR}"
         CACHE PATH "Writable runtime fixture directory used by tests")
 
+# modify SUNSHINE_DEFINITIONS
+if (WIN32)
+    list(APPEND
+            SUNSHINE_DEFINITIONS SUNSHINE_SHADERS_DIR="${SUNSHINE_TEST_SOURCE_DIR}/src_assets/windows/assets/shaders/directx")
+elseif (NOT APPLE)
+    list(APPEND SUNSHINE_DEFINITIONS SUNSHINE_SHADERS_DIR="${SUNSHINE_TEST_SOURCE_DIR}/src_assets/linux/assets/shaders/opengl")
+endif ()
+
+set(TEST_DEFINITIONS)  # list will be appended as needed
 # this indicates we're building tests in case sunshine needs to adjust some code or add private tests
 list(APPEND TEST_DEFINITIONS SUNSHINE_TESTS)
 list(APPEND TEST_DEFINITIONS SUNSHINE_SOURCE_DIR="${SUNSHINE_TEST_SOURCE_DIR}")

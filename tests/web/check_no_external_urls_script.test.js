@@ -18,7 +18,7 @@ const fixtures = []
  * @return {import('node:child_process').SpawnSyncReturns<string>} Script result.
  */
 function runCheck(root) {
-  return spawnSync('bash', [script, root], { encoding: 'utf8' })
+  return spawnSync('bash', [script, root], { encoding: 'utf8', timeout: 30_000 })
 }
 
 /**
@@ -46,8 +46,9 @@ afterEach(() => {
 describe('scripts/check-no-external-urls.sh', () => {
   it('passes on the repository sources', () => {
     const result = runCheck(projectRoot)
+    expect(result.error).toBeUndefined()
     expect(result.status, result.stdout + result.stderr).toBe(0)
-  })
+  }, 35_000)
 
   it('reports external URLs and network APIs outside the allowlist', () => {
     const root = makeTree({

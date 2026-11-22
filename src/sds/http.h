@@ -11,6 +11,34 @@
 #include "src/nvhttp.h"
 
 namespace sds::http {
+  /** @brief Limits spanning socket admission, body buffering and asynchronous response writes. */
+  struct transport_limits_t {
+    std::size_t connections = 64;  ///< Accepted sockets, including TLS/header work.
+    std::size_t client_connections = 8;  ///< Connections per verified certificate.
+    std::size_t bytes = 256 * 1024 * 1024;  ///< Aggregate body/output copy reservations.
+    std::size_t client_bytes = 128 * 1024 * 1024;  ///< Reservations per certificate.
+    long content_timeout = 35;  ///< Finite body/send timeout, above the maximum event poll.
+  };
+
+  /** @brief Current transport reservations; counters remain readable after server shutdown. */
+  struct transport_usage_t {
+    std::size_t connections = 0;  ///< Accepted connections.
+    std::size_t requests = 0;  ///< Admitted requests still buffering, executing or sending.
+    std::size_t bytes = 0;  ///< Reserved body/output copies.
+  };
+
+  /** @brief Lifetime-safe accounting observer for the server's RAII transport reservations. */
+  class transport_budget_t {
+  public:
+    /** @brief Construct an independent server budget. @param limits Admission limits. */
+    explicit transport_budget_t(transport_limits_t limits);
+    /** @brief Read counters under their accounting mutex. @return Current usage. */
+    transport_usage_t usage() const;
+  private:
+    friend std::shared_ptr<transport_budget_t> register_routes(SimpleWeb::ServerBase<nvhttp::SunshineHTTPS> &, transport_limits_t);
+    struct state_t;  ///< Internal accounting state shared with connection/request leases.
+    std::shared_ptr<state_t> state;  ///< Shared state; no server lifetime dependency.
+  };
   /**
    * @brief Paired HTTPS server type.
    */
@@ -30,7 +58,7 @@ namespace sds::http {
    *
    * @param server Paired HTTPS server, before start().
    */
-  void register_routes(https_server_t &server);
+  std::shared_ptr<transport_budget_t> register_routes(https_server_t &server, transport_limits_t limits = {});
 
   /**
    * @brief Make the plain HTTP server answer every `/sds/...` request with 404 for all methods.

@@ -84,6 +84,11 @@ namespace sds {
     future.wait();
   }
 
+  bool worker_t::wait_until_stopping(std::chrono::milliseconds timeout) {
+    std::unique_lock lock {mutex_};
+    return cv_.wait_for(lock, timeout, [this]() { return stopping_; });
+  }
+
   bool worker_t::on_worker_thread() const {
     return std::this_thread::get_id() == thread_.get_id();
   }
@@ -92,6 +97,20 @@ namespace sds {
     platf::set_thread_name(name_);
     std::unique_lock lock {mutex_};
     while (true) {
+      // Timers include response deadlines and upload expiry, so request traffic must not starve
+      // them. During shutdown only admitted FIFO jobs are drained; timers remain discarded.
+      if (!stopping_ && !timers_.empty() && timers_.begin()->first <= clock::now()) {
+        auto job = std::move(timers_.begin()->second.second);
+        timers_.erase(timers_.begin());
+        lock.unlock();
+        try {
+          job();
+        } catch (const std::exception &e) {
+          BOOST_LOG(error) << "sds: timer on "sv << name_ << " threw: "sv << e.what();
+        }
+        lock.lock();
+        continue;
+      }
       if (!jobs_.empty()) {
         auto job = std::move(jobs_.front());
         jobs_.pop_front();
@@ -107,18 +126,6 @@ namespace sds {
       if (stopping_) {
         timers_.clear();
         return;
-      }
-      if (!timers_.empty() && timers_.begin()->first <= clock::now()) {
-        auto job = std::move(timers_.begin()->second.second);
-        timers_.erase(timers_.begin());
-        lock.unlock();
-        try {
-          job();
-        } catch (const std::exception &e) {
-          BOOST_LOG(error) << "sds: timer on "sv << name_ << " threw: "sv << e.what();
-        }
-        lock.lock();
-        continue;
       }
       if (timers_.empty()) {
         cv_.wait(lock);

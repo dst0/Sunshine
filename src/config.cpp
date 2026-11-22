@@ -910,6 +910,7 @@ namespace config {
     {},  // file_inbox_dir: user's Downloads/Moonlight
     {},  // file_outbox_dir: inbox/Outbox
     {},  // sds_default_permissions: none
+    {},  // mic_device: automatic platform selection
   };
 
   /**
@@ -1989,6 +1990,7 @@ namespace config {
     bool_f(vars, "stream_audio", audio.stream);
     bool_f(vars, "install_steam_audio_drivers", audio.install_steam_drivers);
     bool_f(vars, "external_audio", audio.external_audio);
+    string_f(vars, "mic_device", sds.mic_device);
 
     string_restricted_f(vars, "origin_web_ui_allowed", nvhttp.origin_web_ui_allowed, {"pc"sv, "lan"sv, "wan"sv});
 

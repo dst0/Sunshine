@@ -1,7 +1,7 @@
 /**
  * @file tests/unit/sds/test_sds_auth.cpp
  * @brief Test the single authorization pipeline (DESIGN 4.1; checks S2-S6 and S12) and the
- *        per-connection client identity registry.
+ *        execution-time revalidation without a second rate/concurrency charge.
  */
 
 // test includes
@@ -228,6 +228,24 @@ TEST_F(SdsAuthorizeTest, UploadConcurrencyLimit) {
   EXPECT_TRUE(check(sds::op_e::upload_chunk).ok()) << "existing sessions keep working";
   open_uploads = 1;
   EXPECT_TRUE(check(sds::op_e::upload_create).ok());
+}
+
+TEST_F(SdsAuthorizeTest, DeferredRevalidationKeepsLiveChecksWithoutChargingAdmissionTwice) {
+  rate_per_second = 1;
+  rebuild();
+  ASSERT_TRUE(check(sds::op_e::clipboard_get).ok());
+  sds::request_view_t request;
+  request.cert_pem = PAIRED;
+  EXPECT_TRUE(sds::authorize(context, request, sds::op_e::clipboard_get, false).ok());
+  EXPECT_EQ(check(sds::op_e::clipboard_get).status, 429);
+  open_uploads = context.uploads_max;
+  EXPECT_TRUE(sds::authorize(context, request, sds::op_e::upload_create, false).ok());
+  clients[PAIRED].permissions.reset();
+  EXPECT_EQ(sds::authorize(context, request, sds::op_e::clipboard_get, false).status, 403);
+  streaming.clear();
+  EXPECT_EQ(sds::authorize(context, request, sds::op_e::clipboard_get, false).status, 409);
+  clients.clear();
+  EXPECT_EQ(sds::authorize(context, request, sds::op_e::clipboard_get, false).status, 401);
 }
 
 TEST_F(SdsAuthorizeTest, SizeLimitsPerOperation) {

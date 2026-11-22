@@ -6,7 +6,11 @@
 #include <array>
 #include <atomic>
 #include <cctype>
+#include <charconv>
+#include <limits>
+#include <map>
 #include <memory>
+#include <mutex>
 #include <regex>
 #include <string>
 #include <utility>
@@ -18,6 +22,90 @@
 #include "src/nvhttp.h"
 
 namespace sds::http {
+  /** @brief Shared accounting; leases never retain a server or network callback. */
+  struct transport_budget_t::state_t: std::enable_shared_from_this<state_t> {
+    /** @brief Per-certificate usage, retained while either connection or request bytes exist. */
+    struct client_t {
+      std::size_t connections = 0;  ///< Verified sockets.
+      std::size_t requests = 0;  ///< Requests may legally outlive their weak connection reference.
+      std::size_t bytes = 0;  ///< Request and output reservations.
+    };
+    /** @brief Accepted socket lease, extended with its verified certificate after TLS. */
+    struct connection_t {
+      std::shared_ptr<state_t> state;  ///< Accounting owner.
+      std::string cert;  ///< Verified certificate, empty before authentication.
+      bool counted = false;  ///< Global connection reservation was acquired.
+      ~connection_t() {
+        if (counted) {
+          std::lock_guard lock {state->mutex};
+          --state->current.connections;
+          if (!cert.empty()) {
+            if (auto it = state->clients.find(cert); it != state->clients.end()) {
+              auto &client = it->second;
+              --client.connections;
+              if (!client.connections && !client.requests && !client.bytes) {
+                state->clients.erase(it);
+              }
+            }
+          }
+        }
+      }
+    };
+    /** @brief Body/output lease retained by the Request through asynchronous socket completion. */
+    struct request_t {
+      std::shared_ptr<state_t> state;  ///< Accounting owner.
+      std::string cert;  ///< Verified identity.
+      std::size_t bytes = 0;  ///< Current input and output reservation.
+      bool counted = false;  ///< Reservation was acquired.
+      ~request_t() {
+        if (counted) {
+          std::lock_guard lock {state->mutex};
+          --state->current.requests;
+          state->current.bytes -= bytes;
+          if (auto it = state->clients.find(cert); it != state->clients.end()) {
+            auto &client = it->second;
+            --client.requests;
+            client.bytes -= bytes;
+            if (!client.connections && !client.requests && !client.bytes) {
+              state->clients.erase(it);
+            }
+          }
+        }
+      }
+      /** @brief Reserve both output copies before constructing the SWS output buffer. */
+      bool response(std::size_t size) {
+        if (size > std::numeric_limits<std::size_t>::max() / 2) {
+          return false;
+        }
+        const auto extra = size * 2;
+        std::lock_guard lock {state->mutex};
+        const auto it = state->clients.find(cert);
+        if (it == state->clients.end()) { return false; }
+        auto &client = it->second;
+        if (extra > state->limits.bytes - state->current.bytes || extra > state->limits.client_bytes - client.bytes) {
+          return false;
+        }
+        state->current.bytes += extra;
+        client.bytes += extra;
+        bytes += extra;
+        return true;
+      }
+    };
+    transport_limits_t limits;  ///< Immutable server limits.
+    mutable std::mutex mutex;  ///< Serializes worker/network accounting updates.
+    transport_usage_t current;  ///< Aggregate usage.
+    std::map<std::string, client_t> clients;  ///< Bounded by accepted connections/requests.
+  };
+
+  transport_budget_t::transport_budget_t(transport_limits_t limits): state(std::make_shared<state_t>()) {
+    state->limits = limits;
+  }
+
+  transport_usage_t transport_budget_t::usage() const {
+    std::lock_guard lock {state->mutex};
+    return state->current;
+  }
+
   namespace {
     /**
      * @brief Methods routed to the dispatcher (others never reach SDS code).
@@ -28,6 +116,26 @@ namespace sds::http {
      * @brief Regex covering the whole `/sds` namespace.
      */
     constexpr const char *NAMESPACE_PATTERN = "^/sds(?:/.*)?$";
+
+    /** @brief Refuse malformed/obsolete header lines the upstream permissive parser ignores. */
+    bool canonical_header_lines(std::string_view raw) {
+      auto end = raw.find("\r\n");
+      if (end == std::string_view::npos) { return false; }
+      raw.remove_prefix(end + 2);
+      while (raw != "\r\n") {
+        end = raw.find("\r\n");
+        if (end == std::string_view::npos || end == 0) { return false; }
+        const auto line = raw.substr(0, end);
+        const auto colon = line.find(':');
+        if (colon == 0 || colon == std::string_view::npos) { return false; }
+        for (const unsigned char ch : line.substr(0, colon)) {
+          if (!((ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9') || std::string_view("!#$%&'*+-.^_`|~").find(ch) != std::string_view::npos)) { return false; }
+        }
+        if (line.find('\0') != std::string_view::npos || line.find('\r') != std::string_view::npos || line.find('\n') != std::string_view::npos) { return false; }
+        raw.remove_prefix(end + 2);
+      }
+      return true;
+    }
 
     /**
      * @brief One API route.
@@ -70,7 +178,7 @@ namespace sds::http {
      * @param reply Reply.
      */
     template<class Response>
-    void write_reply(Response &response, reply_t reply) {
+    void write_reply(Response &response, reply_t reply, const std::function<bool(std::size_t)> &reserve = {}) {
       SimpleWeb::CaseInsensitiveMultimap headers;
       headers.emplace("Cache-Control", "no-store");
       headers.emplace("X-Content-Type-Options", "nosniff");
@@ -91,6 +199,10 @@ namespace sds::http {
         body = std::move(reply.body);
         headers.emplace("Content-Type", reply.content_type);
       }
+      if (reserve && !reserve(body.size())) {
+        response.abort();
+        return;
+      }
       response.write(static_cast<SimpleWeb::StatusCode>(reply.status), body, headers);
     }
 
@@ -102,6 +214,7 @@ namespace sds::http {
     template<class Response>
     struct reply_guard_t {
       std::shared_ptr<Response> response;  ///< Response being produced.
+      std::function<bool(std::size_t)> reserve;  ///< Output reservation held through the Request.
       std::atomic_bool done {false};  ///< Set once written.
 
       /**
@@ -113,7 +226,7 @@ namespace sds::http {
         if (done.exchange(true)) {
           return;
         }
-        write_reply(*response, std::move(reply));
+        write_reply(*response, std::move(reply), reserve);
       }
 
       /**
@@ -121,7 +234,7 @@ namespace sds::http {
        */
       ~reply_guard_t() {
         if (!done.exchange(true)) {
-          write_reply(*response, reply_t::failure(500, "internal", "request was not completed"));
+          write_reply(*response, reply_t::failure(500, "internal", "request was not completed"), reserve);
         }
       }
     };
@@ -135,6 +248,7 @@ namespace sds::http {
     void dispatch(const std::shared_ptr<https_server_t::Response> &response, const std::shared_ptr<https_server_t::Request> &request) {
       auto guard = std::make_shared<reply_guard_t<https_server_t::Response>>();
       guard->response = response;
+      guard->reserve = request->reserve_response;
       reply_fn respond = [guard](reply_t reply) {
         guard->send(std::move(reply));
       };
@@ -188,13 +302,93 @@ namespace sds::http {
     }
   }  // namespace
 
-  void register_routes(https_server_t &server) {
+  std::shared_ptr<transport_budget_t> register_routes(https_server_t &server, transport_limits_t limits) {
+    auto budget = std::make_shared<transport_budget_t>(limits);
+    auto state = budget->state;
+    server.on_connection_accepted = [state](auto request) {
+      auto lease = std::make_shared<transport_budget_t::state_t::connection_t>();
+      lease->state = state;
+      {
+        std::lock_guard lock {state->mutex};
+        if (state->current.connections >= state->limits.connections) {
+          return false;
+        }
+        ++state->current.connections;
+        lease->counted = true;
+      }
+      request->connection_context(lease);
+      return true;
+    };
+    server.on_connection_authenticated = [state](auto request) {
+      auto lease = std::static_pointer_cast<transport_budget_t::state_t::connection_t>(request->connection_context());
+      const auto cert = nvhttp::verified_client_cert(request);
+      if (!lease || !cert || cert->empty()) {
+        return false;
+      }
+      std::lock_guard lock {state->mutex};
+      auto &client = state->clients[*cert];
+      if (client.connections >= state->limits.client_connections) {
+        if (!client.connections && !client.requests && !client.bytes) {
+          state->clients.erase(*cert);
+        }
+        return false;
+      }
+      ++client.connections;
+      lease->cert = *cert;
+      return true;
+    };
+    server.on_request_header = [state](auto request) {
+      if (!canonical_header_lines(request->raw_header)) { return false; }
+      const bool sds = request->path == "/sds" || request->path.starts_with("/sds/");
+      if (request->header.count("Content-Length") > 1 || request->header.count("Transfer-Encoding")) {
+        return false;
+      }
+      std::size_t length = 0;
+      if (const auto it = request->header.find("Content-Length"); it != request->header.end()) {
+        const auto &value = it->second;
+        const auto [end, error] = std::from_chars(value.data(), value.data() + value.size(), length);
+        if (value.empty() || error != std::errc {} || end != value.data() + value.size()) {
+          return false;
+        }
+      }
+      if (length > (sds ? max_request_body_size() : nvhttp::HTTP_MAX_REQUEST_SIZE) || length > std::numeric_limits<std::size_t>::max() / 2) {
+        return false;
+      }
+      auto connection = std::static_pointer_cast<transport_budget_t::state_t::connection_t>(request->connection_context());
+      if (!connection || connection->cert.empty()) {
+        return false;
+      }
+      auto lease = std::make_shared<transport_budget_t::state_t::request_t>();
+      lease->state = state;
+      lease->cert = connection->cert;
+      lease->bytes = length * 2;
+      {
+        std::lock_guard lock {state->mutex};
+        auto &client = state->clients.at(lease->cert);
+        if (state->current.requests >= state->limits.connections || client.requests >= state->limits.client_connections || lease->bytes > state->limits.bytes - state->current.bytes || lease->bytes > state->limits.client_bytes - client.bytes) {
+          return false;
+        }
+        ++state->current.requests;
+        ++client.requests;
+        state->current.bytes += lease->bytes;
+        client.bytes += lease->bytes;
+        lease->counted = true;
+      }
+      request->admission_context = lease;
+      request->reserve_response = [lease](std::size_t size) {
+        return lease->response(size);
+      };
+      return true;
+    };
     for (const auto *method : METHODS) {
       server.resource[NAMESPACE_PATTERN][method] = [](std::shared_ptr<https_server_t::Response> response, std::shared_ptr<https_server_t::Request> request) {
         dispatch(response, request);
       };
     }
     server.config.max_request_streambuf_size = max_request_body_size();
+    server.config.max_request_header_size = 64 * 1024;
+    server.config.timeout_content = std::max(1L, limits.content_timeout);
+    return budget;
   }
 
   void register_plain_http_guard(http_server_t &server) {

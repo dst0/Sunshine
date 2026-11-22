@@ -133,7 +133,8 @@ namespace sds::files {
       std::string upper;
       for (const char32_t c : stem) {
         if (c == 0xB9 || c == 0xB2 || c == 0xB3) {
-          upper.push_back(c == 0xB9 ? '1' : c == 0xB2 ? '2' : '3');
+          upper.push_back(c == 0xB9 ? '1' : c == 0xB2 ? '2' :
+                                                        '3');
           upper.push_back('^');  // superscript marker so plain digits and superscripts both match below
           continue;
         }
@@ -153,7 +154,9 @@ namespace sds::files {
      * @return 1-4.
      */
     std::size_t utf8_length(char32_t c) {
-      return c < 0x80 ? 1 : c < 0x800 ? 2 : c < 0x10000 ? 3 : 4;
+      return c < 0x80 ? 1 : c < 0x800 ? 2 :
+                          c < 0x10000 ? 3 :
+                                        4;
     }
 
     /**
@@ -507,7 +510,7 @@ namespace sds::files {
     return reply_t::success(200, {{"offset", upload->offset}});
   }
 
-  reply_t manager_t::complete(const std::string &client, std::string_view id) {
+  reply_t manager_t::complete(const std::string &client, std::string_view id, std::function<std::optional<reply_t>()> before_publish) {
     auto *upload = find(client, id);
     if (!upload) {
       return reply_t::failure(404, "not_found", "unknown upload");
@@ -542,10 +545,27 @@ namespace sds::files {
       drop(key);
       return reply_t::failure(500, "internal", "could not flush the file");
     }
+    // Mark the still-private part before any final name is visible. A Windows ADS write failure
+    // is a failed upload, never a successful unmarked download.
+    if (const auto ec = upload->dir->mark_from_internet(upload->part_name); ec) {
+      BOOST_LOG(warning) << "sds: could not mark a received file as downloaded: "sv << ec.message();
+      drop(key);
+      return reply_t::failure(500, "internal", "could not mark the downloaded file");
+    }
+    if (!upload->dir->same_file(upload->part_name, *upload->file)) {
+      drop(key);
+      return reply_t::failure(500, "internal", "partial upload was modified");
+    }
 
     std::optional<std::string> final_name;
     for (unsigned n = 0; n <= COLLISION_MAX && !final_name; ++n) {
       auto candidate = n == 0 ? upload->name : collision_name(upload->name, n);
+      if (before_publish) {
+        if (auto denied = before_publish(); denied) {
+          drop(key);
+          return std::move(*denied);
+        }
+      }
       switch (upload->dir->rename_noreplace(upload->part_name, candidate)) {
         case fs::rename_result_e::ok:
           final_name = std::move(candidate);
@@ -560,9 +580,6 @@ namespace sds::files {
     if (!final_name) {
       drop(key);
       return reply_t::failure(409, "conflict", "no free file name");
-    }
-    if (const auto ec = upload->dir->mark_from_internet(*final_name); ec) {
-      BOOST_LOG(warning) << "sds: could not mark a received file as downloaded: "sv << ec.message();
     }
     const auto size = upload->size;
     // The part name is gone now; forget the session without deleting anything.

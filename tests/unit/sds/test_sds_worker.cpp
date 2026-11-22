@@ -17,6 +17,7 @@
 
 // local includes
 #include <src/sds/worker.h>
+#include <src/utility.h>
 
 using namespace std::literals;
 
@@ -70,45 +71,92 @@ TEST(SdsWorkerTest, StopRunsQueuedJobsDropsTimersAndRejectsNewWork) {
   std::atomic_int ran {0};
   std::promise<void> release;
   auto released = release.get_future().share();
-  worker->post([released]() {
+  std::promise<void> started;
+  auto entered = started.get_future();
+  worker->post([released, &started]() {
+    started.set_value();
     released.wait();
   });
+  EXPECT_EQ(entered.wait_for(5s), std::future_status::ready);
   for (int i = 0; i < 3; ++i) {
     worker->post([&ran]() {
       ++ran;
     });
   }
   std::atomic_bool timer_ran {false};
-  worker->post_at(sds::worker_t::clock::now() + 1h, [&timer_ran]() {
+  worker->post_at(sds::worker_t::clock::now(), [&timer_ran]() {
     timer_ran = true;
   });
   std::jthread stopper {[&worker]() {
     worker->stop();
   }};
-  std::this_thread::sleep_for(20ms);
+  EXPECT_TRUE(worker->wait_until_stopping(5s));
   release.set_value();
   stopper.join();
   EXPECT_EQ(ran, 3);
   EXPECT_FALSE(timer_ran);
-  EXPECT_FALSE(worker->post([]() {}));
-  EXPECT_EQ(worker->post_at(sds::worker_t::clock::now(), []() {}), 0u);
+  EXPECT_FALSE(worker->post([]() {
+  }));
+  EXPECT_EQ(worker->post_at(sds::worker_t::clock::now(), []() {
+  }),
+            0u);
   worker->drain();  // returns immediately once stopped
   worker->stop();  // idempotent
 }
 
 TEST(SdsWorkerTest, ThrowingJobsDoNotKillTheWorker) {
   sds::worker_t worker {"sds-test"};
+  std::promise<void> timer_started;
+  auto timer_entered = timer_started.get_future();
   worker.post([]() {
     throw std::runtime_error("boom");
   });
-  worker.post_at(sds::worker_t::clock::now(), []() {
+  worker.post_at(sds::worker_t::clock::now(), [&timer_started]() {
+    timer_started.set_value();
     throw std::runtime_error("timer boom");
   });
-  std::this_thread::sleep_for(20ms);
+  EXPECT_EQ(timer_entered.wait_for(5s), std::future_status::ready);
   std::atomic_bool ran {false};
   worker.post([&ran]() {
     ran = true;
   });
   worker.drain();
   EXPECT_TRUE(ran);
+}
+
+TEST(SdsWorkerTest, DueTimersAreNotStarvedByQueuedJobs) {
+  sds::worker_t worker {"sds-fairness"};
+  std::promise<void> release;
+  auto released = release.get_future().share();
+  bool opened = false;
+  auto cleanup = util::fail_guard([&]() {
+    if (!opened) {
+      release.set_value();
+    }
+  });
+  std::promise<void> started;
+  auto started_future = started.get_future();
+  worker.post([&started, released]() {
+    started.set_value();
+    released.wait();
+  });
+  ASSERT_EQ(started_future.wait_for(5s), std::future_status::ready);
+  std::vector<int> order;
+  std::promise<void> timer;
+  auto done = timer.get_future();
+  worker.post_at(sds::worker_t::clock::now(), [&]() {
+    order.push_back(0);
+    timer.set_value();
+  });
+  for (int i = 1; i <= 10; ++i) {
+    worker.post([&, i]() {
+      order.push_back(i);
+    });
+  }
+  opened = true;
+  release.set_value();
+  ASSERT_EQ(done.wait_for(5s), std::future_status::ready);
+  worker.drain();
+  ASSERT_EQ(order.size(), 11u);
+  EXPECT_EQ(order.front(), 0);
 }

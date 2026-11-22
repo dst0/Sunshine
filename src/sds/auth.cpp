@@ -226,7 +226,7 @@ namespace sds {
     return {std::move(media_type), std::move(charset)};
   }
 
-  auth_result_t authorize(const auth_context_t &context, const request_view_t &request, op_e op) {
+  auth_result_t authorize(const auth_context_t &context, const request_view_t &request, op_e op, bool charge_limits) {
     const auto rule = rule_for(op);
 
     // 1. The TLS client certificate was verified by nvhttp during the handshake.
@@ -265,7 +265,7 @@ namespace sds {
     }
 
     // 6. Rate and concurrency limits.
-    if (rule.limit == limit_rule_e::clipboard_rate) {
+    if (charge_limits && rule.limit == limit_rule_e::clipboard_rate) {
       if (!context.clipboard_rate) {
         return fail(500, "internal", "rate limiter unavailable");
       }
@@ -275,7 +275,7 @@ namespace sds {
         result.client = std::move(*client);
         return result;
       }
-    } else if (rule.limit == limit_rule_e::upload_concurrency) {
+    } else if (charge_limits && rule.limit == limit_rule_e::upload_concurrency) {
       const auto open = context.open_uploads ? context.open_uploads(client->cert) : 0;
       if (open >= context.uploads_max) {
         auto result = fail(429, "rate_limited", "too many concurrent uploads");
