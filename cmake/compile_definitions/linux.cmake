@@ -249,6 +249,14 @@ if(X11_FOUND)
     add_compile_definitions(SUNSHINE_BUILD_X11)
     include_directories(SYSTEM ${X11_INCLUDE_DIR})
     list(APPEND PLATFORM_LIBRARIES ${X11_LIBRARIES})
+    if(X11_Xtst_FOUND)
+        set_property(SOURCE "${CMAKE_SOURCE_DIR}/src/main.cpp"
+                            "${CMAKE_SOURCE_DIR}/src/platform/virtualhid_input.cpp"
+                     APPEND PROPERTY COMPILE_DEFINITIONS SUNSHINE_BUILD_PRIVATE_X11_INPUT)
+        # Use the existing system X11 includes. A per-source /usr/include
+        # can change GCC include_next ordering.
+        list(APPEND PLATFORM_LIBRARIES ${X11_Xtst_LIB})
+    endif()
     list(APPEND PLATFORM_TARGET_FILES
             "${CMAKE_SOURCE_DIR}/src/platform/linux/x11grab.h"
             "${CMAKE_SOURCE_DIR}/src/platform/linux/x11grab.cpp")

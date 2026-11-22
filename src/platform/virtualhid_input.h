@@ -29,6 +29,9 @@ namespace platf::virtualhid {
      */
     input_context_t();
 
+    /** @brief Construct an inactive context; do not probe or open platform devices. */
+    explicit input_context_t(std::nullptr_t) {}
+
     /**
      * @brief Construct the libvirtualhid input context using a selected backend.
      *

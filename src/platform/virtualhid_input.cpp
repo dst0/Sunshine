@@ -9,6 +9,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <format>
 #include <limits>
 #include <mutex>
@@ -25,6 +26,10 @@
 #include "src/config.h"
 #include "src/logging.h"
 #include "virtualhid_input.h"
+
+#ifdef SUNSHINE_BUILD_PRIVATE_X11_INPUT
+  #include "linux/x11_virtual_input.h"
+#endif
 
 using namespace std::literals;
 
@@ -1133,7 +1138,15 @@ namespace platf {
    * @brief Global libvirtualhid devices shared by clients.
    */
   struct input_raw_t {
+#ifdef __linux__
+    const bool private_input = std::getenv("SUNSHINE_PRIVATE_X11_INPUT") != nullptr;  ///< Explicit service opt-in.
+    virtualhid::input_context_t virtualhid = private_input ? virtualhid::input_context_t {nullptr} : virtualhid::input_context_t {};  ///< Never open host input in private mode.
+  #ifdef SUNSHINE_BUILD_PRIVATE_X11_INPUT
+    std::unique_ptr<x11_virtual_input::session_t> x11 = private_input ? std::make_unique<x11_virtual_input::session_t>() : nullptr;  ///< Dedicated Xvfb input.
+  #endif
+#else
     virtualhid::input_context_t virtualhid;  ///< libvirtualhid input context.
+#endif
   };
 
   namespace {
@@ -1161,7 +1174,19 @@ namespace platf {
    * @return Owning handle for the global virtual input backend.
    */
   input_t input() {
-    return input_t {new input_raw_t {}};
+    auto input = input_t {new input_raw_t {}};
+#ifdef __linux__
+    if (input->private_input) {
+  #ifdef SUNSHINE_BUILD_PRIVATE_X11_INPUT
+      if (input->x11 && *input->x11) {
+        BOOST_LOG(info) << "Input is confined to the private X11 desktop"sv;
+        return input;
+      }
+  #endif
+      BOOST_LOG(error) << "Private X11 input unavailable; host input remains disabled"sv;
+    }
+#endif
+    return input;
   }
 
   std::unique_ptr<client_input_t> allocate_client_input_context(input_t &input) {
@@ -1182,30 +1207,72 @@ namespace platf {
 #endif
 
   void move_mouse(input_t &input, int deltaX, int deltaY) {
+#ifdef SUNSHINE_BUILD_PRIVATE_X11_INPUT
+    if (input->x11) {
+      input->x11->move(deltaX, deltaY);
+      return;
+    }
+#endif
     virtualhid::move_mouse(virtualhid::get_input_context(input), deltaX, deltaY);
   }
 
   void move_mouse(input_t &input, const touch_port_t &touch_port, int deltaX, int deltaY) {
+#ifdef SUNSHINE_BUILD_PRIVATE_X11_INPUT
+    if (input->x11) {
+      input->x11->move(deltaX, deltaY);
+      return;
+    }
+#endif
     virtualhid::move_mouse(virtualhid::get_input_context(input), touch_port, deltaX, deltaY);
   }
 
   void abs_mouse(input_t &input, const touch_port_t &touch_port, float x, float y) {
+#ifdef SUNSHINE_BUILD_PRIVATE_X11_INPUT
+    if (input->x11) {
+      input->x11->absolute(x - touch_port.env_offset_x, y - touch_port.env_offset_y);
+      return;
+    }
+#endif
     virtualhid::abs_mouse(virtualhid::get_input_context(input), touch_port, x, y);
   }
 
   void button_mouse(input_t &input, int button, bool release) {
+#ifdef SUNSHINE_BUILD_PRIVATE_X11_INPUT
+    if (input->x11) {
+      input->x11->button(button, release);
+      return;
+    }
+#endif
     virtualhid::button_mouse(virtualhid::get_input_context(input), button, release);
   }
 
   void scroll(input_t &input, int high_res_distance) {
+#ifdef SUNSHINE_BUILD_PRIVATE_X11_INPUT
+    if (input->x11) {
+      input->x11->scroll(high_res_distance, false);
+      return;
+    }
+#endif
     virtualhid::scroll(virtualhid::get_input_context(input), high_res_distance);
   }
 
   void hscroll(input_t &input, int high_res_distance) {
+#ifdef SUNSHINE_BUILD_PRIVATE_X11_INPUT
+    if (input->x11) {
+      input->x11->scroll(high_res_distance, true);
+      return;
+    }
+#endif
     virtualhid::hscroll(virtualhid::get_input_context(input), high_res_distance);
   }
 
   void keyboard_update(input_t &input, uint16_t modcode, bool release, uint8_t flags, bool extended) {
+#ifdef SUNSHINE_BUILD_PRIVATE_X11_INPUT
+    if (input->x11) {
+      input->x11->key(modcode, release, extended);
+      return;
+    }
+#endif
     virtualhid::keyboard_update(virtualhid::get_input_context(input), modcode, release, flags, extended);
   }
 
