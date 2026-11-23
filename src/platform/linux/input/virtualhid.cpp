@@ -4,6 +4,7 @@
  */
 
 // standard includes
+#include <cstdlib>
 #include <memory>
 #include <utility>
 
@@ -19,6 +20,10 @@ using namespace std::literals;
 
 namespace platf {
   platform_caps::caps_t get_capabilities() {
+    if (std::getenv("SUNSHINE_PRIVATE_X11_INPUT") != nullptr) {
+      return {};
+    }
+
     platform_caps::caps_t caps = 0;
     const auto runtime = virtualhid::create_runtime();
     if (!runtime) {

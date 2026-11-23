@@ -13,8 +13,12 @@
   #include <cerrno>
   #include <cstdlib>
   #include <fcntl.h>
+  #include <filesystem>
+  #include <limits>
   #include <set>
   #include <sys/stat.h>
+  #include <sys/statvfs.h>
+  #include <type_traits>
   #include <unistd.h>
   #include <vector>
 
@@ -22,6 +26,7 @@
   #include <openssl/evp.h>
 
   #include "files.h"
+  #include "src/config.h"
 #endif
 
 namespace sds::file_clipboard {
@@ -41,6 +46,132 @@ namespace sds::file_clipboard {
 #ifdef __linux__
   namespace {
     constexpr std::string_view stage_prefix = "sds-file-clipboard-";
+    constexpr std::uint64_t stage_headroom_bytes = 64ull * 1024 * 1024;
+
+    bool forbidden_component(std::string_view prev_part, std::string_view part) {
+      if (part.empty() || part == "." || part == ".." || part.starts_with(stage_prefix)) {
+        return true;
+      }
+      if (part == ".ssh" || part == ".gnupg" ||
+          part == "sds-minipc-sunshine" || part == "sds-pc2-sunshine" ||
+          part == "sds-minipc-display" ||
+          (part.starts_with("sds-") && part.ends_with("-sunshine"))) {
+        return true;
+      }
+      if (prev_part == ".config" && part == "sunshine") {
+        return true;
+      }
+      return false;
+    }
+
+    bool path_is_or_under(std::string_view candidate, const std::filesystem::path &blocked) {
+      if (blocked.empty() || !blocked.is_absolute()) {
+        return false;
+      }
+      auto norm = blocked.lexically_normal().string();
+      while (norm.size() > 1 && norm.back() == '/') {
+        norm.pop_back();
+      }
+      if (norm == "/") {
+        return false;
+      }
+      return candidate == norm || (candidate.size() > norm.size() && candidate.starts_with(norm) && candidate[norm.size()] == '/');
+    }
+
+    bool sensitive_sunshine_dir_name(const std::filesystem::path &dir) {
+      const auto name = dir.filename().string();
+      return name == "credentials" || name == "sunshine" || (name.starts_with("sds-") && name.ends_with("-sunshine"));
+    }
+
+    bool forbidden_sunshine_path(std::string_view absolute_path) {
+      const auto norm_candidate = std::filesystem::path(absolute_path).lexically_normal().string();
+      auto check_env_sub = [&](const char *var, std::string_view sub) {
+        const auto *val = std::getenv(var);
+        if (!val || *val != '/') {
+          return false;
+        }
+        return path_is_or_under(norm_candidate, std::filesystem::path(val) / sub);
+      };
+      if (check_env_sub("CONFIGURATION_DIRECTORY", "sunshine") ||
+          check_env_sub("XDG_CONFIG_HOME", "sunshine") ||
+          check_env_sub("HOME", ".config/sunshine")) {
+        return true;
+      }
+
+      std::vector<std::filesystem::path> bases;
+      if (const auto *cfg_dir = std::getenv("CONFIGURATION_DIRECTORY"); cfg_dir && *cfg_dir == '/') {
+        bases.push_back(std::filesystem::path(cfg_dir) / "sunshine");
+      }
+      if (const auto *xdg_cfg = std::getenv("XDG_CONFIG_HOME"); xdg_cfg && *xdg_cfg == '/') {
+        bases.push_back(std::filesystem::path(xdg_cfg) / "sunshine");
+      }
+      if (const auto *home = std::getenv("HOME"); home && *home == '/') {
+        bases.push_back(std::filesystem::path(home) / ".config" / "sunshine");
+      }
+      if (!config::sunshine.config_file.empty()) {
+        const std::filesystem::path cfg_path {config::sunshine.config_file};
+        if (cfg_path.is_absolute() && cfg_path.has_parent_path()) {
+          bases.push_back(cfg_path.parent_path());
+        }
+      }
+      std::error_code ec;
+      if (const auto cwd = std::filesystem::current_path(ec); !ec && cwd.is_absolute()) {
+        bases.push_back(cwd);
+      }
+
+      for (const auto *raw : {
+             &config::nvhttp.file_state,
+             &config::sunshine.credentials_file,
+             &config::nvhttp.pkey,
+             &config::nvhttp.cert,
+             &config::sunshine.config_file,
+           }) {
+        if (raw->empty()) {
+          continue;
+        }
+        const std::filesystem::path configured {*raw};
+        if (configured.is_absolute()) {
+          if (path_is_or_under(norm_candidate, configured)) {
+            return true;
+          }
+          if (configured.has_parent_path() && sensitive_sunshine_dir_name(configured.parent_path()) &&
+              path_is_or_under(norm_candidate, configured.parent_path())) {
+            return true;
+          }
+        } else {
+          for (const auto &base : bases) {
+            const auto resolved = base / configured;
+            if (path_is_or_under(norm_candidate, resolved)) {
+              return true;
+            }
+            if (configured.has_parent_path() && resolved.has_parent_path() &&
+                sensitive_sunshine_dir_name(resolved.parent_path()) &&
+                path_is_or_under(norm_candidate, resolved.parent_path())) {
+              return true;
+            }
+          }
+        }
+      }
+      return false;
+    }
+
+    std::optional<std::uint64_t> available_space(int dir_fd) {
+      struct statvfs vfs {};
+      if (fstatvfs(dir_fd, &vfs) != 0 || vfs.f_frsize == 0) {
+        return std::nullopt;
+      }
+      if constexpr (std::is_signed_v<decltype(vfs.f_bavail)>) {
+        if (vfs.f_bavail < 0) {
+          return 0;
+        }
+      }
+      const auto bavail = static_cast<std::uint64_t>(vfs.f_bavail);
+      const auto frsize = static_cast<std::uint64_t>(vfs.f_frsize);
+      if (bavail > std::numeric_limits<std::uint64_t>::max() / frsize) {
+        return std::numeric_limits<std::uint64_t>::max();
+      }
+      return bavail * frsize;
+    }
 
     class fd_t {
     public:
@@ -141,12 +272,16 @@ namespace sds::file_clipboard {
     }
 
     fd_t source_file(std::string_view absolute_path, std::string &name) {
+      if (absolute_path.empty() || absolute_path.front() != '/' || forbidden_sunshine_path(absolute_path)) {
+        return fd_t {};
+      }
       fd_t directory {open("/", O_RDONLY | O_DIRECTORY | O_CLOEXEC)};
       auto remaining = absolute_path.substr(1);
+      std::string prev_part;
       while (directory) {
         const auto end = remaining.find('/');
         const std::string part {remaining.substr(0, end)};
-        if (part.empty() || part == "." || part == ".." || part.starts_with(stage_prefix)) {
+        if (forbidden_component(prev_part, part)) {
           return fd_t {};
         }
         if (end == std::string_view::npos) {
@@ -167,6 +302,7 @@ namespace sds::file_clipboard {
           return readable;
         }
         directory = fd_t {openat(directory.get(), part.c_str(), O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)};
+        prev_part = part;
         remaining.remove_prefix(end + 1);
       }
       return fd_t {};
@@ -287,8 +423,10 @@ namespace sds::file_clipboard {
   public:
     explicit stage_t(fd_t root_fd, std::string name): root {std::move(root_fd)}, leaf {std::move(name)} {}
     ~stage_t() {
-      for (const auto &name : files) unlinkat(directory.get(), name.c_str(), 0);
-      unlinkat(root.get(), leaf.c_str(), AT_REMOVEDIR);
+      if (root && !leaf.empty()) {
+        for (const auto &name : files) unlinkat(directory.get(), name.c_str(), 0);
+        unlinkat(root.get(), leaf.c_str(), AT_REMOVEDIR);
+      }
     }
     fd_t root;
     std::string leaf;
@@ -313,6 +451,9 @@ namespace sds::file_clipboard {
     auto root = secure_runtime();
     const auto token = new_epoch();
     if (!root || !token) return {};
+    const auto free_space = available_space(root.get());
+    if (!free_space || *free_space < stage_headroom_bytes) return {};
+    std::uint64_t free_remaining = *free_space;
     const auto leaf = std::string {stage_prefix} + *token;
     if (mkdirat(root.get(), leaf.c_str(), 0700) != 0) return {};
     auto offer = std::make_shared<stage_t>(std::move(root), leaf);
@@ -327,6 +468,8 @@ namespace sds::file_clipboard {
       if (!safe_name(name) || !names.insert(name_key(name)).second) return {};
       auto bytes = decode(entry.at("data").get_ref<const std::string &>(), remaining);
       if (!bytes) return {};
+      if (free_remaining < stage_headroom_bytes || free_remaining - stage_headroom_bytes < bytes->size()) return {};
+      free_remaining -= bytes->size();
       remaining -= bytes->size();
       fd_t fd {openat(offer->directory.get(), name.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600)};
       if (!fd) return {};
@@ -348,10 +491,26 @@ namespace sds::file_clipboard {
   std::string_view native_offer(const stage_t &stage) {
     return stage.offer;
   }
+
+  std::shared_ptr<const stage_t> make_test_stage(std::string offer) {
+    auto out = std::make_shared<stage_t>(fd_t {}, std::string {});
+    out->offer = std::move(offer);
+    return out;
+  }
 #else
+  class stage_t {
+  public:
+    std::string offer = "copy";
+  };
+
   bool private_x11_enabled() { return false; }
   std::optional<nlohmann::json> read_offer(std::string_view, const std::function<bool()> &) { return {}; }
   std::shared_ptr<const stage_t> stage(std::string_view, const std::function<bool()> &) { return {}; }
-  std::string_view native_offer(const stage_t &) { return {}; }
+  std::string_view native_offer(const stage_t &stage) { return stage.offer; }
+  std::shared_ptr<const stage_t> make_test_stage(std::string offer) {
+    auto out = std::make_shared<stage_t>();
+    out->offer = std::move(offer);
+    return out;
+  }
 #endif
 }  // namespace sds::file_clipboard

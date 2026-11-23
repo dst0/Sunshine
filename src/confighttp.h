@@ -20,6 +20,7 @@
 #include <Simple-Web-Server/server_https.hpp>
 
 // local includes
+#include "network.h"
 #include "thread_safe.h"
 
 /**
@@ -142,6 +143,26 @@ namespace confighttp {
    * @param request HTTP request data from the client.
    */
   void savePin(const resp_https_t &response, const req_https_t &request);
+
+  /**
+   * @brief Unpair a single paired client and terminate its active sessions.
+   *
+   * @param response The HTTP response object.
+   * @param request The HTTP request object.
+   *
+   * @api_examples{/api/clients/unpair|:| POST|:| {"uuid":"<uuid>"}}
+   */
+  void unpair(const resp_https_t &response, const req_https_t &request);
+
+  /**
+   * @brief Unpair all paired clients and terminate all active sessions.
+   *
+   * @param response The HTTP response object.
+   * @param request The HTTP request object.
+   *
+   * @api_examples{/api/clients/unpair-all|:| POST|:| null}
+   */
+  void unpairAll(const resp_https_t &response, const req_https_t &request);
 
   /**
    * @brief Replace the secure-desktop-stream permissions of a paired client.
@@ -276,6 +297,15 @@ namespace confighttp {
    * @param server Server to configure.
    */
   void configure_server_limits(https_server_t &server);
+
+  /**
+   * @brief Determine the listening bind address for the Web UI HTTPS server.
+   *
+   * @param address_family Configured Sunshine address family.
+   * @param origin_web_ui_allowed Configured `origin_web_ui_allowed` policy (`pc`, `lan`, `wan`).
+   * @return Loopback address when restricted to `pc`; otherwise the configured bind address.
+   */
+  std::string resolve_bind_address(net::af_e address_family, std::string_view origin_web_ui_allowed);
 
 #ifdef SUNSHINE_TESTS
   /**

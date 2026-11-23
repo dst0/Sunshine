@@ -5,9 +5,13 @@
 // standard includes
 #include <algorithm>
 #include <cctype>
+#include <cerrno>
 #include <cstdlib>
+#include <fcntl.h>
 #include <memory>
 #include <mutex>
+#include <sys/stat.h>
+#include <unistd.h>
 #include <utility>
 
 // lib includes
@@ -16,11 +20,13 @@
 // local includes
 #include "pipewire.cpp"
 #include "portal_session.h"
+#include "src/config.h"
 #include "src/globals.h"
 
 namespace {
   // Portal configuration constants
   constexpr uint32_t SOURCE_TYPE_MONITOR = 1;
+  constexpr uint32_t SOURCE_TYPE_VIRTUAL = 4;
   constexpr uint32_t CURSOR_MODE_EMBEDDED = 2;
 
   constexpr uint32_t PERSIST_FORGET = 0;
@@ -41,6 +47,11 @@ namespace {
 
   constexpr const char REQUEST_PREFIX[] = "/org/freedesktop/portal/desktop/request/";
   constexpr const char SESSION_PREFIX[] = "/org/freedesktop/portal/desktop/session/";
+
+  /** @brief Whether the user explicitly selected a virtual output from the portal. */
+  bool portal_virtual_display() {
+    return config::video.capture == "portal-virtual";
+  }
 }  // namespace
 
 using namespace std::literals;
@@ -85,6 +96,7 @@ namespace portal {
      * @brief Load persisted state from its backing store.
      */
     static void load() {
+      token_->clear();
       std::ifstream file(active_file_path());
       if (file.is_open()) {
         std::getline(file, *token_);
@@ -114,25 +126,53 @@ namespace portal {
     }
 
     /**
-     * @brief Save current state to its backing store.
+     * @brief Save current state to its backing store with owner-only permissions.
      */
     static void save() {
       if (token_->empty()) {
         return;
       }
-      std::ofstream file(active_file_path());
-      if (file.is_open()) {
-        file << *token_;
-        BOOST_LOG(info) << "[portalgrab] Saved portal restore token to disk"sv;
-      } else {
+      const auto path = active_file_path();
+      const int fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW | O_CLOEXEC, S_IRUSR | S_IWUSR);
+      if (fd < 0) {
         BOOST_LOG(warning) << "[portalgrab] Failed to save portal restore token"sv;
+        return;
       }
+
+      if (::fchmod(fd, S_IRUSR | S_IWUSR) != 0) {
+        BOOST_LOG(warning) << "[portalgrab] Failed to restrict portal restore token permissions"sv;
+        ::close(fd);
+        return;
+      }
+
+      const char *data = token_->data();
+      std::size_t remaining = token_->size();
+      while (remaining > 0) {
+        const auto written = ::write(fd, data, remaining);
+        if (written < 0) {
+          if (errno == EINTR) {
+            continue;
+          }
+          BOOST_LOG(warning) << "[portalgrab] Failed to write portal restore token"sv;
+          ::close(fd);
+          return;
+        }
+        data += written;
+        remaining -= static_cast<std::size_t>(written);
+      }
+
+      if (::close(fd) != 0) {
+        BOOST_LOG(warning) << "[portalgrab] Failed to close portal restore token"sv;
+        return;
+      }
+      BOOST_LOG(info) << "[portalgrab] Saved portal restore token to disk"sv;
     }
 
     /**
      * @brief Get file path of the XDG Portal restore token.
      *
      * The token filename is suffixed with the XDG session desktop when set in the environment.
+     * Virtual sources have a separate token to keep monitor grants out of virtual sessions.
      *
      * @param directory Directory containing saved tokens; defaults to the application data directory.
      * @param desktop Session desktop; defaults to the XDG_SESSION_DESKTOP environment variable.
@@ -154,6 +194,10 @@ namespace portal {
           !is_safe) {
         BOOST_LOG(warning) << "[portalgrab] XDG session desktop type cannot be determined. Using .unknown suffix for Portal restore token."sv;
         suffix = "unknown";
+      }
+
+      if (portal_virtual_display()) {
+        return directory / ("portal_token." + suffix + ".virtual");
       }
 
       const std::filesystem::path suffixed_path = directory / ("portal_token." + suffix);
@@ -330,6 +374,7 @@ namespace portal {
     int height = 0;  ///< Stream height in pixels.
     int pos_x = 0;  ///< Output X position reported by the portal.
     int pos_y = 0;  ///< Output Y position reported by the portal.
+    bool virtual_display = false;  ///< True when this stream creates a virtual display.
     std::string monitor_name;  ///< Monitor name.
 
     /**
@@ -338,6 +383,9 @@ namespace portal {
      * @return Value converted to display name.
      */
     std::string to_display_name() {
+      if (virtual_display) {
+        return "portal-virtual";
+      }
       if (!monitor_name.empty()) {
         return monitor_name;
       }
@@ -521,6 +569,7 @@ namespace portal {
 
       if (select_remote_desktop_devices(loop, *session_path) < 0) {
         BOOST_LOG(warning) << "[portalgrab] RemoteDesktop.SelectDevices failed, falling back to ScreenCast-only mode"sv;
+        close_session();
         g_free(*session_path);
         *session_path = nullptr;
         return false;
@@ -528,6 +577,7 @@ namespace portal {
 
       if (select_screencast_sources(loop, *session_path, false) < 0) {
         BOOST_LOG(warning) << "[portalgrab] ScreenCast.SelectSources failed with RemoteDesktop session, trying ScreenCast-only mode"sv;
+        close_session();
         g_free(*session_path);
         *session_path = nullptr;
         return false;
@@ -557,6 +607,7 @@ namespace portal {
         return -1;
       }
       if (select_screencast_sources(loop, *session_path, true) < 0) {
+        close_session();
         g_free(*session_path);
         *session_path = nullptr;
         return -1;
@@ -816,9 +867,10 @@ namespace portal {
       g_variant_builder_add(&builder, "o", session_path);
       g_variant_builder_open(&builder, G_VARIANT_TYPE("a{sv}"));
       g_variant_builder_add(&builder, "{sv}", "handle_token", g_variant_new_string(request_token));
-      g_variant_builder_add(&builder, "{sv}", "types", g_variant_new_uint32(SOURCE_TYPE_MONITOR));
+      const bool virtual_display = portal_virtual_display();
+      g_variant_builder_add(&builder, "{sv}", "types", g_variant_new_uint32(virtual_display ? SOURCE_TYPE_VIRTUAL : SOURCE_TYPE_MONITOR));
       g_variant_builder_add(&builder, "{sv}", "cursor_mode", g_variant_new_uint32(CURSOR_MODE_EMBEDDED));
-      g_variant_builder_add(&builder, "{sv}", "multiple", g_variant_new_boolean(TRUE));
+      g_variant_builder_add(&builder, "{sv}", "multiple", g_variant_new_boolean(!virtual_display));
       if (persist) {
         g_variant_builder_add(&builder, "{sv}", "persist_mode", g_variant_new_uint32(PERSIST_UNTIL_REVOKED));
         if (!restore_token_t::empty()) {
@@ -914,6 +966,18 @@ namespace portal {
         return portal_start_e::no_streams;
       }
 
+      const bool virtual_display = portal_virtual_display();
+      if (virtual_display) {
+        guint32 source_type = 0;
+        g_autoptr(GVariant) stream = g_variant_get_child_value(streams, 0);
+        g_autoptr(GVariant) properties = g_variant_get_child_value(stream, 1);
+        if (g_variant_n_children(streams) != 1 || !g_variant_lookup(properties, "source_type", "u", &source_type) || source_type != SOURCE_TYPE_VIRTUAL) {
+          BOOST_LOG(error) << "[portalgrab] The portal did not return exactly one virtual display"sv;
+          close_session();
+          return portal_start_e::failure;
+        }
+      }
+
       if (const gchar *new_token = nullptr; g_variant_lookup(dict, "restore_token", "s", &new_token) && new_token && new_token[0] != '\0' && restore_token_t::get() != new_token) {
         restore_token_t::set(new_token);
         restore_token_t::save();
@@ -925,10 +989,10 @@ namespace portal {
       g_autoptr(GVariant) value = nullptr;
       g_variant_iter_init(&iter, streams);
       while (g_variant_iter_next(&iter, "(u@a{sv})", &out_pipewire_node, &value)) {
-        int out_width;
-        int out_height;
+        int out_width = 0;
+        int out_height = 0;
         bool result = g_variant_lookup(value, "size", "(ii)", &out_width, &out_height, nullptr);
-        if (!result) {
+        if (!result && !virtual_display) {
           BOOST_LOG(warning) << "[portalgrab] Ignoring stream without proper resolution on pipewire node "sv << out_pipewire_node;
           continue;
         }
@@ -937,7 +1001,9 @@ namespace portal {
         int out_pos_y;
         result = g_variant_lookup(value, "position", "(ii)", &out_pos_x, &out_pos_y, nullptr);
         if (!result) {
-          BOOST_LOG(warning) << "[portalgrab] Falling back to position 0x0 for stream with resolution "sv << out_width << "x"sv << out_height << "on pipewire node "sv << out_pipewire_node;
+          if (!virtual_display) {
+            BOOST_LOG(warning) << "[portalgrab] Falling back to position 0x0 for stream with resolution "sv << out_width << "x"sv << out_height << "on pipewire node "sv << out_pipewire_node;
+          }
           out_pos_x = 0;
           out_pos_y = 0;
         }
@@ -956,10 +1022,14 @@ namespace portal {
           .height = out_height,
           .pos_x = out_pos_x,
           .pos_y = out_pos_y,
+          .virtual_display = virtual_display,
         };
 
         // Try to match the stream to a monitor_name by position/resolution and update stream info
         for (const auto &monitor : wl_monitors) {
+          if (virtual_display) {
+            break;
+          }
           if (monitor->viewport.offset_x == out_pos_x && monitor->viewport.offset_y == out_pos_y && monitor->viewport.logical_width == out_width && monitor->viewport.logical_height == out_height) {
             stream.monitor_name = monitor->name;
             break;
@@ -1355,6 +1425,15 @@ namespace portal {
    */
   class portal_t: public pipewire::pipewire_display_t {
   public:
+    /**
+     * @brief Construct a portal display with initial dimensions for virtual sources without geometry.
+     * @param width Width requested by the stream configuration.
+     * @param height Height requested by the stream configuration.
+     */
+    explicit portal_t(int width = 1920, int height = 1080):
+        preferred_virtual_width {std::clamp(width, 1, 8192)},
+        preferred_virtual_height {std::clamp(height, 1, 4096)} {}
+
     int configure_stream(const std::string &display_name, int &out_pipewire_fd, uint32_t &out_pipewire_node, uint64_t &out_pipewire_object_serial [[maybe_unused]]) override {
       const std::vector<pipewire_streaminfo_t> *portal_streams = nullptr;
       int stream_fd = -1;
@@ -1420,8 +1499,9 @@ namespace portal {
       this->output_name = stream.monitor_name;
       this->offset_x = stream.pos_x;
       this->offset_y = stream.pos_y;
-      this->width = stream.width;
-      this->height = stream.height;
+      // Mutter creates the virtual monitor only after the PipeWire consumer negotiates its format.
+      this->width = stream.virtual_display && stream.width <= 0 ? preferred_virtual_width : stream.width;
+      this->height = stream.virtual_display && stream.height <= 0 ? preferred_virtual_height : stream.height;
       this->logical_width = 0;  // Explicitly mark for pipewire_display_t to try to figure this out.
       this->logical_height = 0;  // Explicitly Mark for pipewire_display_t to try to figure this out.
       // Flag successful setup
@@ -1452,6 +1532,9 @@ namespace portal {
       }
       return false;  // Return to default stream dead handling
     }
+
+    const int preferred_virtual_width;  ///< Requested width before PipeWire reports the actual virtual width.
+    const int preferred_virtual_height;  ///< Requested height before PipeWire reports the actual virtual height.
 
     // DBus portal connection
     dbus_t dbus;  ///< DBus connection used for portal screencast requests when the session is not shared.
@@ -1514,7 +1597,7 @@ namespace platf {
       return nullptr;
     }
 
-    auto portal = std::make_shared<portal::portal_t>();
+    auto portal = std::make_shared<portal::portal_t>(config.width, config.height);
     if (portal->init(hwdevice_type, display_name, config)) {
       return nullptr;
     }

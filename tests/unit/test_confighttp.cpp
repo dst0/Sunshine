@@ -358,6 +358,8 @@ protected:
     server->resource["^/pairing-test$"]["POST"] = confighttp::savePin;
     server->resource["^/portal-token-reset-test$"]["POST"] = confighttp::resetPortalToken;
     server->resource["^/api/apps$"]["POST"] = confighttp::saveApp;
+    server->resource["^/api/clients/unpair$"]["POST"] = confighttp::unpair;
+    server->resource["^/api/clients/unpair-all$"]["POST"] = confighttp::unpairAll;
     server->resource["^/api/clients/permissions$"]["POST"] = confighttp::updateClientPermissions;
     server->resource["^/api/password$"]["POST"] = confighttp::savePassword;
     server->resource["^/api/covers/upload$"]["POST"] = confighttp::uploadCover;
@@ -622,9 +624,7 @@ INSTANTIATE_TEST_SUITE_P(
 
 TEST_P(InvalidVirtualInputLicenseRequestTest, ReturnsExpectedError) {
   const auto &request = GetParam();
-  SimpleWeb::CaseInsensitiveMultimap headers;
-  headers.emplace("Authorization", create_auth_header("testuser", "testpass"));
-  headers.emplace("Origin", std::format("https://localhost:{}", port));
+  const auto headers = authenticated_json_headers();
 
   const auto response = client->request("POST", "/virtual-input-license-test", request.body, headers);
   ASSERT_EQ(response->status_code, "400 Bad Request");
@@ -719,10 +719,7 @@ TEST_F(ConfigHttpTest, PairingRestApiRejectsMalformedFieldsWithoutConsumingReque
     nlohmann::json {{"pairing_id", pairing_id}, {"pin", "1234"}, {"name", std::string(nvhttp::MAX_PAIRING_CLIENT_NAME_SIZE + 1, 'a')}},
   };
 
-  SimpleWeb::CaseInsensitiveMultimap headers;
-  headers.emplace("Authorization", create_auth_header("testuser", "testpass"));
-  headers.emplace("Content-Type", "application/json");
-  headers.emplace("Origin", std::format("https://localhost:{}", port));
+  const auto headers = authenticated_json_headers();
   for (const auto &request : invalid_requests) {
     const auto response = client->request("POST", "/pairing-test", request.dump(), headers);
     EXPECT_EQ(response->status_code, "400 Bad Request");
@@ -735,10 +732,7 @@ TEST_F(ConfigHttpTest, PairingRestApiRejectsMalformedFieldsWithoutConsumingReque
 
 TEST_F(ConfigHttpTest, PairingRestApiCancelsOnlyExplicitRequest) {
   const std::string pairing_id = insert_pending_pairing();
-  SimpleWeb::CaseInsensitiveMultimap headers;
-  headers.emplace("Authorization", create_auth_header("testuser", "testpass"));
-  headers.emplace("Content-Type", "application/json");
-  headers.emplace("Origin", std::format("https://localhost:{}", port));
+  const auto headers = authenticated_json_headers();
 
   const auto response = client->request(
     "DELETE",
@@ -753,10 +747,7 @@ TEST_F(ConfigHttpTest, PairingRestApiCancelsOnlyExplicitRequest) {
 
 TEST_F(ConfigHttpTest, PairingRestApiReportsIncompleteHandshakeAsFailure) {
   const std::string pairing_id = insert_pending_pairing();
-  SimpleWeb::CaseInsensitiveMultimap headers;
-  headers.emplace("Authorization", create_auth_header("testuser", "testpass"));
-  headers.emplace("Content-Type", "application/json");
-  headers.emplace("Origin", std::format("https://localhost:{}", port));
+  const auto headers = authenticated_json_headers();
 
   const auto response = client->request(
     "POST",
@@ -778,9 +769,7 @@ TEST_F(ConfigHttpTest, PortalTokenResetHandlesSavedTokenForCurrentPlatform) {
   const auto token_path = test_web_dir / "portal_token";
   std::ofstream(token_path) << "saved-token";
 
-  SimpleWeb::CaseInsensitiveMultimap headers;
-  headers.emplace("Authorization", create_auth_header("testuser", "testpass"));
-  headers.emplace("Origin", std::format("https://localhost:{}", port));
+  const auto headers = authenticated_json_headers();
 
   const auto response = client->request("POST", "/portal-token-reset-test", "", headers);
 
@@ -794,9 +783,7 @@ TEST_F(ConfigHttpTest, PortalTokenResetHandlesSavedTokenForCurrentPlatform) {
 }
 
 TEST_F(ConfigHttpTest, PortalTokenResetSucceedsWhenTokenDoesNotExist) {
-  SimpleWeb::CaseInsensitiveMultimap headers;
-  headers.emplace("Authorization", create_auth_header("testuser", "testpass"));
-  headers.emplace("Origin", std::format("https://localhost:{}", port));
+  const auto headers = authenticated_json_headers();
 
   const auto response = client->request("POST", "/portal-token-reset-test", "", headers);
 
@@ -809,9 +796,7 @@ TEST_F(ConfigHttpTest, PortalTokenResetReportsDeletionFailure) {
   std::filesystem::create_directories(token_path);
   std::ofstream(token_path / "contents") << "not empty";
 
-  SimpleWeb::CaseInsensitiveMultimap headers;
-  headers.emplace("Authorization", create_auth_header("testuser", "testpass"));
-  headers.emplace("Origin", std::format("https://localhost:{}", port));
+  const auto headers = authenticated_json_headers();
 
   const auto response = client->request("POST", "/portal-token-reset-test", "", headers);
 
@@ -834,9 +819,7 @@ TEST_F(ConfigHttpTest, PortalTokenResetUsesSessionResolverAndPreservesOtherDeskt
     return portal::get_saved_token_path_for_testing(test_web_dir, "KDE");
   });
 
-  SimpleWeb::CaseInsensitiveMultimap headers;
-  headers.emplace("Authorization", create_auth_header("testuser", "testpass"));
-  headers.emplace("Origin", std::format("https://localhost:{}", port));
+  const auto headers = authenticated_json_headers();
   const auto response = client->request("POST", "/portal-token-reset-test", "", headers);
 
   ASSERT_EQ(response->status_code, "200 OK");
@@ -857,9 +840,7 @@ TEST_F(ConfigHttpTest, PortalTokenResetRemovesMigratedLegacyToken) {
     return portal::get_saved_token_path_for_testing(test_web_dir, "KDE");
   });
 
-  SimpleWeb::CaseInsensitiveMultimap headers;
-  headers.emplace("Authorization", create_auth_header("testuser", "testpass"));
-  headers.emplace("Origin", std::format("https://localhost:{}", port));
+  const auto headers = authenticated_json_headers();
   const auto response = client->request("POST", "/portal-token-reset-test", "", headers);
 
   ASSERT_EQ(response->status_code, "200 OK");
@@ -1129,58 +1110,105 @@ TEST_F(ConfigHttpTest, CSRFValidationRejectsLookAlikeOrigins) {
   }
 }
 
-// Test: the Web UI reached through an SSH tunnel (any local port on localhost/127.0.0.1/[::1]) works
-TEST_F(ConfigHttpTest, CSRFValidationAllowsSshTunnelOrigins) {
-  for (const auto *origin : {"https://localhost:47990", "https://localhost:8443", "https://127.0.0.1:9000", "https://[::1]:47990"}) {
-    SimpleWeb::CaseInsensitiveMultimap headers;
-    headers.emplace("Authorization", create_auth_header("testuser", "testpass"));
-    headers.emplace("Origin", origin);
-
-    const auto response = client->request("POST", "/csrf-validate-test", "", headers);
-    EXPECT_EQ(response->status_code, "200 OK") << origin;
-  }
-}
-
-// Test: a script without browser headers can use a CSRF token
-TEST_F(ConfigHttpTest, CSRFValidationAllowsTokenWithoutBrowserHeaders) {
+// Test: allowed SSH tunnel origins require X-CSRF-Token and succeed when both match
+TEST_F(ConfigHttpTest, CSRFValidationAllowsSshTunnelOriginsWithToken) {
   SimpleWeb::CaseInsensitiveMultimap auth_headers;
   auth_headers.emplace("Authorization", create_auth_header("testuser", "testpass"));
   const auto token_response = client->request("GET", "/csrf-token-test", "", auth_headers);
   ASSERT_EQ(token_response->status_code, "200 OK");
   const auto token = nlohmann::json::parse(token_response->content.string()).at("csrf_token").get<std::string>();
 
-  SimpleWeb::CaseInsensitiveMultimap headers;
-  headers.emplace("Authorization", create_auth_header("testuser", "testpass"));
-  const auto query_response = client->request("POST", "/csrf-validate-test?csrf_token=" + token, "", headers);
-  EXPECT_EQ(query_response->status_code, "200 OK");
+  for (const auto *origin : {"https://localhost:47990", "https://localhost:8443", "https://127.0.0.1:9000", "https://[::1]:47990"}) {
+    SimpleWeb::CaseInsensitiveMultimap without_token;
+    without_token.emplace("Authorization", create_auth_header("testuser", "testpass"));
+    without_token.emplace("Origin", origin);
+    const auto rejected = client->request("POST", "/csrf-validate-test", "", without_token);
+    EXPECT_EQ(rejected->status_code, "400 Bad Request") << origin;
+
+    SimpleWeb::CaseInsensitiveMultimap with_token = without_token;
+    with_token.emplace("X-CSRF-Token", token);
+    const auto accepted = client->request("POST", "/csrf-validate-test", "", with_token);
+    EXPECT_EQ(accepted->status_code, "200 OK") << origin;
+  }
 }
 
-// Test: CSRF same-origin exemption with Origin header
-TEST_F(ConfigHttpTest, CSRFSameOriginExemptionWithOrigin) {
+// Test: scripts without browser headers must pass X-CSRF-Token in headers, never as a query parameter
+TEST_F(ConfigHttpTest, CSRFValidationAllowsHeaderTokenWithoutBrowserHeaders) {
+  SimpleWeb::CaseInsensitiveMultimap auth_headers;
+  auth_headers.emplace("Authorization", create_auth_header("testuser", "testpass"));
+  const auto token_response = client->request("GET", "/csrf-token-test", "", auth_headers);
+  ASSERT_EQ(token_response->status_code, "200 OK");
+  const auto token = nlohmann::json::parse(token_response->content.string()).at("csrf_token").get<std::string>();
+
+  SimpleWeb::CaseInsensitiveMultimap query_only_headers;
+  query_only_headers.emplace("Authorization", create_auth_header("testuser", "testpass"));
+  const auto query_response = client->request("POST", "/csrf-validate-test?csrf_token=" + token, "", query_only_headers);
+  ASSERT_EQ(query_response->status_code, "400 Bad Request");
+  EXPECT_TRUE(query_response->content.string().contains("Missing CSRF token"));
+
+  SimpleWeb::CaseInsensitiveMultimap duplicate_token_headers = query_only_headers;
+  duplicate_token_headers.emplace("X-CSRF-Token", token);
+  duplicate_token_headers.emplace("X-CSRF-Token", token);
+  const auto duplicate_response = client->request("POST", "/csrf-validate-test", "", duplicate_token_headers);
+  ASSERT_EQ(duplicate_response->status_code, "400 Bad Request");
+  EXPECT_TRUE(duplicate_response->content.string().contains("Invalid CSRF token"));
+
+  SimpleWeb::CaseInsensitiveMultimap valid_headers = query_only_headers;
+  valid_headers.emplace("X-CSRF-Token", token);
+  const auto valid_response = client->request("POST", "/csrf-validate-test", "", valid_headers);
+  ASSERT_EQ(valid_response->status_code, "200 OK");
+  EXPECT_EQ(valid_response->content.string(), "csrf-valid");
+}
+
+// Test: same-origin Origin header alone does not bypass X-CSRF-Token verification
+TEST_F(ConfigHttpTest, CSRFRequiresTokenEvenWithAllowedOrigin) {
   SimpleWeb::CaseInsensitiveMultimap headers;
   headers.emplace("Authorization", create_auth_header("testuser", "testpass"));
   headers.emplace("Origin", std::format("https://localhost:{}", port));
 
-  // Make a POST request without CSRF token but with same-origin Origin header
   const auto response = client->request("POST", "/csrf-validate-test", "", headers);
-  ASSERT_EQ(response->status_code, "200 OK");
-
-  const std::string body = response->content.string();
-  ASSERT_EQ(body, "csrf-valid");
+  ASSERT_EQ(response->status_code, "400 Bad Request");
+  EXPECT_TRUE(response->content.string().contains("Missing CSRF token"));
 }
 
-// Test: CSRF same-origin exemption with Referer header
-TEST_F(ConfigHttpTest, CSRFSameOriginExemptionWithReferer) {
+// Test: same-origin Referer header alone does not bypass X-CSRF-Token verification
+TEST_F(ConfigHttpTest, CSRFRequiresTokenEvenWithAllowedReferer) {
   SimpleWeb::CaseInsensitiveMultimap headers;
   headers.emplace("Authorization", create_auth_header("testuser", "testpass"));
   headers.emplace("Referer", std::format("https://localhost:{}/some/page", port));
 
-  // Make a POST request without CSRF token but with same-origin Referer header
   const auto response = client->request("POST", "/csrf-validate-test", "", headers);
-  ASSERT_EQ(response->status_code, "200 OK");
+  ASSERT_EQ(response->status_code, "400 Bad Request");
+  EXPECT_TRUE(response->content.string().contains("Missing CSRF token"));
+}
 
-  const std::string body = response->content.string();
-  ASSERT_EQ(body, "csrf-valid");
+// Test: disallowed or multiple Origin headers reject immediately even with an allowed Referer and valid CSRF token
+TEST_F(ConfigHttpTest, CSRFRejectsDisallowedOriginWithoutFallingBackToReferer) {
+  SimpleWeb::CaseInsensitiveMultimap auth_headers;
+  auth_headers.emplace("Authorization", create_auth_header("testuser", "testpass"));
+  const auto token_response = client->request("GET", "/csrf-token-test", "", auth_headers);
+  ASSERT_EQ(token_response->status_code, "200 OK");
+  const auto token = nlohmann::json::parse(token_response->content.string()).at("csrf_token").get<std::string>();
+
+  SimpleWeb::CaseInsensitiveMultimap mismatched_origin;
+  mismatched_origin.emplace("Authorization", create_auth_header("testuser", "testpass"));
+  mismatched_origin.emplace("Origin", "https://example.invalid");
+  mismatched_origin.emplace("Referer", std::format("https://localhost:{}/some/page", port));
+  mismatched_origin.emplace("X-CSRF-Token", token);
+
+  const auto rejected = client->request("POST", "/csrf-validate-test", "", mismatched_origin);
+  ASSERT_EQ(rejected->status_code, "400 Bad Request");
+  EXPECT_TRUE(rejected->content.string().contains("Origin not allowed"));
+
+  SimpleWeb::CaseInsensitiveMultimap multi_origin;
+  multi_origin.emplace("Authorization", create_auth_header("testuser", "testpass"));
+  multi_origin.emplace("Origin", std::format("https://localhost:{}", port));
+  multi_origin.emplace("Origin", std::format("https://localhost:{}", port));
+  multi_origin.emplace("X-CSRF-Token", token);
+
+  const auto rejected_multi = client->request("POST", "/csrf-validate-test", "", multi_origin);
+  ASSERT_EQ(rejected_multi->status_code, "400 Bad Request");
+  EXPECT_TRUE(rejected_multi->content.string().contains("Origin not allowed"));
 }
 
 // Test: confighttp::getPage() serves HTML with authentication
@@ -1886,10 +1914,7 @@ TEST_F(ConfigHttpTest, PermissionsEndpointReturnsRequiredAndOptionalStatuses) {
 }
 
 TEST_F(ConfigHttpTest, PermissionsEndpointRejectsMalformedAndUnknownRequests) {
-  SimpleWeb::CaseInsensitiveMultimap headers;
-  headers.emplace("Content-Type", "application/json");
-  headers.emplace("Authorization", create_auth_header("testuser", "testpass"));
-  headers.emplace("Origin", std::format("https://localhost:{}", port));
+  const auto headers = authenticated_json_headers();
 
   EXPECT_EQ(client->request("POST", "/permissions-test", "not-json", headers)->status_code, "400 Bad Request");
   EXPECT_EQ(client->request("POST", "/permissions-test", R"({"id":1})", headers)->status_code, "400 Bad Request");
@@ -2441,8 +2466,7 @@ TEST_F(ConfigHttpTest, PasswordEndpointDoesNotDiscloseMalformedInput) {
 
 // Test: an authenticated user can change the credentials
 TEST_F(ConfigHttpTest, PasswordEndpointChangesCredentialsWhenAuthenticated) {
-  auto headers = same_origin_json_headers(port);
-  headers.emplace("Authorization", create_auth_header("testuser", "testpass"));
+  const auto headers = authenticated_json_headers();
   const nlohmann::json body {
     {"currentUsername", "testuser"},
     {"currentPassword", "testpass"},
@@ -2500,22 +2524,10 @@ TEST_F(ConfigHttpTest, RepeatedLoginFailuresLockOutTheSource) {
   EXPECT_NE(response->content.string().find("Too many failed login attempts"), std::string::npos);
 }
 
-/**
- * @brief Build an authenticated, same-origin JSON request for the cover upload endpoint.
- *
- * @param port Test server port used in the Origin header.
- * @return Request headers.
- */
-static SimpleWeb::CaseInsensitiveMultimap cover_upload_headers(const unsigned short port) {
-  auto headers = same_origin_json_headers(port);
-  headers.emplace("Authorization", "Basic " + SimpleWeb::Crypto::Base64::encode("testuser:testpass"));
-  return headers;
-}
-
 // Test: covers can no longer be downloaded from a URL (no outbound connections)
 TEST_F(ConfigHttpTest, UploadCoverRejectsUrlDownloads) {
   const nlohmann::json body {{"key", "igdb_1234"}, {"url", "https://images.igdb.com/igdb/image/upload/t_cover_big_2x/abc.png"}};
-  const auto response = client->request("POST", "/api/covers/upload", body.dump(), cover_upload_headers(port));
+  const auto response = client->request("POST", "/api/covers/upload", body.dump(), authenticated_json_headers());
 
   ASSERT_EQ(response->status_code, "400 Bad Request");
   EXPECT_NE(response->content.string().find("not supported"), std::string::npos);
@@ -2526,11 +2538,11 @@ TEST_F(ConfigHttpTest, UploadCoverRejectsUrlDownloads) {
 TEST_F(ConfigHttpTest, UploadCoverRejectsNonImageData) {
   for (const std::string &data : {std::string {"GIF89a....."}, std::string {"<svg onload=alert(1)>"}, std::string {"\xff\xd8\xff\xe0jpeg", 8}, std::string {}}) {
     const nlohmann::json body {{"key", "not_an_image"}, {"data", SimpleWeb::Crypto::Base64::encode(data)}};
-    const auto response = client->request("POST", "/api/covers/upload", body.dump(), cover_upload_headers(port));
+    const auto response = client->request("POST", "/api/covers/upload", body.dump(), authenticated_json_headers());
     EXPECT_EQ(response->status_code, "400 Bad Request") << data;
   }
   const nlohmann::json invalid_base64 {{"key", "not_an_image"}, {"data", "%%%"}};
-  EXPECT_EQ(client->request("POST", "/api/covers/upload", invalid_base64.dump(), cover_upload_headers(port))->status_code, "400 Bad Request");
+  EXPECT_EQ(client->request("POST", "/api/covers/upload", invalid_base64.dump(), authenticated_json_headers())->status_code, "400 Bad Request");
   EXPECT_FALSE(std::filesystem::exists(platf::appdata() / "covers" / "not_an_image.png"));
 }
 
@@ -2539,7 +2551,7 @@ TEST_F(ConfigHttpTest, UploadCoverRejectsUnsafeKeys) {
   const std::string png {"\x89PNG\r\n\x1a\n0000", 12};
   for (const auto &key : std::initializer_list<std::string> {"../escape", "a/b", "", std::string(65, 'a'), "name.png", "a b"}) {
     const nlohmann::json body {{"key", key}, {"data", SimpleWeb::Crypto::Base64::encode(png)}};
-    const auto response = client->request("POST", "/api/covers/upload", body.dump(), cover_upload_headers(port));
+    const auto response = client->request("POST", "/api/covers/upload", body.dump(), authenticated_json_headers());
     EXPECT_EQ(response->status_code, "400 Bad Request") << key;
   }
 }
@@ -2553,7 +2565,7 @@ TEST_F(ConfigHttpTest, UploadCoverStoresPngUpToTheSizeLimit) {
     std::filesystem::remove(path);
     const nlohmann::json body {{"key", key}, {"data", SimpleWeb::Crypto::Base64::encode(data)}};
     ASSERT_LE(body.dump().size(), confighttp::MAX_REQUEST_SIZE);
-    const auto response = client->request("POST", "/api/covers/upload", body.dump(), cover_upload_headers(port));
+    const auto response = client->request("POST", "/api/covers/upload", body.dump(), authenticated_json_headers());
 
     ASSERT_EQ(response->status_code, "200 OK") << key << ": " << response->content.string().substr(0, 200);
     ASSERT_TRUE(std::filesystem::exists(path));
@@ -2600,7 +2612,7 @@ TEST(ConfigHttpCoverValidationTest, RejectsOversizedAndUnknownImages) {
 
 // Test: the Web UI refuses oversized requests before buffering their body
 TEST_F(ConfigHttpTest, OversizedRequestIsRejectedBeforeBuffering) {
-  SimpleWeb::CaseInsensitiveMultimap headers = cover_upload_headers(port);
+  const SimpleWeb::CaseInsensitiveMultimap headers = authenticated_json_headers();
   const std::string accepted_body(1024 * 1024, ' ');
   EXPECT_EQ(client->request("POST", "/content-type-test", accepted_body, headers)->status_code, "200 OK");
 
@@ -2680,4 +2692,99 @@ TEST_F(ConfigHttpTest, EveryResponseCarriesTheContentSecurityPolicy) {
   const auto locked_csp = locked->header.find("Content-Security-Policy");
   ASSERT_NE(locked_csp, locked->header.end());
   EXPECT_EQ(locked_csp->second, confighttp::WEB_UI_CSP);
+}
+
+// Test: Web UI bind address is strictly loopback in pc mode and uses configured bind in lan/wan mode
+TEST(ConfigHttpBindAddressTest, RestrictsPcModeToLoopbackAndAllowsLanMode) {
+  const std::string saved_bind_address = config::sunshine.bind_address;
+  const auto restore = util::fail_guard([&]() {
+    config::sunshine.bind_address = saved_bind_address;
+  });
+
+  config::sunshine.bind_address.clear();
+  EXPECT_EQ(confighttp::resolve_bind_address(net::IPV4, "pc"), "127.0.0.1");
+  EXPECT_EQ(confighttp::resolve_bind_address(net::BOTH, "pc"), "::1");
+  EXPECT_EQ(confighttp::resolve_bind_address(net::IPV4, "lan"), "0.0.0.0");
+  EXPECT_EQ(confighttp::resolve_bind_address(net::BOTH, "lan"), "::");
+
+  config::sunshine.bind_address = "192.168.1.50";
+  EXPECT_EQ(confighttp::resolve_bind_address(net::BOTH, "pc"), "127.0.0.1");
+  EXPECT_EQ(confighttp::resolve_bind_address(net::BOTH, "lan"), "192.168.1.50");
+}
+
+// Test: /api/clients/unpair and /api/clients/unpair-all revoke clients and enforce CSRF
+TEST_F(ConfigHttpTest, UnpairAndUnpairAllRevokePairedClients) {
+  const auto saved_state_file = config::nvhttp.file_state;
+  const auto saved_fresh_state = config::sunshine.flags[config::flag::FRESH_STATE];
+  const auto state_file = test_web_dir / "unpair_clients_state.json";
+  std::filesystem::remove(state_file);
+  config::nvhttp.file_state = state_file.string();
+  config::sunshine.flags[config::flag::FRESH_STATE] = false;
+  nvhttp::test_support::reset_client_state();
+  const auto restore = util::fail_guard([&]() {
+    nvhttp::test_support::reset_client_state();
+    std::filesystem::remove(state_file);
+    config::nvhttp.file_state = saved_state_file;
+    config::sunshine.flags[config::flag::FRESH_STATE] = saved_fresh_state;
+  });
+
+  const auto creds1 = crypto::gen_creds("Unpair Client One", 2048);
+  const auto creds2 = crypto::gen_creds("Unpair Client Two", 2048);
+  const auto uuid1 = nvhttp::test_support::add_client("one", creds1.x509, true);
+  const auto uuid2 = nvhttp::test_support::add_client("two", creds2.x509, true);
+  ASSERT_FALSE(uuid1.empty());
+  ASSERT_FALSE(uuid2.empty());
+  ASSERT_EQ(nvhttp::get_all_clients().size(), 2U);
+
+  // Missing CSRF token must not unpair the client.
+  SimpleWeb::CaseInsensitiveMultimap missing_csrf;
+  missing_csrf.emplace("Authorization", create_auth_header("testuser", "testpass"));
+  missing_csrf.emplace("Content-Type", "application/json");
+  missing_csrf.emplace("Origin", std::format("https://localhost:{}", port));
+  const auto csrf_blocked = client->request("POST", "/api/clients/unpair", nlohmann::json {{"uuid", uuid1}}.dump(), missing_csrf);
+  ASSERT_EQ(csrf_blocked->status_code, "400 Bad Request");
+  EXPECT_TRUE(csrf_blocked->content.string().contains("Missing CSRF token"));
+  EXPECT_EQ(nvhttp::get_all_clients().size(), 2U);
+
+  const auto unpair_one = client->request("POST", "/api/clients/unpair", nlohmann::json {{"uuid", uuid1}}.dump(), authenticated_json_headers());
+  ASSERT_EQ(unpair_one->status_code, "200 OK");
+  EXPECT_TRUE(nlohmann::json::parse(unpair_one->content.string()).at("status").get<bool>());
+  EXPECT_TRUE(nvhttp::get_cert_by_uuid(uuid1).empty());
+  ASSERT_EQ(nvhttp::get_all_clients().size(), 1U);
+  EXPECT_FALSE(nvhttp::get_cert_by_uuid(uuid2).empty());
+
+  const auto unpair_all = client->request("POST", "/api/clients/unpair-all", "{}", authenticated_json_headers());
+  ASSERT_EQ(unpair_all->status_code, "200 OK");
+  EXPECT_TRUE(nlohmann::json::parse(unpair_all->content.string()).at("status").get<bool>());
+  EXPECT_TRUE(nvhttp::get_all_clients().empty());
+}
+
+// Test: Web UI HTTPS server rejects smuggling, non-canonical framing, and >64 KiB headers
+TEST_F(ConfigHttpTest, HardeningRejectsSmugglingNonCanonicalHeadsAndOversizedHeaders) {
+  auto send_and_expect_drop = [this](const std::string &raw_request) {
+    boost::asio::io_context io;
+    boost::asio::ssl::context context {boost::asio::ssl::context::tls_client};
+    context.set_verify_mode(boost::asio::ssl::verify_none);
+    boost::asio::ssl::stream<boost::asio::ip::tcp::socket> stream {io, context};
+    boost::asio::ip::tcp::resolver resolver {io};
+    boost::asio::connect(stream.lowest_layer(), resolver.resolve("localhost", std::to_string(port)));
+    stream.handshake(boost::asio::ssl::stream_base::client);
+
+    boost::system::error_code write_ec;
+    boost::asio::write(stream, boost::asio::buffer(raw_request), write_ec);
+
+    std::array<char, 1> byte {};
+    boost::system::error_code read_ec;
+    const auto read = stream.read_some(boost::asio::buffer(byte), read_ec);
+    EXPECT_EQ(read, 0U) << raw_request.substr(0, 64);
+    EXPECT_TRUE(read_ec) << raw_request.substr(0, 64);
+  };
+
+  send_and_expect_drop("POST /api/clients/unpair HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n");
+  send_and_expect_drop("GET /json-test HTTP/1.1\nHost: localhost\r\n\r\n");
+  send_and_expect_drop("GET /json-test HTTP/1.1\r\nHost: localhost\nX-Test: 1\r\n\r\n");
+  send_and_expect_drop("GET /json-test HTTP/1.1\r\nHost: localhost\r\n folded\r\n\r\n");
+  send_and_expect_drop("GET /json-test HTTP/1.1\r\nBadHeader\r\n\r\n");
+  send_and_expect_drop("GET /json-test HTTP/1.1\r\nHost: localhost\r\nContent-Length: 1\r\nContent-Length: 1\r\n\r\na");
+  send_and_expect_drop("GET /json-test HTTP/1.1\r\nX-Pad: " + std::string(65 * 1024, 'a'));
 }

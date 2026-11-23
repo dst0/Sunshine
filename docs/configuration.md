@@ -2711,7 +2711,7 @@ consent prompt for directory ACLs, so the Web UI shows setup steps for correctin
             @endcode</td>
     </tr>
     <tr>
-        <td rowspan="8">Choices</td>
+        <td rowspan="9">Choices</td>
         <td>nvfbc</td>
         <td>Use NVIDIA Frame Buffer Capture to capture direct to GPU memory. This is usually the fastest method for
             NVIDIA cards. NvFBC does not have native Wayland support and does not work with XWayland.
@@ -2742,6 +2742,13 @@ consent prompt for directory ACLs, so the Web UI shows setup steps for correctin
         <td>portal</td>
         <td>Capture via XDG Desktop Portal.
             @note{Applies to Linux only.}</td>
+    </tr>
+    <tr>
+        <td>portal-virtual</td>
+        <td>Request one new virtual display from the Linux XDG Desktop Portal. The portal must support virtual displays
+            and authorize the session. Sunshine uses a separate restore token for this mode and will fail rather than
+            stream an existing display if the virtual source is unavailable. The portal owns the display for the
+            lifetime of its session.</td>
     </tr>
     <tr>
         <td>x11</td>

@@ -254,10 +254,10 @@ namespace sds::mic {
             if (FAILED(client->GetCurrentPadding(&padding))) {
               break;
             }
-            const auto frames = buffer_frames - padding;
-            if (frames == 0) {
+            if (padding >= buffer_frames) {
               continue;
             }
+            const auto frames = buffer_frames - padding;
             BYTE *data = nullptr;
             if (FAILED(render->GetBuffer(frames, &data))) {
               break;

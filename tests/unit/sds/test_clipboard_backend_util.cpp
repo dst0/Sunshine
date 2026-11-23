@@ -341,6 +341,33 @@ TEST(ClipboardUtilTest, DibRejectsMalformedAndUnsupported) {
   EXPECT_FALSE(cliputil::dib_to_bgra(huge));
 }
 
+TEST(ClipboardUtilTest, DibRejectsTruncatedBitfieldsHeaders) {
+  // V2+ headers with BI_BITFIELDS (3) require at least 52 bytes for the RGB masks;
+  // BI_ALPHABITFIELDS (6) requires at least 56 bytes for RGBA masks.
+  for (std::uint32_t header_size = 41; header_size < 52; ++header_size) {
+    auto dib = dib_header(header_size, 1, 1, 32, 3);
+    put<std::uint32_t>(dib, 0xFF112233);
+    EXPECT_FALSE(cliputil::dib_to_bgra(dib)) << "BI_BITFIELDS header_size=" << header_size;
+  }
+  for (std::uint32_t header_size = 41; header_size < 56; ++header_size) {
+    auto dib = dib_header(header_size, 1, 1, 32, 6);
+    put<std::uint32_t>(dib, 0xFF112233);
+    EXPECT_FALSE(cliputil::dib_to_bgra(dib)) << "BI_ALPHABITFIELDS header_size=" << header_size;
+  }
+
+  auto valid_v2 = dib_header(52, 1, 1, 32, 3, 0, {0x00FF0000, 0x0000FF00, 0x000000FF, 0});
+  put<std::uint32_t>(valid_v2, 0x00112233);
+  const auto decoded_v2 = cliputil::dib_to_bgra(valid_v2);
+  ASSERT_TRUE(decoded_v2);
+  EXPECT_EQ(pixel(*decoded_v2, 0, 0), (std::array<std::uint8_t, 4> {0x33, 0x22, 0x11, 0xFF}));
+
+  auto valid_v3 = dib_header(56, 1, 1, 32, 6, 0, {0x00FF0000, 0x0000FF00, 0x000000FF, 0xFF000000});
+  put<std::uint32_t>(valid_v3, 0x80112233);
+  const auto decoded_v3 = cliputil::dib_to_bgra(valid_v3);
+  ASSERT_TRUE(decoded_v3);
+  EXPECT_EQ(pixel(*decoded_v3, 0, 0), (std::array<std::uint8_t, 4> {0x33, 0x22, 0x11, 0x80}));
+}
+
 TEST(ClipboardUtilTest, BgraToDibRoundTrip) {
   cliputil::bgra_image_t image;
   image.width = 3;

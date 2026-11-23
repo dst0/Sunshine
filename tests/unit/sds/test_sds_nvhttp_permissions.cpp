@@ -3,12 +3,17 @@
  * @brief Test per-client sds permissions in the nvhttp paired-client store.
  */
 
+// local includes
+// Include mic.h before tests_common.h so Boost.Asio precedes Windows headers.
+#include <src/sds/mic.h>
+
 // test includes
 #include "../../certificate_test_utils.h"
 #include "../../tests_common.h"
 #include "sds_test_utils.h"
 
 // standard includes
+#include <atomic>
 #include <filesystem>
 #include <future>
 #include <string>
@@ -201,4 +206,86 @@ TEST_F(SdsNvhttpPermissionsTest, ModuleRunsWithProductionCollaborators) {
   EXPECT_EQ(promise.get_future().get().status, 409) << "the real rtsp session table has no stream for this client";
   sds::stop();
   config::sds.clipboard = saved_clipboard;
+}
+
+TEST_F(SdsNvhttpPermissionsTest, OnClientChangedImmediatelyDeactivatesActiveMicSession) {
+  const auto saved_mic = config::sds.mic_passthrough;
+  config::sds.mic_passthrough = true;
+  std::atomic_int starts {0};
+  std::atomic_int stops {0};
+
+  struct probe_sink_t final: sds::mic::sink_t {
+    probe_sink_t(std::atomic_int &starts_ref, std::atomic_int &stops_ref):
+        starts_ref(starts_ref),
+        stops_ref(stops_ref) {}
+    int start() override {
+      ++starts_ref;
+      return 0;
+    }
+    void write(std::span<const std::int16_t>) override {}
+    void stop() override {
+      ++stops_ref;
+    }
+    std::string_view name() const override {
+      return "probe";
+    }
+    std::atomic_int &starts_ref;
+    std::atomic_int &stops_ref;
+  };
+
+  sds::mic::set_sink_provider({
+    []() {
+      return true;
+    },
+    [&]() -> std::unique_ptr<sds::mic::sink_t> {
+      return std::make_unique<probe_sink_t>(starts, stops);
+    },
+  });
+  std::shared_ptr<sds::mic::session_t> session;
+  auto restore = util::fail_guard([&]() {
+    sds::mic::stop_session(session);
+    sds::mic::set_sink_provider({});
+    config::sds.mic_passthrough = saved_mic;
+  });
+
+  const auto creds = crypto::gen_creds("Mic Client", 2048);
+  const auto uuid = nvhttp::test_support::add_client("mic-client", creds.x509, true);
+  ASSERT_TRUE(nvhttp::set_client_permissions(uuid, {"mic"}));
+  auto certificate = crypto::x509(creds.x509);
+  const auto canonical = crypto::pem(certificate);
+
+  sds::mic::session_config_t cfg;
+  cfg.key = {0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f};
+  cfg.ping_payload = "0123456789ABCDEF";
+  cfg.expected_address = boost::asio::ip::make_address("127.0.0.1");
+  cfg.client_cert = canonical;
+  cfg.start_playout_thread = true;
+
+  session = sds::mic::start_session(std::move(cfg));
+  ASSERT_TRUE(session);
+  EXPECT_TRUE(session->active());
+  EXPECT_EQ(starts.load(), 1);
+  EXPECT_EQ(stops.load(), 0);
+
+  // Revoke mic permission and notify: active session must deactivate immediately without waiting 1s.
+  ASSERT_TRUE(nvhttp::set_client_permissions(uuid, {}));
+  sds::on_client_changed(canonical);
+  EXPECT_FALSE(session->active());
+  EXPECT_EQ(stops.load(), 1);
+}
+
+TEST_F(SdsNvhttpPermissionsTest, CipherAndMicClearKeyMaterialOnTeardown) {
+  const crypto::aes_t key {0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f};
+  crypto::cipher::gcm_t gcm {key, false};
+  EXPECT_EQ(gcm.key, key);
+  gcm.cleanse_key();
+  EXPECT_TRUE(gcm.key.empty());
+
+  sds::mic::packet_cipher_t cipher {key};
+  const auto datagram = cipher.encrypt(1, 960, std::vector<std::uint8_t> {1, 2, 3});
+  ASSERT_FALSE(datagram.empty());
+  cipher.clear_key();
+  const auto header = sds::mic::parse_header(datagram);
+  ASSERT_TRUE(header);
+  EXPECT_FALSE(cipher.decrypt(datagram, *header).has_value());
 }

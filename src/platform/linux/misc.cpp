@@ -1287,8 +1287,12 @@ namespace platf {
         platf::restart();
         return false;
       case no_token:
-        BOOST_LOG(fatal) << "Portal capture is awaiting user permission. "sv
-                         << "The current session will attempt to use a fallback capture method."sv;
+        if (config::video.capture == "portal-virtual") {
+          BOOST_LOG(info) << "Portal virtual display is awaiting user permission."sv;
+        } else {
+          BOOST_LOG(fatal) << "Portal capture is awaiting user permission. "sv
+                           << "The current session will attempt to use a fallback capture method."sv;
+        }
         std::call_once(portal::xdg_worker_flag, []() {
           portal::xdg_worker = std::jthread([]() {
             try {
@@ -1472,9 +1476,9 @@ namespace platf {
     // When Portal is explicitly selected, probe it first so other capture methods can be considered for fallback capture.
 #ifdef SUNSHINE_BUILD_PORTAL
     bool portal_available = false;
-    if (selected_capture == "portal") {
+    if (selected_capture == "portal" || selected_capture == "portal-virtual") {
       portal_available = verify_portal();
-      if (!portal_available) {
+      if (!portal_available && selected_capture == "portal") {
         // Continue probing for fallback capture methods.
         selected_capture.clear();
       }
@@ -1515,17 +1519,6 @@ namespace platf {
     portal::set_capture_active(sources[source::PORTAL]);
 #endif
 
-    if (sources.none()) {
-      BOOST_LOG(error) << "Unable to initialize capture method"sv;
-      log_missing_graphical_session_hint();
-      return nullptr;
-    }
-
-    if (!gladLoaderLoadEGL(NULL)) {
-      BOOST_LOG(error) << "Failed to load EGL library symbols"sv;
-      return nullptr;
-    }
-
 #ifdef SUNSHINE_BUILD_PORTAL
     class deinit_t: public platf::deinit_t {
     public:
@@ -1546,7 +1539,23 @@ namespace platf {
         }
       }
     };
+
+    if (selected_capture == "portal-virtual" && sources.none() && portal::xdg_worker.joinable()) {
+      // Keep the permission worker tied to Sunshine's lifetime even without a fallback capture backend.
+      return std::make_unique<deinit_t>();
+    }
 #endif
+
+    if (sources.none()) {
+      BOOST_LOG(error) << "Unable to initialize capture method"sv;
+      log_missing_graphical_session_hint();
+      return nullptr;
+    }
+
+    if (!gladLoaderLoadEGL(NULL)) {
+      BOOST_LOG(error) << "Failed to load EGL library symbols"sv;
+      return nullptr;
+    }
 
     return std::make_unique<deinit_t>();
   }

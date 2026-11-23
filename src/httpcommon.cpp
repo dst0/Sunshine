@@ -5,9 +5,18 @@
 #define BOOST_BIND_GLOBAL_PLACEHOLDERS
 
 // standard includes
+#include <atomic>
+#include <cerrno>
+#include <charconv>
 #include <filesystem>
 #include <fstream>
 #include <utility>
+
+#ifndef _WIN32
+  #include <fcntl.h>
+  #include <sys/stat.h>
+  #include <unistd.h>
+#endif
 
 // lib includes
 #include <boost/asio/ssl/context.hpp>
@@ -172,6 +181,167 @@ namespace http {
   }
 
   /**
+   * @brief Shared atomic connection counter for @ref connection_limiter_t.
+   */
+  struct connection_limiter_t::state_t {
+    /**
+     * @brief RAII slot lease decrementing @ref state_t on destruction.
+     */
+    struct lease_t {
+      /**
+       * @brief Acquire ownership of one counted connection slot.
+       *
+       * @param owner Shared counter state.
+       */
+      explicit lease_t(std::shared_ptr<state_t> owner):
+          state(std::move(owner)) {}
+
+      std::shared_ptr<state_t> state;  ///< Accounting owner.
+
+      ~lease_t() {
+        if (state) {
+          state->active.fetch_sub(1, std::memory_order_relaxed);
+        }
+      }
+    };
+
+    /**
+     * @brief Construct counter state with a maximum connection limit.
+     *
+     * @param max_connections Maximum concurrent leases.
+     */
+    explicit state_t(const std::size_t max_connections):
+        limit(max_connections) {}
+
+    std::atomic<std::size_t> active {0};  ///< Currently leased connection count.
+    std::size_t limit = 0;  ///< Maximum concurrent leases.
+  };
+
+  namespace {
+
+#ifndef _WIN32
+    /**
+     * @brief Create or truncate a file with owner-only (`0600`) permissions before writing bytes.
+     *
+     * @param path Destination path.
+     * @param content Contents to write.
+     * @return `0` on success, `-1` on failure.
+     */
+    int write_private_file(const std::string &path, const std::string_view content) {
+      const int fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, S_IRUSR | S_IWUSR);
+      if (fd < 0) {
+        return -1;
+      }
+
+      if (::fchmod(fd, S_IRUSR | S_IWUSR) != 0) {
+        ::close(fd);
+        return -1;
+      }
+
+      const char *data = content.data();
+      std::size_t remaining = content.size();
+      while (remaining > 0) {
+        const auto written = ::write(fd, data, remaining);
+        if (written < 0) {
+          if (errno == EINTR) {
+            continue;
+          }
+          ::close(fd);
+          return -1;
+        }
+        data += written;
+        remaining -= static_cast<std::size_t>(written);
+      }
+
+      return ::close(fd) == 0 ? 0 : -1;
+    }
+#endif
+  }  // namespace
+
+  connection_limiter_t::connection_limiter_t(const std::size_t max_connections):
+      state_(std::make_shared<state_t>(max_connections)) {}
+
+  std::shared_ptr<void> connection_limiter_t::try_acquire() {
+    auto current = state_->active.load(std::memory_order_relaxed);
+    while (current < state_->limit) {
+      if (state_->active.compare_exchange_weak(current, current + 1, std::memory_order_acq_rel, std::memory_order_relaxed)) {
+        return std::make_shared<state_t::lease_t>(state_);
+      }
+    }
+    return {};
+  }
+
+  bool has_canonical_header_lines(std::string_view raw) {
+    auto end = raw.find("\r\n");
+    if (end == std::string_view::npos) {
+      return false;
+    }
+    const auto request_line = raw.substr(0, end);
+    if (request_line.empty() ||
+        request_line.find('\n') != std::string_view::npos ||
+        request_line.find('\r') != std::string_view::npos ||
+        request_line.find('\0') != std::string_view::npos) {
+      return false;
+    }
+    raw.remove_prefix(end + 2);
+    while (raw != "\r\n") {
+      end = raw.find("\r\n");
+      if (end == std::string_view::npos || end == 0) {
+        return false;
+      }
+      const auto line = raw.substr(0, end);
+      const auto colon = line.find(':');
+      if (colon == 0 || colon == std::string_view::npos) {
+        return false;
+      }
+      for (const unsigned char ch : line.substr(0, colon)) {
+        if (!((ch >= 'A' && ch <= 'Z') ||
+              (ch >= 'a' && ch <= 'z') ||
+              (ch >= '0' && ch <= '9') ||
+              std::string_view("!#$%&'*+-.^_`|~").find(ch) != std::string_view::npos)) {
+          return false;
+        }
+      }
+      if (line.find('\0') != std::string_view::npos ||
+          line.find('\r') != std::string_view::npos ||
+          line.find('\n') != std::string_view::npos) {
+        return false;
+      }
+      raw.remove_prefix(end + 2);
+    }
+    return true;
+  }
+
+  bool validate_request_framing(
+    const std::string_view raw_header,
+    const SimpleWeb::CaseInsensitiveMultimap &header,
+    const std::size_t max_body_size,
+    std::size_t *content_length
+  ) {
+    if (!has_canonical_header_lines(raw_header)) {
+      return false;
+    }
+    if (header.count("Content-Length") > 1 || header.count("Transfer-Encoding") > 0) {
+      return false;
+    }
+    std::size_t length = 0;
+    if (const auto it = header.find("Content-Length"); it != header.end()) {
+      const auto &value = it->second;
+      const auto [end, error] = std::from_chars(value.data(), value.data() + value.size(), length);
+      if (value.empty() || error != std::errc {} || end != value.data() + value.size()) {
+        return false;
+      }
+    }
+    if (length > max_body_size) {
+      return false;
+    }
+    if (content_length) {
+      *content_length = length;
+    }
+    return true;
+  }
+
+  /**
    * @brief Generate HTTPS credential files from the provided key and certificate paths.
    */
   int create_creds(const std::string &pkey, const std::string &cert) {
@@ -186,22 +356,33 @@ namespace http {
     cert_dir.remove_filename();
 
     std::error_code err_code {};
-    fs::create_directories(pkey_dir, err_code);
-    if (err_code) {
-      BOOST_LOG(error) << "Couldn't create directory ["sv << pkey_dir << "] :"sv << err_code.message();
-      return -1;
+    if (!pkey_dir.empty()) {
+      fs::create_directories(pkey_dir, err_code);
+      if (err_code) {
+        BOOST_LOG(error) << "Couldn't create directory ["sv << pkey_dir << "] :"sv << err_code.message();
+        return -1;
+      }
     }
 
-    fs::create_directories(cert_dir, err_code);
-    if (err_code) {
-      BOOST_LOG(error) << "Couldn't create directory ["sv << cert_dir << "] :"sv << err_code.message();
-      return -1;
+    if (!cert_dir.empty()) {
+      fs::create_directories(cert_dir, err_code);
+      if (err_code) {
+        BOOST_LOG(error) << "Couldn't create directory ["sv << cert_dir << "] :"sv << err_code.message();
+        return -1;
+      }
     }
 
+#ifdef _WIN32
     if (file_handler::write_file(pkey.c_str(), creds.pkey)) {
       BOOST_LOG(error) << "Couldn't open ["sv << config::nvhttp.pkey << ']';
       return -1;
     }
+#else
+    if (write_private_file(pkey, creds.pkey) != 0) {
+      BOOST_LOG(error) << "Couldn't open ["sv << pkey << ']';
+      return -1;
+    }
+#endif
 
     if (file_handler::write_file(cert.c_str(), creds.x509)) {
       BOOST_LOG(error) << "Couldn't open ["sv << config::nvhttp.cert << ']';

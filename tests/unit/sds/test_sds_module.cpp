@@ -158,6 +158,7 @@ namespace {
       deps.make_clipboard_backend = backend_available ? test_utils::sds::fake_backend_factory(clipboard) : std::function<std::unique_ptr<sds::clipboard::backend_t>()> {[]() {
         return std::unique_ptr<sds::clipboard::backend_t> {};
       }};
+      deps.stage_file_clipboard = stage_override;
       deps.observe_sessions = false;
       ASSERT_EQ(sds::start(options, std::move(deps)), 0);
     }
@@ -236,6 +237,7 @@ namespace {
     std::shared_ptr<test_utils::sds::fake_clipboard_state_t> clipboard;  ///< Fake backend state.
     bool backend_available = true;  ///< Whether the factory returns a backend.
     std::function<bool(std::string_view)> stream_override;  ///< Overrides the stream checker.
+    std::function<std::shared_ptr<const sds::file_clipboard::stage_t>(std::string_view, const std::function<bool()> &)> stage_override;  ///< Overrides file clipboard staging.
     std::mutex mutex;  ///< Protects clients and streaming.
     std::map<std::string, sds::client_t> clients;  ///< Paired clients.
     std::set<std::string> streaming;  ///< Active streams.
@@ -369,6 +371,101 @@ TEST_F(SdsModuleTest, NativeFileClipboardBaselineNeverSendsDataAndEpochEndsOnRec
   EXPECT_EQ(clipboard->write_count(), 0);
 }
 
+TEST_F(SdsModuleTest, ResetFileClipboardReleasesRetiredLeasesAfterGracePeriod) {
+  using enum sds::op_e;
+  options.file_clipboard = true;
+  options.file_clipboard_lease_grace = 60ms;
+  options.file_clipboard_lease_ttl = 60s;
+  {
+    const std::lock_guard lock {clipboard->mutex};
+    clipboard->native_file_clipboard = true;
+  }
+  stage_override = [](std::string_view, const std::function<bool()> &) {
+    return sds::file_clipboard::make_test_stage("copy\nfile:///tmp/synthetic.txt");
+  };
+  start();
+
+  auto publish_one = [&]() {
+    sds::on_stream_state(CERT_A, true);
+    sds::drain_for_test();
+    const auto baseline = call(file_clipboard_get);
+    if (baseline.status != 204) {
+      return baseline;
+    }
+    auto push = req(CERT_A, {}, R"({"files":[{"name":"synthetic.txt","data":"eA=="}]})");
+    push.content_type = "application/json";
+    push.file_clipboard_seq = header(baseline, "X-SDS-Clipboard-Seq");
+    push.file_clipboard_epoch = header(baseline, "X-SDS-Clipboard-Epoch");
+    return call(file_clipboard_put, std::move(push));
+  };
+
+  // Disconnects retire ownership and release leases after the short grace period instead of 3 minutes.
+  for (int cycle = 0; cycle < 5; ++cycle) {
+    ASSERT_EQ(publish_one().status, 204) << "cycle " << cycle;
+    set_streaming(CERT_A, false);
+    sds::on_stream_state(CERT_A, false);
+    sds::drain_for_test();
+    EXPECT_EQ(sds::state_for_test(CERT_A).file_clipboard_leases, 1u);
+    std::this_thread::sleep_for(90ms);
+    EXPECT_EQ(sds::state_for_test(CERT_A).file_clipboard_leases, 0u);
+    set_streaming(CERT_A, true);
+  }
+
+  // Four rapid disconnects within the grace window fill the 4 lease slots, then recover once grace elapses.
+  options.file_clipboard_lease_grace = 300ms;
+  start();
+  for (int i = 0; i < 4; ++i) {
+    ASSERT_EQ(publish_one().status, 204) << "fill " << i;
+    set_streaming(CERT_A, false);
+    sds::on_stream_state(CERT_A, false);
+    sds::drain_for_test();
+    set_streaming(CERT_A, true);
+  }
+  EXPECT_EQ(sds::state_for_test(CERT_A).file_clipboard_leases, 4u);
+  EXPECT_EQ(publish_one().status, 429);
+
+  std::this_thread::sleep_for(350ms);
+  EXPECT_EQ(sds::state_for_test(CERT_A).file_clipboard_leases, 0u);
+  ASSERT_EQ(publish_one().status, 204);
+
+  // Permission change via on_client_changed also retires and schedules short grace release.
+  set_permission(CERT_A, sds::permission_e::file_upload, false);
+  sds::on_client_changed(CERT_A);
+  sds::drain_for_test();
+  EXPECT_EQ(sds::state_for_test(CERT_A).file_clipboard_leases, 1u);
+  std::this_thread::sleep_for(350ms);
+  EXPECT_EQ(sds::state_for_test(CERT_A).file_clipboard_leases, 0u);
+
+  // Revocation right before responding (deferred_failure after publish_file_clipboard) retires and frees too.
+  set_permission(CERT_A, sds::permission_e::file_upload, true);
+  options.file_clipboard_lease_grace = 60ms;
+  start();
+  sds::on_stream_state(CERT_A, true);
+  sds::drain_for_test();
+  const auto baseline = call(file_clipboard_get);
+  ASSERT_EQ(baseline.status, 204);
+
+  {
+    const std::lock_guard lock {clipboard->mutex};
+    clipboard->on_publish = [this]() {
+      set_streaming(CERT_A, false);
+    };
+  }
+  auto push = req(CERT_A, {}, R"({"files":[{"name":"late.txt","data":"eA=="}]})");
+  push.content_type = "application/json";
+  push.file_clipboard_seq = header(baseline, "X-SDS-Clipboard-Seq");
+  push.file_clipboard_epoch = header(baseline, "X-SDS-Clipboard-Epoch");
+  const auto revoked_reply = call(file_clipboard_put, std::move(push));
+  {
+    const std::lock_guard lock {clipboard->mutex};
+    clipboard->on_publish = nullptr;
+  }
+  EXPECT_EQ(revoked_reply.status, 409);
+  EXPECT_EQ(sds::state_for_test(CERT_A).file_clipboard_leases, 1u);
+  std::this_thread::sleep_for(90ms);
+  EXPECT_EQ(sds::state_for_test(CERT_A).file_clipboard_leases, 0u);
+}
+
 #ifdef __linux__
 TEST_F(SdsModuleTest, NativeFileClipboardReadsCompleteLocalCopyAndRejectsNonFiles) {
   const auto allowed = [] { return true; };
@@ -425,6 +522,78 @@ TEST_F(SdsModuleTest, NativeFileClipboardStagesPrivateFilesAndRejectsUnsafeBundl
   staged.reset();
   EXPECT_FALSE(fs::exists(path));
   EXPECT_FALSE(fs::exists(path.parent_path()));
+}
+
+TEST_F(SdsModuleTest, NativeFileClipboardRejectsCredentialAndSunshineConfigPaths) {
+  const auto allowed = [] { return true; };
+  const auto offer_for = [](const fs::path &p) {
+    return "copy\nfile://" + p.string();
+  };
+
+  const std::vector<fs::path> forbidden_dirs {
+    base / ".ssh",
+    base / ".gnupg",
+    base / ".config" / "sunshine",
+    base / "sds-minipc-sunshine",
+    base / "sds-pc2-sunshine",
+    base / "sds-custom-sunshine",
+    base / "sds-minipc-display",
+  };
+  std::vector<fs::path> forbidden_files;
+  for (const auto &dir : forbidden_dirs) {
+    fs::create_directories(dir);
+    const auto file = dir / "secret.txt";
+    test_utils::sds::write_file(file, "secret");
+    forbidden_files.push_back(file);
+  }
+
+  const auto custom_state_dir = base / "custom_state";
+  const auto custom_creds_dir = base / "credentials";
+  const auto custom_xdg = base / "xdg_cfg";
+  fs::create_directories(custom_state_dir);
+  fs::create_directories(custom_creds_dir);
+  fs::create_directories(custom_xdg / "sunshine");
+  const auto state_file = custom_state_dir / "sunshine_state.json";
+  const auto pkey_file = custom_creds_dir / "cakey.pem";
+  const auto sibling_cert = custom_creds_dir / "cacert.pem";
+  const auto xdg_secret = custom_xdg / "sunshine" / "cakey.pem";
+  test_utils::sds::write_file(state_file, "{}");
+  test_utils::sds::write_file(pkey_file, "key");
+  test_utils::sds::write_file(sibling_cert, "cert");
+  test_utils::sds::write_file(xdg_secret, "xdgkey");
+
+  const auto saved_file_state = config::nvhttp.file_state;
+  const auto saved_creds_file = config::sunshine.credentials_file;
+  const auto saved_pkey = config::nvhttp.pkey;
+  const auto *old_xdg = std::getenv("XDG_CONFIG_HOME");
+  const std::optional<std::string> saved_xdg = old_xdg ? std::optional<std::string> {old_xdg} : std::nullopt;
+  auto restore = util::fail_guard([&]() {
+    config::nvhttp.file_state = saved_file_state;
+    config::sunshine.credentials_file = saved_creds_file;
+    config::nvhttp.pkey = saved_pkey;
+    if (saved_xdg) {
+      ::setenv("XDG_CONFIG_HOME", saved_xdg->c_str(), 1);
+    } else {
+      ::unsetenv("XDG_CONFIG_HOME");
+    }
+  });
+  config::nvhttp.file_state = state_file.string();
+  config::sunshine.credentials_file = state_file.string();
+  config::nvhttp.pkey = pkey_file.string();
+  ::setenv("XDG_CONFIG_HOME", custom_xdg.c_str(), 1);
+
+  forbidden_files.push_back(state_file);
+  forbidden_files.push_back(pkey_file);
+  forbidden_files.push_back(sibling_cert);
+  forbidden_files.push_back(xdg_secret);
+
+  for (const auto &path : forbidden_files) {
+    EXPECT_FALSE(sds::file_clipboard::read_offer(offer_for(path), allowed)) << "must reject " << path;
+  }
+
+  const auto safe_file = base / "sunshine_notes.txt";
+  test_utils::sds::write_file(safe_file, "ok");
+  EXPECT_TRUE(sds::file_clipboard::read_offer(offer_for(safe_file), allowed));
 }
 #endif
 

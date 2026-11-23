@@ -54,6 +54,7 @@ namespace sds::clipboard::x11 {
     using steady = std::chrono::steady_clock;
 
     constexpr std::size_t property_pool_size = 8;
+    constexpr std::size_t max_outgoing_transfers = 8;
     constexpr std::size_t default_incr_chunk = 256 * 1024;
     constexpr auto write_wait = 3s;
     constexpr auto server_time_wait = 1s;
@@ -865,9 +866,15 @@ namespace sds::clipboard::x11 {
         const auto [bytes, type] = *data;
         if (bytes.size() > chunk_) {
           // INCR: announce a lower bound of the size, then send chunks as the requestor deletes the property
-          std::erase_if(outgoing_, [&](const outgoing_t &t) {
+          const auto existing = std::ranges::find_if(outgoing_, [&](const outgoing_t &t) {
             return t.requestor == requestor && t.property == property;
           });
+          if (existing == outgoing_.end() && outgoing_.size() >= max_outgoing_transfers) {
+            return false;
+          }
+          if (existing != outgoing_.end()) {
+            outgoing_.erase(existing);
+          }
           XSelectInput(dpy_, requestor, PropertyChangeMask | StructureNotifyMask);
           const long size = static_cast<long>(bytes.size());
           XChangeProperty(dpy_, requestor, property, atoms_.incr, 32, PropModeReplace, reinterpret_cast<const unsigned char *>(&size), 1);
@@ -1178,19 +1185,57 @@ namespace sds::clipboard::x11 {
       }
 
       /**
-       * @brief Read and delete one INCR chunk from our property.
-       *
-       * @return Chunk bytes, or nullopt when the property is missing or not 8-bit.
+       * @brief Outcome of probing/reading one INCR chunk property.
        */
-      std::optional<std::vector<std::uint8_t>> take_chunk(Atom property) {
+      struct chunk_read_t {
+        enum class state_e {
+          none,  ///< Property missing or read failed.
+          eof,  ///< Zero-length INCR terminator.
+          aborted,  ///< Draining, invalid format, or oversized chunk (deleted without fetching payload).
+          data,  ///< Valid chunk payload in `bytes`.
+        };
+
+        state_e state = state_e::none;
+        std::vector<std::uint8_t> bytes;
+      };
+
+      /**
+       * @brief Probe, read (when within cap and not draining), and delete one INCR chunk from our property.
+       *
+       * @param property Property atom on our window.
+       * @param cap_remaining Maximum bytes accepted, or `std::nullopt` when draining.
+       * @return Chunk outcome and payload bytes when `state == data`.
+       */
+      chunk_read_t take_chunk(Atom property, std::optional<std::size_t> cap_remaining) {
+        property_t header;
+        if (XGetWindowProperty(dpy_, window_, property, 0, 0, False, AnyPropertyType, &header.type, &header.format, &header.items, &header.bytes_after, &header.data) != Success || header.type == None) {
+          return {chunk_read_t::state_e::none, {}};
+        }
+        if (header.bytes_after == 0) {
+          XDeleteProperty(dpy_, window_, property);
+          XFlush(dpy_);
+          return {chunk_read_t::state_e::eof, {}};
+        }
+        const bool draining = !cap_remaining || std::ranges::any_of(draining_, [property](const drain_t &d) {
+          return d.property == property;
+        });
+        if (draining || header.format != 8 || header.bytes_after > *cap_remaining) {
+          XDeleteProperty(dpy_, window_, property);
+          XFlush(dpy_);
+          return {chunk_read_t::state_e::aborted, {}};
+        }
         property_t chunk;
-        if (XGetWindowProperty(dpy_, window_, property, 0, 0x1FFFFFFF, True, AnyPropertyType, &chunk.type, &chunk.format, &chunk.items, &chunk.bytes_after, &chunk.data) != Success || chunk.type == None) {
-          return std::nullopt;
+        if (XGetWindowProperty(dpy_, window_, property, 0, static_cast<long>((header.bytes_after + 3) / 4), True, AnyPropertyType, &chunk.type, &chunk.format, &chunk.items, &chunk.bytes_after, &chunk.data) != Success || chunk.type == None) {
+          return {chunk_read_t::state_e::none, {}};
         }
-        if (chunk.items != 0 && chunk.format != 8) {
-          return std::nullopt;
+        if ((chunk.items != 0 && chunk.format != 8) || chunk.bytes_after > 0 || chunk.items > *cap_remaining) {
+          if (chunk.bytes_after > 0) {
+            XDeleteProperty(dpy_, window_, property);
+            XFlush(dpy_);
+          }
+          return {chunk_read_t::state_e::aborted, {}};
         }
-        return std::vector<std::uint8_t>(chunk.data, chunk.data + chunk.items);
+        return {chunk_read_t::state_e::data, std::vector<std::uint8_t>(chunk.data, chunk.data + chunk.items)};
       }
 
       /**
@@ -1209,22 +1254,23 @@ namespace sds::clipboard::x11 {
 
         if (!reads_.empty() && reads_.front()->active && reads_.front()->incr && event.atom == reads_.front()->property) {
           auto &op = *reads_.front();
-          auto chunk = take_chunk(event.atom);
-          if (!chunk) {
+          const std::size_t remaining = op.cap >= op.buffer.size() ? op.cap - op.buffer.size() : 0;
+          auto chunk = take_chunk(event.atom, remaining);
+          if (chunk.state == chunk_read_t::state_e::none) {
             return;
           }
-          if (chunk->empty()) {
+          if (chunk.state == chunk_read_t::state_e::eof) {
             op.incr = false;
             advance(op, std::move(op.buffer));
             return;
           }
-          if (op.buffer.size() + chunk->size() > op.cap) {
+          if (chunk.state == chunk_read_t::state_e::aborted) {
             op.incr = false;
             drain(op.property);
             advance(op, std::nullopt);
             return;
           }
-          op.buffer.insert(op.buffer.end(), chunk->begin(), chunk->end());
+          op.buffer.insert(op.buffer.end(), chunk.bytes.begin(), chunk.bytes.end());
           return;
         }
 
@@ -1232,8 +1278,8 @@ namespace sds::clipboard::x11 {
           return d.property == event.atom;
         });
         if (drain_it != draining_.end()) {
-          const auto chunk = take_chunk(event.atom);
-          if (chunk && chunk->empty()) {
+          const auto chunk = take_chunk(event.atom, std::nullopt);
+          if (chunk.state == chunk_read_t::state_e::eof) {
             draining_.erase(drain_it);
           } else {
             drain_it->deadline = steady::now() + options_.transfer_timeout;

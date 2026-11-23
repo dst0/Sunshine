@@ -200,3 +200,53 @@ TEST_F(ClientAuthorizationTest, ConcurrentStateChangesRemainConsistent) {
   ASSERT_TRUE(nvhttp::set_client_enabled(uuid, false));
   EXPECT_FALSE(nvhttp::test_support::authorize_client_certificate(credentials.x509));
 }
+
+TEST_F(ClientAuthorizationTest, GetClientStatusFailsClosedWhenMissing) {
+  const auto missing_credentials = test_utils::certificates::generate_ca_credentials("Unpaired Client");
+  const auto missing = nvhttp::test_support::get_client_status(missing_credentials.x509);
+  EXPECT_FALSE(missing.first);
+  EXPECT_TRUE(missing.second.empty());
+
+  const auto paired_credentials = test_utils::certificates::generate_ca_credentials("Paired Client");
+  const auto uuid = nvhttp::test_support::add_client("laptop", paired_credentials.x509, false);
+  ASSERT_FALSE(uuid.empty());
+
+  const auto disabled = nvhttp::test_support::get_client_status(paired_credentials.x509);
+  EXPECT_FALSE(disabled.first);
+  EXPECT_EQ(disabled.second, "laptop");
+
+  ASSERT_TRUE(nvhttp::set_client_enabled(uuid, true));
+  const auto enabled = nvhttp::test_support::get_client_status(paired_credentials.x509);
+  EXPECT_TRUE(enabled.first);
+  EXPECT_EQ(enabled.second, "laptop");
+}
+
+TEST_F(ClientAuthorizationTest, GetAllClientCertsReturnsSnapshotOfPairedCertificates) {
+  const auto creds_a = test_utils::certificates::generate_ca_credentials("Snapshot A");
+  const auto creds_b = test_utils::certificates::generate_ca_credentials("Snapshot B");
+  ASSERT_FALSE(nvhttp::test_support::add_client("a", creds_a.x509, true).empty());
+  ASSERT_FALSE(nvhttp::test_support::add_client("b", creds_b.x509, false).empty());
+
+  auto x509_a = crypto::x509(creds_a.x509);
+  auto x509_b = crypto::x509(creds_b.x509);
+  const auto certs = nvhttp::get_all_client_certs();
+  EXPECT_EQ(certs.size(), 2u);
+  EXPECT_NE(std::ranges::find(certs, crypto::pem(x509_a)), certs.end());
+  EXPECT_NE(std::ranges::find(certs, crypto::pem(x509_b)), certs.end());
+}
+
+TEST(NvhttpSurroundParamsTest, AcceptsOnlyOneToSixteenAsciiDigits) {
+  EXPECT_TRUE(nvhttp::test_support::is_valid_surround_params("0"));
+  EXPECT_TRUE(nvhttp::test_support::is_valid_surround_params("65536"));
+  EXPECT_TRUE(nvhttp::test_support::is_valid_surround_params("1234567890123456"));
+  EXPECT_EQ(nvhttp::test_support::sanitize_surround_params("65536"), "65536");
+
+  EXPECT_FALSE(nvhttp::test_support::is_valid_surround_params(""));
+  EXPECT_FALSE(nvhttp::test_support::is_valid_surround_params("12345678901234567"));
+  EXPECT_FALSE(nvhttp::test_support::is_valid_surround_params("-1"));
+  EXPECT_FALSE(nvhttp::test_support::is_valid_surround_params("+10"));
+  EXPECT_FALSE(nvhttp::test_support::is_valid_surround_params("12;echo"));
+  EXPECT_FALSE(nvhttp::test_support::is_valid_surround_params("12a"));
+  EXPECT_TRUE(nvhttp::test_support::sanitize_surround_params("12;echo").empty());
+  EXPECT_TRUE(nvhttp::test_support::sanitize_surround_params("12345678901234567").empty());
+}

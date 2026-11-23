@@ -29,7 +29,11 @@ namespace test_utils::sds {
     int stops = 0;  ///< stop() calls.
     int reads = 0;  ///< read() calls.
     bool native_file_clipboard = false;  ///< Allow tests to model the isolated X11 native selection.
-    std::uint64_t generation = 1;
+    std::uint64_t generation = 1;  ///< Monotonic clipboard selection generation.
+    std::uint64_t retired_calls = 0;  ///< Number of retire_file_clipboard() calls.
+    std::vector<std::uint64_t> retired_generations;  ///< Generations passed to retire_file_clipboard().
+    std::vector<std::string> published_offers;  ///< Offers passed to publish_file_clipboard().
+    std::function<void()> on_publish;  ///< Optional hook invoked after publish_file_clipboard() commits.
     bool started = false;  ///< Currently watching.
     bool fail_start = false;  ///< Make start() fail.
     bool fail_write = false;  ///< Make write() fail.
@@ -129,6 +133,39 @@ namespace test_utils::sds {
     std::optional<std::uint64_t> file_clipboard_generation() override {
       const std::lock_guard lock {state_->mutex};
       return state_->started ? std::optional {state_->generation} : std::nullopt;
+    }
+
+    std::optional<std::uint64_t> publish_file_clipboard(std::uint64_t expected, std::string offer, std::function<bool()> allowed) override {
+      if (allowed && !allowed()) {
+        return std::nullopt;
+      }
+      std::function<void()> hook;
+      std::uint64_t published_generation = 0;
+      {
+        const std::lock_guard lock {state_->mutex};
+        if (!state_->started || !state_->native_file_clipboard || state_->generation != expected) {
+          return std::nullopt;
+        }
+        ++state_->generation;
+        published_generation = state_->generation;
+        state_->published_offers.push_back(offer);
+        state_->content = ::sds::clipboard::item_t {std::nullopt, std::nullopt, std::move(offer)};
+        hook = state_->on_publish;
+      }
+      if (hook) {
+        hook();
+      }
+      return published_generation;
+    }
+
+    void retire_file_clipboard(std::uint64_t generation) override {
+      const std::lock_guard lock {state_->mutex};
+      ++state_->retired_calls;
+      state_->retired_generations.push_back(generation);
+      if (state_->generation == generation && state_->content && state_->content->file_offer) {
+        state_->content.reset();
+        ++state_->generation;
+      }
     }
 
     [[nodiscard]] std::string_view name() const override {

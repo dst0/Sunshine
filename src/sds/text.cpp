@@ -232,14 +232,30 @@ namespace sds::text {
     }
 
     // Canonical ordering: stable-sort each run of non-starters by combining class.
-    for (std::size_t i = 1; i < decomposed.size(); ++i) {
-      for (std::size_t j = i; j > 0; --j) {
-        const auto current = combining_class(decomposed[j]);
-        const auto previous = combining_class(decomposed[j - 1]);
-        if (current == 0 || previous <= current) {
+    std::vector<std::pair<std::uint8_t, char32_t>> run;
+    std::size_t pos = 0;
+    while (pos < decomposed.size()) {
+      if (combining_class(decomposed[pos]) == 0) {
+        ++pos;
+        continue;
+      }
+      run.clear();
+      const std::size_t run_start = pos;
+      while (pos < decomposed.size()) {
+        const auto ccc = combining_class(decomposed[pos]);
+        if (ccc == 0) {
           break;
         }
-        std::swap(decomposed[j], decomposed[j - 1]);
+        run.emplace_back(ccc, decomposed[pos]);
+        ++pos;
+      }
+      if (run.size() > 1) {
+        std::stable_sort(run.begin(), run.end(), [](const auto &a, const auto &b) {
+          return a.first < b.first;
+        });
+        for (std::size_t i = 0; i < run.size(); ++i) {
+          decomposed[run_start + i] = run[i].second;
+        }
       }
     }
 

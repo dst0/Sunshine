@@ -597,3 +597,23 @@ TEST_F(SdsFilesTest, ExistingSymlinkAtTheTargetNameIsNotFollowed) {
   EXPECT_TRUE(fs::is_symlink(options.inbox / "notes.txt"));
 }
 #endif
+
+TEST_F(SdsFilesTest, OutboxRefusesFilesLargerThanFileMax) {
+  options.file_max = 1024;
+  manager = std::make_unique<sds::files::manager_t>(options);
+  fs::create_directories(options.outbox);
+  test_utils::sds::write_file(options.outbox / "oversized.bin", std::string(1025, 'x'));
+
+  const auto listing = manager->list_outbox();
+  ASSERT_EQ(listing.status, 200);
+  ASSERT_EQ(listing.json->at("files").size(), 1u);
+  const auto id = listing.json->at("files")[0]["id"].get<std::string>();
+
+  const auto head = manager->read_outbox(id, 0, 16);
+  EXPECT_EQ(head.status, 413);
+  EXPECT_EQ(head.error, "too_large");
+
+  const auto slice = manager->read_outbox(id, 100, 16);
+  EXPECT_EQ(slice.status, 413);
+  EXPECT_EQ(slice.error, "too_large");
+}

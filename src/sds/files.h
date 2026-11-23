@@ -45,11 +45,11 @@ namespace sds::files {
   /**
    * @brief Sanitize a file name according to DESIGN 6.4.
    *
-   * Rejects invalid UTF-8, empty names, `.` and `..`. Normalizes to NFC; replaces
-   * `/ \ : * ? " < > |`, C0/C1 controls, DEL and bidirectional formatting characters with `_`;
-   * strips trailing dots and spaces; replaces a leading `.` or `-` with `_`; prefixes Windows
-   * reserved device names with `_`; shortens to NAME_MAX_BYTES on a code point boundary keeping
-   * an extension of up to 32 bytes.
+   * Rejects names larger than 1024 bytes, invalid UTF-8, empty names, `.` and `..`. Normalizes
+   * to NFC; replaces `/ \ : * ? " < > |`, C0/C1 controls, DEL and bidirectional formatting
+   * characters with `_`; strips trailing dots and spaces; replaces a leading `.` or `-` with `_`;
+   * prefixes Windows reserved device names with `_`; shortens to NAME_MAX_BYTES on a code point
+   * boundary keeping an extension of up to 32 bytes.
    *
    * @param name Untrusted name.
    * @return Safe single path component, or no value when rejected.
@@ -310,9 +310,9 @@ namespace sds::files {
      * @brief Compute the id of an outbox entry.
      *
      * @param entry Metadata.
-     * @return 32 hex digits.
+     * @return 32 hex digits, or no value when key/HMAC initialization failed.
      */
-    std::string outbox_id(const fs::entry_t &entry) const;
+    std::optional<std::string> outbox_id(const fs::entry_t &entry) const;
 
     /**
      * @brief Signature of the cached listing used for change detection.
@@ -323,6 +323,7 @@ namespace sds::files {
 
     options_t options_;  ///< Configuration.
     std::array<unsigned char, 32> id_key_ {};  ///< Per-boot HMAC key for outbox ids.
+    bool id_key_ready_ = false;  ///< Whether id_key_ was initialized from the CSPRNG.
     std::map<std::string, upload_t, std::less<>> uploads_;  ///< Sessions by id.
     std::map<std::string, outbox_entry_t, std::less<>> outbox_;  ///< Outbox cache by id.
     std::optional<std::string> outbox_baseline_;  ///< Signature at the last change report.

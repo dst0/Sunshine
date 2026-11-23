@@ -6,6 +6,8 @@ vi.mock('../../src_assets/common/assets/web/Navbar.vue', () => ({
 }))
 
 import Troubleshooting from '../../src_assets/common/assets/web/Troubleshooting.vue'
+import { apiFetch, resetCsrfTokenCacheForTesting } from '../../src_assets/common/assets/web/fetch_utils.js'
+import { notifyKey } from '../../src_assets/common/assets/web/Notification.vue'
 import createSunshineI18n from '../../src_assets/common/assets/web/locale.js'
 import en from '../../src_assets/common/assets/web/public/assets/locale/en.json'
 
@@ -52,6 +54,9 @@ async function mountTroubleshooting(platform, gamepadDriver, licenseStatus = {},
     if (url === './api/clients/list') {
       return { json: async () => ({ status: true, named_certs: [] }) }
     }
+    if (url === './api/csrf-token') {
+      return { ok: true, status: 200, json: async () => ({ csrf_token: 'test-csrf-token' }) }
+    }
     return {
       ok: true,
       json: async () => ({ tag_name: 'v2026.914.1218.10', html_url: 'https://example.com/release' }),
@@ -70,6 +75,7 @@ async function mountTroubleshooting(platform, gamepadDriver, licenseStatus = {},
 }
 
 afterEach(() => {
+  resetCsrfTokenCacheForTesting()
   vi.unstubAllGlobals()
   vi.restoreAllMocks()
 })
@@ -306,5 +312,93 @@ describe('virtual input troubleshooting', () => {
     ])
     expect(wrapper.findAll('.permission-table-shell tbody button')).toHaveLength(2)
     wrapper.unmount()
+  })
+})
+
+describe('apiFetch CSRF handling', () => {
+  it('routes toggleClient POST requests through apiFetch with X-CSRF-Token', async () => {
+    const wrapper = await mountTroubleshooting('linux', 'none')
+    wrapper.vm.toggleClient('client-1', false)
+    await flushPromises()
+
+    expect(fetch).toHaveBeenCalledWith('./api/csrf-token', { method: 'GET' })
+    expect(fetch).toHaveBeenCalledWith('./api/clients/update', expect.objectContaining({
+      method: 'POST',
+      headers: expect.objectContaining({
+        'Content-Type': 'application/json',
+        'X-CSRF-Token': 'test-csrf-token',
+      }),
+      body: JSON.stringify({ uuid: 'client-1', enabled: false }),
+    }))
+    wrapper.unmount()
+  })
+
+  it('caches CSRF tokens across mutations and retries once when invalid or expired', async () => {
+    const notifySpy = vi.spyOn(notifyKey, 'error').mockImplementation(() => {})
+    let csrfFetches = 0
+    let attempt = 0
+    vi.stubGlobal('fetch', vi.fn(async (url, options) => {
+      if (url === './api/csrf-token') {
+        csrfFetches += 1
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({ csrf_token: `token-${csrfFetches}` }),
+        }
+      }
+      if (url === './api/config' && options?.method === 'POST') {
+        attempt += 1
+        if (attempt === 2) {
+          return {
+            ok: false,
+            status: 400,
+            clone: () => ({ json: async () => ({ error: 'CSRF token expired' }) }),
+          }
+        }
+        return { ok: true, status: 200, clone: () => ({ json: async () => ({ status: true }) }) }
+      }
+      return { ok: true, status: 200, json: async () => ({}) }
+    }))
+
+    // GET requests should neither fetch nor send a CSRF token.
+    await apiFetch('./api/logs', { method: 'GET' })
+    expect(csrfFetches).toBe(0)
+
+    // Two sequential POSTs reuse the cached token-1.
+    await apiFetch('./api/config', { method: 'POST', body: '{}' })
+    expect(csrfFetches).toBe(1)
+    expect(fetch).toHaveBeenLastCalledWith('./api/config', expect.objectContaining({
+      headers: expect.objectContaining({ 'X-CSRF-Token': 'token-1' }),
+    }))
+
+    // Second POST encounters 400 CSRF token expired -> refreshes to token-2 and retries once.
+    const retryResult = await apiFetch('./api/config', { method: 'POST', body: '{}' })
+    expect(retryResult.status).toBe(200)
+    expect(csrfFetches).toBe(2)
+    expect(fetch).toHaveBeenLastCalledWith('./api/config', expect.objectContaining({
+      headers: expect.objectContaining({ 'X-CSRF-Token': 'token-2' }),
+    }))
+    expect(notifySpy).not.toHaveBeenCalled()
+  })
+
+  it('notifies without retrying when Origin is rejected by CSRF protection', async () => {
+    const notifySpy = vi.spyOn(notifyKey, 'error').mockImplementation(() => {})
+    let postCalls = 0
+    vi.stubGlobal('fetch', vi.fn(async (url) => {
+      if (url === './api/csrf-token') {
+        return { ok: true, status: 200, json: async () => ({ csrf_token: 'token-1' }) }
+      }
+      postCalls += 1
+      return {
+        ok: false,
+        status: 400,
+        clone: () => ({ json: async () => ({ error: 'Origin not allowed' }) }),
+      }
+    }))
+
+    const response = await apiFetch('./api/restart', { method: 'POST' })
+    expect(response.status).toBe(400)
+    expect(postCalls).toBe(1)
+    expect(notifySpy).toHaveBeenCalledWith('_common.csrf_error_desc', '_common.csrf_error')
   })
 })

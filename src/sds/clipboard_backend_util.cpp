@@ -394,6 +394,10 @@ namespace sds::clipboard::util {
         offset += mask_count * 4;
       } else {
         // V2+ headers carry the masks at offset 40 (alpha at 52 for V3+)
+        const std::size_t required = compression == bi_alphabitfields ? 56 : 52;
+        if (header_size < required) {
+          return std::nullopt;
+        }
         for (std::size_t i = 0; i < 3; ++i) {
           masks[i] = read_le<std::uint32_t>(dib, 40 + i * 4);
         }

@@ -251,15 +251,64 @@ namespace sds::fs {
           return std::make_error_code(std::errc::invalid_argument);
         }
         const std::string component {name};
+#if defined(__linux__) && defined(O_PATH)
+        // Pin the target inode with O_PATH first so special files (e.g., FIFOs/devices) are never opened.
+        const int pin = ::openat(fd_, component.c_str(), O_PATH | O_NOFOLLOW | O_CLOEXEC);
+        if (pin < 0) {
+          return from_errno(errno);
+        }
+        struct stat st {};
+        if (::fstat(pin, &st) != 0) {
+          const int err = errno;
+          close_fd(pin);
+          return from_errno(err);
+        }
+        if (!S_ISREG(st.st_mode)) {
+          close_fd(pin);
+          return std::make_error_code(std::errc::invalid_argument);
+        }
+        const auto uid = ::geteuid();
+        if (st.st_uid != uid) {
+          close_fd(pin);
+          return std::make_error_code(std::errc::permission_denied);
+        }
+        const auto proc = "/proc/self/fd/" + std::to_string(pin);
+        const int fd = ::open(proc.c_str(), O_RDONLY | O_NONBLOCK | O_CLOEXEC);
+        const int open_err = errno;
+        close_fd(pin);
+        if (fd < 0) {
+          return from_errno(open_err);
+        }
+        struct stat check {};
+        if (::fstat(fd, &check) != 0) {
+          const int err = errno;
+          close_fd(fd);
+          return from_errno(err);
+        }
+        if (!S_ISREG(check.st_mode) || check.st_uid != uid || check.st_dev != st.st_dev || check.st_ino != st.st_ino) {
+          close_fd(fd);
+          return std::make_error_code(std::errc::invalid_argument);
+        }
+#else
         const int fd = ::openat(fd_, component.c_str(), O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC);
         if (fd < 0) {
           return from_errno(errno);
         }
         struct stat st {};
-        if (::fstat(fd, &st) != 0 || !S_ISREG(st.st_mode)) {
+        if (::fstat(fd, &st) != 0) {
+          const int err = errno;
+          close_fd(fd);
+          return from_errno(err);
+        }
+        if (!S_ISREG(st.st_mode)) {
           close_fd(fd);
           return std::make_error_code(std::errc::invalid_argument);
         }
+        if (st.st_uid != ::geteuid()) {
+          close_fd(fd);
+          return std::make_error_code(std::errc::permission_denied);
+        }
+#endif
         out = std::make_unique<posix_file_t>(fd);
         return {};
       }

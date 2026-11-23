@@ -22,6 +22,7 @@
 #include <boost/property_tree/json_parser.hpp>
 #include <boost/property_tree/ptree.hpp>
 #include <boost/property_tree/xml_parser.hpp>
+#include <openssl/ssl.h>
 #include <Simple-Web-Server/server_http.hpp>
 
 // local includes
@@ -83,6 +84,10 @@ namespace nvhttp {
       // Disabling TLS 1.0 and 1.1 (see RFC 8996)
       context.set_options(boost::asio::ssl::context::no_tlsv1);
       context.set_options(boost::asio::ssl::context::no_tlsv1_1);
+      SSL_CTX_set_min_proto_version(context.native_handle(), TLS1_3_VERSION);
+      if (SSL_CTX_set1_groups_list(context.native_handle(), "X25519MLKEM768") != 1) {
+        SSL_CTX_set1_groups_list(context.native_handle(), "X25519:P-256");
+      }
       context.use_certificate_chain_file(certification_file);
       context.use_private_key_file(private_key_file, boost::asio::ssl::context::pem);
       // The verified client identity is bound to the connection at handshake time, so the peer
@@ -90,6 +95,26 @@ namespace nvhttp {
       SSL_CTX_set_options(context.native_handle(), SSL_OP_NO_RENEGOTIATION);
       // Reject oversized requests before their body is buffered.
       config.max_request_streambuf_size = HTTPS_MAX_REQUEST_SIZE;
+      config.max_request_header_size = 64 * 1024;
+      config.timeout_content = 30;
+      auto limiter = std::make_shared<http::connection_limiter_t>(64);
+      on_connection_accepted = [limiter](const std::shared_ptr<Request> &request) {
+        auto lease = limiter->try_acquire();
+        if (!lease) {
+          return false;
+        }
+        request->connection_context(std::move(lease));
+        return true;
+      };
+      on_request_header = [](const std::shared_ptr<Request> &request) {
+        return http::validate_request_framing(request->raw_header, request->header, HTTPS_MAX_REQUEST_SIZE);
+      };
+      on_error = [](const std::shared_ptr<Request> &, const SimpleWeb::error_code &ec) {
+        if (ec == SimpleWeb::error::operation_aborted || ec == boost::asio::error::eof) {
+          return;
+        }
+        BOOST_LOG(debug) << "nvhttp HTTPS server transport error: "sv << ec.message();
+      };
     }
 
     std::function<std::optional<verified_client_t>(SSL *)> verify;  ///< Callback that validates a client's TLS certificate after handshake.
@@ -193,6 +218,26 @@ namespace nvhttp {
      */
     SunshineHTTPServer() {
       config.max_request_streambuf_size = HTTP_MAX_REQUEST_SIZE;
+      config.max_request_header_size = 64 * 1024;
+      config.timeout_content = 30;
+      auto limiter = std::make_shared<http::connection_limiter_t>(64);
+      on_connection_accepted = [limiter](const std::shared_ptr<Request> &request) {
+        auto lease = limiter->try_acquire();
+        if (!lease) {
+          return false;
+        }
+        request->connection_context(std::move(lease));
+        return true;
+      };
+      on_request_header = [](const std::shared_ptr<Request> &request) {
+        return http::validate_request_framing(request->raw_header, request->header, HTTP_MAX_REQUEST_SIZE);
+      };
+      on_error = [](const std::shared_ptr<Request> &, const SimpleWeb::error_code &ec) {
+        if (ec == SimpleWeb::error::operation_aborted || ec == boost::asio::error::eof) {
+          return;
+        }
+        BOOST_LOG(debug) << "nvhttp HTTP server transport error: "sv << ec.message();
+      };
     }
   };
 
@@ -630,6 +675,52 @@ namespace nvhttp {
     return uuid;
   }
 
+  namespace {
+    /**
+     * @brief Validate that a GameStream `surroundParams` string contains 1 to 16 ASCII digits.
+     *
+     * @param params Candidate parameter value.
+     * @return `true` when valid.
+     */
+    bool is_valid_surround_params_value(const std::string_view params) {
+      return !params.empty() && params.size() <= 16 && std::ranges::all_of(params, [](const unsigned char ch) {
+        return ch >= '0' && ch <= '9';
+      });
+    }
+
+    /**
+     * @brief Return `params` if valid (`^[0-9]{1,16}$`), otherwise an empty string.
+     *
+     * @param params Candidate parameter value.
+     * @return Sanitized parameter value.
+     */
+    std::string sanitize_surround_params_value(const std::string_view params) {
+      if (params.empty()) {
+        return {};
+      }
+      if (!is_valid_surround_params_value(params)) {
+        BOOST_LOG(warning) << "Ignoring invalid surroundParams parameter"sv;
+        return {};
+      }
+      return std::string {params};
+    }
+
+    /**
+     * @brief Write an HTTP 401 XML response and close the keep-alive socket after sending.
+     *
+     * @param response HTTPS response object.
+     */
+    void write_unauthorized(const resp_https_t &response) {
+      pt::ptree tree;
+      tree.put("root.<xmlattr>.status_code", 401);
+      tree.put("root.<xmlattr>.status_message", "The client is not authorized. Certificate verification failed.");
+      std::ostringstream data;
+      pt::write_xml(data, tree);
+      response->write(SimpleWeb::StatusCode::client_error_unauthorized, data.str());
+      response->close_connection_after_response = true;
+    }
+  }  // namespace
+
   /**
    * @brief Create launch session.
    *
@@ -671,7 +762,7 @@ namespace nvhttp {
     launch_session->appid = (int) util::from_view(get_arg(args, "appid", "unknown"));
     launch_session->enable_sops = util::from_view(get_arg(args, "sops", "0"));
     launch_session->surround_info = (int) util::from_view(get_arg(args, "surroundAudioInfo", "196610"));
-    launch_session->surround_params = (get_arg(args, "surroundParams", ""));
+    launch_session->surround_params = sanitize_surround_params_value(get_arg(args, "surroundParams", ""));
     launch_session->continuous_audio = util::from_view(get_arg(args, "continuousAudio", "0"));
     launch_session->gcmap = (int) util::from_view(get_arg(args, "gcmap", "0"));
     launch_session->enable_hdr = util::from_view(get_arg(args, "hdrMode", "0"));
@@ -1230,6 +1321,13 @@ namespace nvhttp {
   void pair(std::shared_ptr<typename SimpleWeb::ServerBase<T>::Response> response, std::shared_ptr<typename SimpleWeb::ServerBase<T>::Request> request) {
     print_req<T>(request);
 
+    if constexpr (std::is_same_v<SunshineHTTPS, T>) {
+      if (!verified_client(request)) {
+        write_unauthorized(response);
+        return;
+      }
+    }
+
     pt::ptree tree;
 
     auto fg = util::fail_guard([&tree, &response]() {
@@ -1393,6 +1491,11 @@ namespace nvhttp {
 
     int pair_status = 0;
     if constexpr (std::is_same_v<SunshineHTTPS, T>) {
+      if (!verified_client(request)) {
+        write_unauthorized(response);
+        return;
+      }
+
       auto args = request->parse_query_string();
       auto clientID = args.find("uniqueid"s);
 
@@ -1478,6 +1581,18 @@ namespace nvhttp {
     return named_cert_nodes;
   }
 
+  std::vector<std::string> get_all_client_certs() {
+    std::vector<std::string> certs;
+    std::lock_guard lock {client_auth_mutex()};
+    certs.reserve(client_root.named_devices.size());
+    for (const auto &named_cert : client_root.named_devices) {
+      if (!named_cert.cert.empty()) {
+        certs.push_back(named_cert.cert);
+      }
+    }
+    return certs;
+  }
+
   /**
    * @brief Build the GameStream application list response.
    *
@@ -1486,6 +1601,11 @@ namespace nvhttp {
    */
   void applist(resp_https_t response, req_https_t request) {
     print_req<SunshineHTTPS>(request);
+    if (!verified_client(request)) {
+      write_unauthorized(response);
+      return;
+    }
+
     proc::refresh(config::stream.file_apps);
 
     pt::ptree tree;
@@ -1523,6 +1643,12 @@ namespace nvhttp {
   void launch(bool &host_audio, resp_https_t response, req_https_t request) {
     print_req<SunshineHTTPS>(request);
 
+    const auto client = verified_client(request);
+    if (!client) {
+      write_unauthorized(response);
+      return;
+    }
+
     pt::ptree tree;
     bool revert_display_configuration {false};
     auto g = util::fail_guard([&]() {
@@ -1555,6 +1681,13 @@ namespace nvhttp {
       return;
     }
 
+    if (const auto surround_it = args.find("surroundParams"); surround_it != args.end() && !surround_it->second.empty() && !is_valid_surround_params_value(surround_it->second)) {
+      tree.put("root.resume", 0);
+      tree.put("root.<xmlattr>.status_code", 400);
+      tree.put("root.<xmlattr>.status_message", "Invalid surroundParams parameter");
+      return;
+    }
+
     auto appid = util::from_view(get_arg(args, "appid"));
 
     auto current_appid = proc::proc.running();
@@ -1562,15 +1695,6 @@ namespace nvhttp {
       tree.put("root.resume", 0);
       tree.put("root.<xmlattr>.status_code", 400);
       tree.put("root.<xmlattr>.status_message", "An app is already running on this host");
-
-      return;
-    }
-
-    const auto client = verified_client(request);
-    if (!client) {
-      tree.put("root.resume", 0);
-      tree.put("root.<xmlattr>.status_code", 401);
-      tree.put("root.<xmlattr>.status_message", "The client is not authorized. Certificate verification failed.");
 
       return;
     }
@@ -1650,6 +1774,12 @@ namespace nvhttp {
   void resume(bool &host_audio, resp_https_t response, req_https_t request) {
     print_req<SunshineHTTPS>(request);
 
+    const auto client = verified_client(request);
+    if (!client) {
+      write_unauthorized(response);
+      return;
+    }
+
     pt::ptree tree;
     auto g = util::fail_guard([&]() {
       std::ostringstream data;
@@ -1684,12 +1814,10 @@ namespace nvhttp {
       return;
     }
 
-    const auto client = verified_client(request);
-    if (!client) {
+    if (const auto surround_it = args.find("surroundParams"); surround_it != args.end() && !surround_it->second.empty() && !is_valid_surround_params_value(surround_it->second)) {
       tree.put("root.resume", 0);
-      tree.put("root.<xmlattr>.status_code", 401);
-      tree.put("root.<xmlattr>.status_message", "The client is not authorized. Certificate verification failed.");
-
+      tree.put("root.<xmlattr>.status_code", 400);
+      tree.put("root.<xmlattr>.status_message", "Invalid surroundParams parameter");
       return;
     }
 
@@ -1755,6 +1883,10 @@ namespace nvhttp {
    */
   void cancel(resp_https_t response, req_https_t request) {
     print_req<SunshineHTTPS>(request);
+    if (!verified_client(request)) {
+      write_unauthorized(response);
+      return;
+    }
 
     pt::ptree tree;
     auto g = util::fail_guard([&tree, &response]() {
@@ -1786,6 +1918,10 @@ namespace nvhttp {
    */
   void appasset(resp_https_t response, req_https_t request) {
     print_req<SunshineHTTPS>(request);
+    if (!verified_client(request)) {
+      write_unauthorized(response);
+      return;
+    }
 
     auto args = request->parse_query_string();
     auto app_image = proc::proc.get_app_image((int) util::from_view(get_arg(args, "appid")));
@@ -1940,13 +2076,13 @@ namespace nvhttp {
         std::string name = "nvhttp::" + std::to_string(web_server->config.port);
         platf::set_thread_name(name);
         web_server->start();
-      } catch (boost::system::system_error &err) {
+      } catch (const std::exception &err) {
         // It's possible the exception gets thrown after calling http_server->stop() from a different thread
         if (shutdown_event->peek()) {
           return;
         }
 
-        BOOST_LOG(fatal) << "Couldn't start http server on ports ["sv << port_https << ", "sv << port_https << "]: "sv << err.what();
+        BOOST_LOG(fatal) << "Couldn't start http server on ports ["sv << port_http << ", "sv << port_https << "]: "sv << err.what();
         shutdown_event->raise(true);
         return;
       }
@@ -2026,7 +2162,7 @@ namespace nvhttp {
         return {named_cert.enabled, named_cert.name};
       }
     }
-    return {true, {}};
+    return {false, {}};
   }
 
   std::optional<client_info_t> find_enabled_client(const std::string_view cert_pem) {
@@ -2101,6 +2237,35 @@ namespace nvhttp {
 
     void serverinfo_https(resp_https_t response, req_https_t request) {
       serverinfo<SunshineHTTPS>(std::move(response), std::move(request));
+    }
+
+    void applist_https(resp_https_t response, req_https_t request) {
+      applist(std::move(response), std::move(request));
+    }
+
+    void appasset_https(resp_https_t response, req_https_t request) {
+      appasset(std::move(response), std::move(request));
+    }
+
+    void cancel_https(resp_https_t response, req_https_t request) {
+      cancel(std::move(response), std::move(request));
+    }
+
+    void pair_https(resp_https_t response, req_https_t request) {
+      pair<SunshineHTTPS>(std::move(response), std::move(request));
+    }
+
+    std::pair<bool, std::string> get_client_status(const std::string_view cert_pem) {
+      std::lock_guard lock {client_auth_mutex()};
+      return nvhttp::get_client_status(cert_pem);
+    }
+
+    bool is_valid_surround_params(const std::string_view params) {
+      return is_valid_surround_params_value(params);
+    }
+
+    std::string sanitize_surround_params(const std::string_view params) {
+      return sanitize_surround_params_value(params);
     }
 
     std::unique_ptr<SimpleWeb::ServerBase<SimpleWeb::HTTP>> make_http_server() {

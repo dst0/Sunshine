@@ -17,6 +17,7 @@
 #include "clipboard.h"
 #include "events.h"
 #include "file_clipboard.h"
+#include "mic.h"
 #include "sds.h"
 #include "src/config.h"
 #include "src/logging.h"
@@ -238,6 +239,9 @@ namespace sds {
         }
         if (!deps_.make_clipboard_backend) {
           deps_.make_clipboard_backend = take_or_make_backend;
+        }
+        if (!deps_.stage_file_clipboard) {
+          deps_.stage_file_clipboard = file_clipboard::stage;
         }
 
         std::unique_ptr<clipboard::backend_t> backend;
@@ -540,6 +544,7 @@ namespace sds {
               state.clipboard_watching = clipboard_->watching();
               state.clipboard_content = clipboard_->has_content();
               state.clipboard_seq = clipboard_->seq();
+              state.file_clipboard_leases = file_clipboard_leases_.size();
               done.set_value();
             })) {
           future.wait();
@@ -891,8 +896,16 @@ namespace sds {
       void reset_file_clipboard() {
         file_clipboard_session_.reset();
         if (file_clipboard_owned_) {
-          file_clipboard_backend_->retire_file_clipboard(*file_clipboard_owned_);
+          const auto previous = *file_clipboard_owned_;
+          file_clipboard_backend_->retire_file_clipboard(previous);
           file_clipboard_owned_.reset();
+          if (shut_down_) {
+            file_clipboard_leases_.clear();
+          } else {
+            control_->post_at(worker_t::clock::now() + options_.file_clipboard_lease_grace, [this, previous]() {
+              file_clipboard_leases_.erase(previous);
+            });
+          }
         }
         // Keep the small, private lease until its timer fires: a file manager can
         // have already requested the URI and still be reading the staged bytes.
@@ -1001,7 +1014,7 @@ namespace sds {
                       respond(stale_file_clipboard());
                       return;
                     }
-                    auto staged = put ? file_clipboard::stage(body, allowed) : nullptr;
+                    auto staged = put ? deps_.stage_file_clipboard(body, allowed) : nullptr;
                     auto bundle = !put ? file_clipboard::read_offer(*item->file_offer, allowed) : std::nullopt;
                     if (!control_->post([this, op, put, cert, epoch, before, authority, staged = std::move(staged), bundle = std::move(bundle), reservation, respond]() mutable {
                           if (auto failure = deferred_failure(cert, op, authority)) {
@@ -1037,13 +1050,13 @@ namespace sds {
                             return;
                           }
                           if (file_clipboard_owned_) {
-                            control_->post_at(worker_t::clock::now() + 15s, [this, previous = *file_clipboard_owned_]() {
+                            control_->post_at(worker_t::clock::now() + options_.file_clipboard_lease_grace, [this, previous = *file_clipboard_owned_]() {
                               file_clipboard_leases_.erase(previous);
                             });
                           }
                           file_clipboard_owned_ = *committed;
                           file_clipboard_leases_.emplace(*committed, std::move(staged));
-                          control_->post_at(worker_t::clock::now() + 3min, [this, seq = *committed]() {
+                          control_->post_at(worker_t::clock::now() + options_.file_clipboard_lease_ttl, [this, seq = *committed]() {
                             if (file_clipboard_owned_ == seq) {
                               file_clipboard_backend_->retire_file_clipboard(seq);
                               file_clipboard_owned_.reset();
@@ -1411,6 +1424,7 @@ namespace sds {
     if (cert_pem.empty()) {
       return;
     }
+    mic::on_client_changed(cert_pem);
     if (const auto runtime = current(); runtime) {
       runtime->client_changed(std::string {cert_pem});
     }

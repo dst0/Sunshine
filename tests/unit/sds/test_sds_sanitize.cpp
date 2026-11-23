@@ -7,6 +7,7 @@
 #include "../../tests_common.h"
 
 // standard includes
+#include <chrono>
 #include <optional>
 #include <string>
 #include <utility>
@@ -155,4 +156,21 @@ TEST(SdsSanitizeTest, IdFormat) {
   EXPECT_FALSE(sds::files::is_id("0123456789abcdef0123456789abcde"));
   EXPECT_FALSE(sds::files::is_id("0123456789abcdef0123456789abcdeg"));
   EXPECT_FALSE(sds::files::is_id(""));
+}
+
+TEST(SdsSanitizeTest, RejectsOverlongRawNamesBeforeNormalization) {
+  const auto accepted = sds::files::sanitize_file_name(std::string(1024, 'a'));
+  ASSERT_TRUE(accepted);
+  EXPECT_EQ(accepted->size(), sds::files::NAME_MAX_BYTES);
+
+  EXPECT_FALSE(sds::files::sanitize_file_name(std::string(1025, 'a')));
+
+  std::string combining_flood = "a";
+  combining_flood.reserve(1 + 50000 * 2);
+  for (int i = 0; i < 50000; ++i) {
+    combining_flood += "\xCC\x81";
+  }
+  const auto start = std::chrono::steady_clock::now();
+  EXPECT_FALSE(sds::files::sanitize_file_name(combining_flood));
+  EXPECT_LT(std::chrono::steady_clock::now() - start, std::chrono::milliseconds(500));
 }

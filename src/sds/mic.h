@@ -132,6 +132,11 @@ namespace sds::mic {
      */
     std::vector<std::uint8_t> encrypt(std::uint32_t sequence, std::uint32_t timestamp, std::span<const std::uint8_t> opus);
 
+    /**
+     * @brief Zero and release the underlying AES key and OpenSSL cipher contexts.
+     */
+    void clear_key() noexcept;
+
   private:
     crypto::cipher::gcm_t _cipher;  ///< AES-128-GCM context bound to the session key.
   };
@@ -429,6 +434,31 @@ namespace sds::mic {
    * @brief Session parameters.
    */
   struct session_config_t {
+    session_config_t() = default;
+    session_config_t(const session_config_t &) = default;
+    session_config_t(session_config_t &&) noexcept = default;
+
+    /**
+     * @brief Copy-assign, cleansing any previously held AES key bytes first.
+     *
+     * @param other Source configuration.
+     * @return This configuration.
+     */
+    session_config_t &operator=(const session_config_t &other);
+
+    /**
+     * @brief Move-assign, cleansing any previously held AES key bytes first.
+     *
+     * @param other Source configuration.
+     * @return This configuration.
+     */
+    session_config_t &operator=(session_config_t &&other) noexcept;
+
+    /**
+     * @brief Zero any retained AES key bytes on destruction.
+     */
+    ~session_config_t();
+
     crypto::aes_t key;  ///< Session rikey.
     std::string ping_payload;  ///< 16-character ping payload from SETUP.
     boost::asio::ip::address expected_address;  ///< RTSP client address; pings from elsewhere are rejected.
@@ -510,6 +540,13 @@ namespace sds::mic {
      * @brief Re-check the global switch and the client's permission.
      */
     void refresh_permission();
+
+    /**
+     * @brief Client certificate associated with this session.
+     *
+     * @return PEM certificate string.
+     */
+    [[nodiscard]] const std::string &client_cert() const;
 
     /**
      * @brief Whether packets are accepted.
@@ -602,6 +639,13 @@ namespace sds::mic {
      */
     std::optional<result_e> route(std::span<const std::uint8_t> datagram, const boost::asio::ip::udp::endpoint &from);
 
+    /**
+     * @brief Re-check permissions immediately on active sessions matching `cert_pem` (or all if empty).
+     *
+     * @param cert_pem Client certificate PEM, or empty to refresh every registered session.
+     */
+    void refresh_permissions(std::string_view cert_pem);
+
   private:
     /**
      * @brief Receive using the stable resources retained by the matching removal operation.
@@ -689,9 +733,16 @@ namespace sds::mic {
   };
 
   /**
+   * @brief Immediately re-check permissions for active sessions of `cert_pem`.
+   *
+   * @param cert_pem Client certificate PEM.
+   */
+  void on_client_changed(std::string_view cert_pem);
+
+  /**
    * @brief Generate a fresh 16-character ping payload.
    *
-   * @return Hex string from 8 random bytes.
+   * @return Hex string from 8 random bytes, or empty when the CSPRNG fails.
    */
   std::string generate_ping_payload();
 }  // namespace sds::mic

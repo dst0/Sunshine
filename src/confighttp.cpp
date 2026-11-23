@@ -884,43 +884,51 @@ namespace confighttp {
       });
     };
 
-    // Check if the request is from the same origin (Origin or Referer header matches configured allowed origins)
-    const auto origin_it = request->header.find("Origin");
-    if (origin_it != request->header.end() && is_allowed_origin(origin_it->second)) {
-      // Same origin request - allow without CSRF token
-      return true;
-    }
-
-    // If we have a Referer header, check if it's same-origin
-    const auto referer_it = request->header.find("Referer");
-    if (referer_it != request->header.end() && is_allowed_origin(referer_it->second)) {
-      // Same origin request - allow without CSRF token
-      return true;
-    }
-
-    // Everything else needs a CSRF token: a mismatching Origin/Referer, `Origin: null`, and also
-    // requests carrying neither header. Browsers send Origin on every state-changing request, so
-    // a missing header is not proof of a non-browser client (older browsers and privacy settings
-    // can strip both), and the Web UI itself, including through an SSH tunnel to
-    // https://localhost:<port>, always presents an allowed Origin. Scripts obtain a token from
-    // GET /api/csrf-token and send it in the X-CSRF-Token header.
-    const bool has_origin = origin_it != request->header.end();
-    const bool has_referer = referer_it != request->header.end();
-    // Extract token from X-CSRF-Token header
     const auto header_it = request->header.find("X-CSRF-Token");
-    if (header_it == request->header.end()) {
-      // Also check query parameters as fallback
-      auto query_params = request->parse_query_string();
-      const auto query_it = query_params.find("csrf_token");
-      if (query_it == query_params.end()) {
+    const auto token_count = request->header.count("X-CSRF-Token");
+
+    // If Origin is present, it is authoritative: a disallowed or duplicated Origin must fail
+    // immediately without falling back to Referer.
+    const auto origin_count = request->header.count("Origin");
+    if (origin_count > 1) {
+      auto address = net::addr_to_normalized_string(request->remote_endpoint().address());
+      BOOST_LOG(error) << "Web UI: ["sv << address << "] -- CSRF protection blocked request: multiple Origin headers"sv;
+      bad_request(response, header_it == request->header.end() ? "Missing CSRF token" : "Origin not allowed");
+      return false;
+    }
+
+    const auto origin_it = request->header.find("Origin");
+    if (origin_it != request->header.end()) {
+      if (!is_allowed_origin(origin_it->second)) {
         auto address = net::addr_to_normalized_string(request->remote_endpoint().address());
-        BOOST_LOG(error) << "Web UI: ["sv << address << "] -- CSRF protection blocked request: "sv
-                         << (has_origin || has_referer ? "browser origin not allowed"sv : "no Origin or Referer header"sv);
-        bad_request(response, "Missing CSRF token");
+        BOOST_LOG(error) << "Web UI: ["sv << address << "] -- CSRF protection blocked request: browser origin not allowed"sv;
+        bad_request(response, header_it == request->header.end() ? "Missing CSRF token" : "Origin not allowed");
         return false;
       }
+    } else {
+      const auto referer_count = request->header.count("Referer");
+      const auto referer_it = request->header.find("Referer");
+      if (referer_count > 1 || (referer_it != request->header.end() && !is_allowed_origin(referer_it->second))) {
+        auto address = net::addr_to_normalized_string(request->remote_endpoint().address());
+        BOOST_LOG(error) << "Web UI: ["sv << address << "] -- CSRF protection blocked request: browser referer not allowed"sv;
+        bad_request(response, header_it == request->header.end() ? "Missing CSRF token" : "Origin not allowed");
+        return false;
+      }
+    }
 
-      return validate_stored_csrf_token(response, request, client_id, query_it->second);
+    // Same-origin Origin/Referer headers never bypass token verification: every state-changing
+    // request must carry a valid X-CSRF-Token header.
+    if (header_it == request->header.end()) {
+      auto address = net::addr_to_normalized_string(request->remote_endpoint().address());
+      BOOST_LOG(error) << "Web UI: ["sv << address << "] -- CSRF protection blocked request: missing CSRF token"sv;
+      bad_request(response, "Missing CSRF token");
+      return false;
+    }
+    if (token_count > 1) {
+      auto address = net::addr_to_normalized_string(request->remote_endpoint().address());
+      BOOST_LOG(error) << "Web UI: ["sv << address << "] -- CSRF protection blocked request: duplicate CSRF token header"sv;
+      bad_request(response, "Invalid CSRF token");
+      return false;
     }
 
     // Validate token from header
@@ -1598,7 +1606,8 @@ namespace confighttp {
       const auto cert = nvhttp::get_cert_by_uuid(uuid);
       const bool removed = nvhttp::unpair_client(uuid);
       output_tree["status"] = removed;
-      if (removed) {
+      if (removed && !cert.empty()) {
+        rtsp_stream::terminate_sessions_by_cert(cert);
         sds::on_client_changed(cert);
       }
 
@@ -1632,7 +1641,12 @@ namespace confighttp {
 
     print_req(request);
 
+    const auto removed_certs = nvhttp::get_all_client_certs();
     nvhttp::erase_all_clients();
+    rtsp_stream::terminate_sessions();
+    for (const auto &cert : removed_certs) {
+      sds::on_client_changed(cert);
+    }
     proc::proc.terminate();
 
     nlohmann::json output_tree;
@@ -2669,6 +2683,34 @@ namespace confighttp {
 
   void configure_server_limits(https_server_t &server) {
     server.config.max_request_streambuf_size = MAX_REQUEST_SIZE;
+    server.config.max_request_header_size = 64 * 1024;
+    server.config.timeout_content = 30;
+    auto limiter = std::make_shared<http::connection_limiter_t>(64);
+    server.on_connection_accepted = [limiter](const req_https_t &request) {
+      auto lease = limiter->try_acquire();
+      if (!lease) {
+        return false;
+      }
+      request->connection_context(std::move(lease));
+      return true;
+    };
+    server.on_request_header = [](const req_https_t &request) {
+      return http::validate_request_framing(request->raw_header, request->header, MAX_REQUEST_SIZE);
+    };
+    server.on_error = [](const req_https_t &, const SimpleWeb::error_code &ec) {
+      if (ec == SimpleWeb::error::operation_aborted || ec == boost::asio::error::eof) {
+        return;
+      }
+      BOOST_LOG(debug) << "Web UI HTTPS server transport error: "sv << ec.message();
+    };
+  }
+
+  std::string resolve_bind_address(const net::af_e address_family, const std::string_view origin_web_ui_allowed) {
+    if (net::from_enum_string(origin_web_ui_allowed) == net::PC) {
+      const auto effective_af = net::get_effective_address_family(address_family);
+      return effective_af == net::IPV4 ? "127.0.0.1" : "::1";
+    }
+    return net::get_bind_address(address_family);
   }
 
   /**
@@ -2742,11 +2784,13 @@ namespace confighttp {
     server.resource["^/assets\\/.+$"]["GET"] = getAsset;
 
     server.config.reuse_address = true;
-    server.config.address = net::get_bind_address(address_family);
+    server.config.address = resolve_bind_address(address_family, config::nvhttp.origin_web_ui_allowed);
     server.config.port = port_https;
     configure_server_limits(server);
 
-    const auto display_addr = net::get_bind_address_url_host();
+    const auto display_addr = net::from_enum_string(config::nvhttp.origin_web_ui_allowed) == net::PC
+      ? (server.config.address == "::1" ? "[::1]"s : "127.0.0.1"s)
+      : net::get_bind_address_url_host();
 
     auto accept_and_run = [&](auto *https_server) {
       try {
@@ -2754,7 +2798,7 @@ namespace confighttp {
         https_server->start([&display_addr](const unsigned short port) {
           BOOST_LOG(info) << "Configuration UI available at [https://"sv << display_addr << ":" << port << "]";
         });
-      } catch (boost::system::system_error &err) {
+      } catch (const std::exception &err) {
         // It's possible the exception gets thrown after calling server->stop() from a different thread
         if (shutdown_event->peek()) {
           return;

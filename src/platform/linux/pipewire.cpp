@@ -84,8 +84,8 @@ namespace pipewire {
     std::atomic<int> transfer_function {0};  ///< PipeWire transfer-function metadata for the stream.
     std::atomic<bool> stream_dead {false};  ///< Whether the PipeWire stream has been destroyed.
     std::atomic<bool> has_streamed {false};  ///< Whether this stream has ever reached PW_STREAM_STATE_STREAMING.
-    pw_stream_state previous_state;  ///< Previous PipeWire stream state reported by callbacks.
-    pw_stream_state current_state;  ///< Current PipeWire stream state reported by callbacks.
+    pw_stream_state previous_state = PW_STREAM_STATE_UNCONNECTED;  ///< Previous PipeWire stream state reported by callbacks.
+    pw_stream_state current_state = PW_STREAM_STATE_UNCONNECTED;  ///< Current PipeWire stream state reported by callbacks.
     std::string err_msg;  ///< Last PipeWire error message reported by the stream.
   };
 
@@ -93,11 +93,11 @@ namespace pipewire {
    * @brief PipeWire stream handle, format, and shared state pointer.
    */
   struct stream_data_t {
-    struct pw_stream *stream;  ///< PipeWire stream handle used for screencast frames.
-    struct spa_hook stream_listener;  ///< Hook registering callbacks on the PipeWire stream.
-    struct spa_video_info format;  ///< Negotiated PipeWire video format.
-    struct pw_buffer *current_buffer;  ///< PipeWire buffer currently exposed to the capture thread.
-    uint64_t drm_format;  ///< DRM format.
+    struct pw_stream *stream = nullptr;  ///< PipeWire stream handle used for screencast frames.
+    struct spa_hook stream_listener {};  ///< Hook registering callbacks on the PipeWire stream.
+    struct spa_video_info format {};  ///< Negotiated PipeWire video format.
+    struct pw_buffer *current_buffer = nullptr;  ///< PipeWire buffer currently exposed to the capture thread.
+    uint64_t drm_format = 0;  ///< DRM format.
     std::shared_ptr<shared_state_t> shared;  ///< State shared between PipeWire callbacks and the capture backend.
     std::mutex frame_mutex;  ///< Synchronizes access to the current PipeWire frame.
     std::condition_variable frame_cv;  ///< Signals arrival or release of a PipeWire frame.
@@ -150,13 +150,17 @@ namespace pipewire {
   public:
     pipewire_t():
         loop(pw_thread_loop_new("Pipewire thread", nullptr)) {
-      BOOST_LOG(debug) << "[pipewire] Start PW thread loop"sv;
-      pw_thread_loop_start(loop);
+      if (loop) {
+        BOOST_LOG(debug) << "[pipewire] Start PW thread loop"sv;
+        pw_thread_loop_start(loop);
+      }
     }
 
     ~pipewire_t() {
       BOOST_LOG(debug) << "[pipewire] Destroying pipewire_t"sv;
-      pw_thread_loop_lock(loop);
+      if (loop) {
+        pw_thread_loop_lock(loop);
+      }
 
       // Lock the frame mutex to stop fill_img
       BOOST_LOG(debug) << "[pipewire] Stop fill_img"sv;
@@ -187,11 +191,14 @@ namespace pipewire {
         context = nullptr;
       }
       // Release pipewire thread loop
-      BOOST_LOG(debug) << "[pipewire] Stop PW thread loop"sv;
-      pw_thread_loop_unlock(loop);
-      pw_thread_loop_stop(loop);
-      BOOST_LOG(debug) << "[pipewire] Destroy PW thread loop"sv;
-      pw_thread_loop_destroy(loop);
+      if (loop) {
+        BOOST_LOG(debug) << "[pipewire] Stop PW thread loop"sv;
+        pw_thread_loop_unlock(loop);
+        pw_thread_loop_stop(loop);
+        BOOST_LOG(debug) << "[pipewire] Destroy PW thread loop"sv;
+        pw_thread_loop_destroy(loop);
+        loop = nullptr;
+      }
     }
 
     /**
@@ -711,13 +718,13 @@ namespace pipewire {
     inline static std::atomic negotiate_variable_rate {true};  ///< Whether the session should request variable rate (maxFrameRate = 0/1) capture.
 
   private:
-    struct pw_thread_loop *loop;
-    struct pw_context *context;
-    struct pw_core *core;
-    struct spa_hook core_listener;
+    struct pw_thread_loop *loop = nullptr;
+    struct pw_context *context = nullptr;
+    struct pw_core *core = nullptr;
+    struct spa_hook core_listener {};
     struct stream_data_t stream_data;
-    uint32_t node;
-    uint64_t object_serial;
+    uint32_t node = 0;
+    uint64_t object_serial = 0;
     bool negotiate_maxframerate_ = true;
 
     struct spa_pod *build_format_parameter(struct spa_pod_builder *b, uint32_t width, uint32_t height, AVRational target_framerate, int32_t format, uint64_t *modifiers, int n_modifiers) {

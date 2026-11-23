@@ -453,6 +453,13 @@ namespace nvhttp {
   nlohmann::json get_all_clients();
 
   /**
+   * @brief Snapshot the PEM certificates of all paired clients.
+   *
+   * @return Vector of stored client certificates.
+   */
+  std::vector<std::string> get_all_client_certs();
+
+  /**
    * @brief Paired-client identity used by the secure-desktop-stream endpoints.
    */
   struct client_info_t {
@@ -542,6 +549,74 @@ namespace nvhttp {
       std::shared_ptr<typename SimpleWeb::ServerBase<SunshineHTTPS>::Response> response,
       std::shared_ptr<typename SimpleWeb::ServerBase<SunshineHTTPS>::Request> request
     );
+
+    /**
+     * @brief Dispatch an HTTPS application-list request through the production handler.
+     *
+     * @param response HTTPS response object to populate.
+     * @param request HTTPS request data from the test client.
+     */
+    void applist_https(
+      std::shared_ptr<typename SimpleWeb::ServerBase<SunshineHTTPS>::Response> response,
+      std::shared_ptr<typename SimpleWeb::ServerBase<SunshineHTTPS>::Request> request
+    );
+
+    /**
+     * @brief Dispatch an HTTPS application-asset request through the production handler.
+     *
+     * @param response HTTPS response object to populate.
+     * @param request HTTPS request data from the test client.
+     */
+    void appasset_https(
+      std::shared_ptr<typename SimpleWeb::ServerBase<SunshineHTTPS>::Response> response,
+      std::shared_ptr<typename SimpleWeb::ServerBase<SunshineHTTPS>::Request> request
+    );
+
+    /**
+     * @brief Dispatch an HTTPS cancel request through the production handler.
+     *
+     * @param response HTTPS response object to populate.
+     * @param request HTTPS request data from the test client.
+     */
+    void cancel_https(
+      std::shared_ptr<typename SimpleWeb::ServerBase<SunshineHTTPS>::Response> response,
+      std::shared_ptr<typename SimpleWeb::ServerBase<SunshineHTTPS>::Request> request
+    );
+
+    /**
+     * @brief Dispatch an HTTPS pairing request through the production handler.
+     *
+     * @param response HTTPS response object to populate.
+     * @param request HTTPS request data from the test client.
+     */
+    void pair_https(
+      std::shared_ptr<typename SimpleWeb::ServerBase<SunshineHTTPS>::Response> response,
+      std::shared_ptr<typename SimpleWeb::ServerBase<SunshineHTTPS>::Request> request
+    );
+
+    /**
+     * @brief Query whether a certificate belongs to an enabled paired client.
+     *
+     * @param cert_pem PEM-encoded client certificate.
+     * @return Pair of (enabled, friendly name).
+     */
+    std::pair<bool, std::string> get_client_status(std::string_view cert_pem);
+
+    /**
+     * @brief Validate a GameStream `surroundParams` query parameter.
+     *
+     * @param params Candidate parameter value.
+     * @return `true` when `params` matches `^[0-9]{1,16}$`.
+     */
+    bool is_valid_surround_params(std::string_view params);
+
+    /**
+     * @brief Sanitize a `surroundParams` value as @ref make_launch_session does.
+     *
+     * @param params Candidate parameter value.
+     * @return Validated value, or empty string when invalid.
+     */
+    std::string sanitize_surround_params(std::string_view params);
 
     /**
      * @brief Create the production plain HTTP server.

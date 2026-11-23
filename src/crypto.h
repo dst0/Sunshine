@@ -6,8 +6,10 @@
 
 // standard includes
 #include <array>
+#include <utility>
 
 // lib includes
+#include <openssl/crypto.h>
 #include <openssl/evp.h>
 #include <openssl/rand.h>
 #include <openssl/sha.h>
@@ -223,12 +225,68 @@ namespace crypto {
      */
     class cipher_t {
     public:
+      cipher_t() = default;
+
+      /**
+       * @brief Construct a cipher context pair with key material and padding mode.
+       *
+       * @param decrypt Decryption context.
+       * @param encrypt Encryption context.
+       * @param key_material AES key bytes.
+       * @param use_padding Whether block padding is enabled.
+       */
+      cipher_t(cipher_ctx_t decrypt, cipher_ctx_t encrypt, aes_t key_material, bool use_padding):
+          decrypt_ctx {std::move(decrypt)},
+          encrypt_ctx {std::move(encrypt)},
+          key {std::move(key_material)},
+          padding {use_padding} {
+      }
+
+      /**
+       * @brief Move-construct a cipher context pair.
+       */
+      cipher_t(cipher_t &&) noexcept = default;
+
+      /**
+       * @brief Move-assign a cipher context pair after cleansing any previous key material.
+       *
+       * @param other Source cipher state.
+       * @return This cipher.
+       */
+      cipher_t &operator=(cipher_t &&other) noexcept {
+        if (this != &other) {
+          cleanse_key();
+          decrypt_ctx = std::move(other.decrypt_ctx);
+          encrypt_ctx = std::move(other.encrypt_ctx);
+          key = std::move(other.key);
+          padding = other.padding;
+        }
+        return *this;
+      }
+
+      /**
+       * @brief Cleanse any retained AES key material on destruction.
+       */
+      ~cipher_t() {
+        cleanse_key();
+      }
+
+      /**
+       * @brief Zero and clear any retained AES key material.
+       */
+      void cleanse_key() noexcept {
+        if (!key.empty()) {
+          OPENSSL_cleanse(key.data(), key.size());
+          key.clear();
+        }
+      }
+
       cipher_ctx_t decrypt_ctx;  ///< Decrypt ctx.
       cipher_ctx_t encrypt_ctx;  ///< Encrypt ctx.
 
       aes_t key;  ///< AES key used by the cipher context.
 
-      bool padding;  ///< Enables block padding for the cipher.
+      bool padding {};  ///< Enables block padding for the cipher.
     };
 
     /**

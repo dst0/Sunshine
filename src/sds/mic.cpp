@@ -145,7 +145,7 @@ namespace sds::mic {
   }
 
   std::optional<std::vector<std::uint8_t>> packet_cipher_t::decrypt(std::span<const std::uint8_t> datagram, const header_t &header) {
-    if (datagram.size() < HEADER_SIZE + TAG_SIZE) {
+    if (_cipher.key.size() != 16 || datagram.size() < HEADER_SIZE + TAG_SIZE) {
       return std::nullopt;
     }
     auto iv_array = make_iv(header.sequence);
@@ -161,6 +161,9 @@ namespace sds::mic {
   }
 
   std::vector<std::uint8_t> packet_cipher_t::encrypt(std::uint32_t sequence, std::uint32_t timestamp, std::span<const std::uint8_t> opus) {
+    if (_cipher.key.size() != 16) {
+      return {};
+    }
     auto header = make_header(sequence, timestamp);
     auto iv_array = make_iv(sequence);
     crypto::aes_t iv {iv_array.begin(), iv_array.end()};
@@ -178,6 +181,10 @@ namespace sds::mic {
       return {};
     }
     return datagram;
+  }
+
+  void packet_cipher_t::clear_key() noexcept {
+    _cipher = crypto::cipher::gcm_t {};
   }
 
   bool replay_window_t::check(std::uint32_t sequence) const {
@@ -393,6 +400,43 @@ namespace sds::mic {
     return provider.available && provider.create && provider.available();
   }
 
+  session_config_t &session_config_t::operator=(const session_config_t &other) {
+    if (this != &other) {
+      if (!key.empty()) {
+        OPENSSL_cleanse(key.data(), key.size());
+      }
+      key = other.key;
+      ping_payload = other.ping_payload;
+      expected_address = other.expected_address;
+      client_cert = other.client_cert;
+      stream_running = other.stream_running;
+      start_playout_thread = other.start_playout_thread;
+    }
+    return *this;
+  }
+
+  session_config_t &session_config_t::operator=(session_config_t &&other) noexcept {
+    if (this != &other) {
+      if (!key.empty()) {
+        OPENSSL_cleanse(key.data(), key.size());
+      }
+      key = std::move(other.key);
+      ping_payload = std::move(other.ping_payload);
+      expected_address = std::move(other.expected_address);
+      client_cert = std::move(other.client_cert);
+      stream_running = std::move(other.stream_running);
+      start_playout_thread = other.start_playout_thread;
+    }
+    return *this;
+  }
+
+  session_config_t::~session_config_t() {
+    if (!key.empty()) {
+      OPENSSL_cleanse(key.data(), key.size());
+      key.clear();
+    }
+  }
+
   session_t::session_t(session_config_t params, std::unique_ptr<sink_t> sink, std::unique_ptr<decoder_t> decoder):
       _config {std::move(params)},
       _sink {std::move(sink)},
@@ -429,6 +473,11 @@ namespace sds::mic {
     {
       std::scoped_lock lock {_mutex};
       _jitter = jitter_buffer_t {};
+      _cipher.clear_key();
+      if (!_config.key.empty()) {
+        OPENSSL_cleanse(_config.key.data(), _config.key.size());
+        _config.key.clear();
+      }
     }
     if (_sink_started.exchange(false)) {
       _sink->stop();
@@ -579,6 +628,10 @@ namespace sds::mic {
     }
   }
 
+  const std::string &session_t::client_cert() const {
+    return _config.client_cert;
+  }
+
   void session_t::playout_loop(std::stop_token stop) {
     platf::set_thread_name("sds::mic");
     std::mutex wait_mutex;
@@ -722,6 +775,19 @@ namespace sds::mic {
     return std::nullopt;
   }
 
+  void receiver_t::refresh_permissions(std::string_view cert_pem) {
+    std::vector<std::shared_ptr<session_t>> sessions;
+    {
+      std::scoped_lock lock {_mutex};
+      sessions = _sessions;
+    }
+    for (auto &session : sessions) {
+      if (cert_pem.empty() || session->client_cert() == cert_pem) {
+        session->refresh_permission();
+      }
+    }
+  }
+
   void receiver_t::receive_loop(boost::asio::io_context &io, boost::asio::ip::udp::socket &socket) {
     platf::set_thread_name("sds::mic::recv");
 
@@ -743,11 +809,21 @@ namespace sds::mic {
   }
 
   namespace {
+    std::atomic_bool global_receiver_created {false};
+
     receiver_t &global_receiver() {
       static receiver_t receiver;
+      global_receiver_created.store(true, std::memory_order_release);
       return receiver;
     }
   }  // namespace
+
+  void on_client_changed(std::string_view cert_pem) {
+    if (!global_receiver_created.load(std::memory_order_acquire)) {
+      return;
+    }
+    global_receiver().refresh_permissions(cert_pem);
+  }
 
   std::shared_ptr<session_t> start_session(session_config_t params) {
     if (!config::sds.mic_passthrough || !sds_mic_permission_granted(params.client_cert)) {
@@ -821,7 +897,11 @@ namespace sds::mic {
 
   std::string generate_ping_payload() {
     std::array<std::uint8_t, PING_PAYLOAD_SIZE / 2> raw {};
-    RAND_bytes(raw.data(), static_cast<int>(raw.size()));
-    return util::hex_vec(raw);
+    if (RAND_bytes(raw.data(), static_cast<int>(raw.size())) != 1) {
+      return {};
+    }
+    auto hex = util::hex_vec(raw);
+    OPENSSL_cleanse(raw.data(), raw.size());
+    return hex;
   }
 }  // namespace sds::mic

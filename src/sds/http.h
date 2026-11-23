@@ -4,6 +4,9 @@
  */
 #pragma once
 
+// standard includes
+#include <string_view>
+
 // lib includes
 #include <Simple-Web-Server/server_http.hpp>
 
@@ -66,4 +69,12 @@ namespace sds::http {
    * @param server Plain HTTP server, before start().
    */
   void register_plain_http_guard(http_server_t &server);
+
+  /**
+   * @brief Validate that raw HTTP request line and header lines use canonical CRLF framing.
+   *
+   * @param raw Raw request head up to and including `\r\n\r\n`.
+   * @return `true` when the request head is well-formed.
+   */
+  bool canonical_header_lines(std::string_view raw);
 }  // namespace sds::http

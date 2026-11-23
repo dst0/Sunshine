@@ -7,6 +7,7 @@
 #include "../../tests_common.h"
 
 // standard includes
+#include <chrono>
 #include <string>
 #include <utility>
 #include <vector>
@@ -78,4 +79,32 @@ TEST(SdsTextTest, NormalizesNfdToNfc) {
     ASSERT_TRUE(normalized) << input;
     EXPECT_EQ(*normalized, expected) << input;
   }
+}
+
+TEST(SdsTextTest, NormalizesLongCombiningMarkRunsEfficiently) {
+  constexpr int count = 10000;
+  std::string input = "e";
+  input.reserve(1 + count * 4);
+  for (int i = 0; i < count; ++i) {
+    input += "\xCC\x81";  // U+0301 COMBINING ACUTE ACCENT (ccc=230)
+  }
+  for (int i = 0; i < count; ++i) {
+    input += "\xCC\x96";  // U+0316 COMBINING GRAVE ACCENT BELOW (ccc=220)
+  }
+
+  std::string expected = "\xC3\xA9";  // U+00E9
+  expected.reserve(2 + count * 2 + (count - 1) * 2);
+  for (int i = 0; i < count; ++i) {
+    expected += "\xCC\x96";
+  }
+  for (int i = 0; i < count - 1; ++i) {
+    expected += "\xCC\x81";
+  }
+
+  const auto start = std::chrono::steady_clock::now();
+  const auto normalized = sds::text::to_nfc(input);
+  const auto elapsed = std::chrono::steady_clock::now() - start;
+  ASSERT_TRUE(normalized);
+  EXPECT_EQ(*normalized, expected);
+  EXPECT_LT(elapsed, std::chrono::seconds(2));
 }

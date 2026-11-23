@@ -937,7 +937,7 @@
           });
         },
         toggleClient(uuid, enabled) {
-          fetch("./api/clients/update", {
+          apiFetch("./api/clients/update", {
             method: "POST",
             headers: {
               'Content-Type': 'application/json'

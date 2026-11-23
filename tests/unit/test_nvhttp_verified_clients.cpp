@@ -23,11 +23,13 @@
 
 // lib includes
 #include <boost/asio/ssl.hpp>
+#include <openssl/ssl.h>
 
 // local includes
 #include <src/config.h>
 #include <src/crypto.h>
 #include <src/nvhttp.h>
+#include <src/sds/http.h>
 
 namespace {
   using namespace std::chrono_literals;
@@ -489,5 +491,86 @@ namespace {
     boost::system::error_code write_error;
     boost::asio::write(long_headers, boost::asio::buffer("GET /serverinfo HTTP/1.1\r\nX-Padding: " + padding), write_error);
     EXPECT_TRUE(closed_without_response(long_headers));
+  }
+
+  /**
+   * @brief Revoked or unpaired keep-alive clients receive 401 and close immediately on protected GameStream routes.
+   */
+  TEST_F(VerifiedClientTest, RevokedKeepAliveClientReceives401AndClosesOnProtectedRoutes) {
+    server->resource["^/serverinfo$"]["GET"] = nvhttp::test_support::serverinfo_https;
+    server->resource["^/applist$"]["GET"] = nvhttp::test_support::applist_https;
+    server->resource["^/appasset$"]["GET"] = nvhttp::test_support::appasset_https;
+    server->resource["^/cancel$"]["GET"] = nvhttp::test_support::cancel_https;
+    server->resource["^/pair$"]["GET"] = nvhttp::test_support::pair_https;
+
+    for (const auto *route : {"/serverinfo", "/applist", "/appasset", "/cancel", "/pair"}) {
+      ASSERT_TRUE(nvhttp::set_client_enabled(client_a_uuid, true));
+      auto connection = connect(client_a);
+      const auto active = whoami(*connection);
+      ASSERT_TRUE(active);
+      EXPECT_EQ(active->body, "client-a\n" + client_a.x509);
+
+      ASSERT_TRUE(nvhttp::set_client_enabled(client_a_uuid, false));
+      const std::string req = std::string {"GET "} + route + " HTTP/1.1\r\nHost: localhost\r\nConnection: keep-alive\r\n\r\n";
+      boost::asio::write(*connection, boost::asio::buffer(req));
+      const auto revoked = read_response(*connection);
+      ASSERT_TRUE(revoked) << route;
+      EXPECT_EQ(revoked->status_line.rfind("HTTP/1.1 401", 0), 0) << route << ": " << revoked->status_line;
+      EXPECT_NE(revoked->body.find("status_code=\"401\""), std::string::npos) << route << ": " << revoked->body;
+      EXPECT_TRUE(closed_without_response(*connection)) << route;
+    }
+
+    ASSERT_TRUE(nvhttp::set_client_enabled(client_a_uuid, true));
+    auto unpaired_conn = connect(client_a);
+    ASSERT_TRUE(whoami(*unpaired_conn));
+    ASSERT_TRUE(nvhttp::unpair_client(client_a_uuid));
+    boost::asio::write(*unpaired_conn, boost::asio::buffer(std::string {"GET /applist HTTP/1.1\r\nHost: localhost\r\nConnection: keep-alive\r\n\r\n"}));
+    const auto after_unpair = read_response(*unpaired_conn);
+    ASSERT_TRUE(after_unpair);
+    EXPECT_EQ(after_unpair->status_line.rfind("HTTP/1.1 401", 0), 0);
+    EXPECT_TRUE(closed_without_response(*unpaired_conn));
+  }
+
+  /**
+   * @brief The GameStream HTTPS server rejects TLS 1.2 clients and enforces TLS 1.3 minimum.
+   */
+  TEST_F(VerifiedClientTest, EnforcesTls13MinimumVersion) {
+    ssl::context tls12_ctx {ssl::context::tls_client};
+    tls12_ctx.set_verify_mode(ssl::verify_none);
+    tls12_ctx.use_certificate(boost::asio::buffer(client_a.x509), ssl::context::pem);
+    tls12_ctx.use_private_key(boost::asio::buffer(client_a.pkey), ssl::context::pem);
+    ASSERT_EQ(SSL_CTX_set_max_proto_version(tls12_ctx.native_handle(), TLS1_2_VERSION), 1);
+
+    ssl::stream<tcp::socket> stream {client_io, tls12_ctx};
+    stream.lowest_layer().connect({boost::asio::ip::address_v4::loopback(), port});
+    boost::system::error_code ec;
+    stream.handshake(ssl::stream_base::client, ec);
+    EXPECT_TRUE(ec);
+  }
+
+  /**
+   * @brief Plain HTTP server rejects Transfer-Encoding smuggling and non-canonical request heads.
+   */
+  TEST_F(PlainHttpLimitTest, RejectsSmugglingAndNonCanonicalFraming) {
+    const std::array malformed_requests {
+      std::string {"POST /serverinfo HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n"},
+      std::string {"GET /serverinfo HTTP/1.1\nHost: localhost\r\n\r\n"},
+      std::string {"GET /serverinfo HTTP/1.1\r\nHost: localhost\nX-Foo: bar\r\n\r\n"},
+      std::string {"GET /serverinfo HTTP/1.1\r\nMissingColon\r\n\r\n"},
+      std::string {"GET /serverinfo HTTP/1.1\r\nHost: localhost\r\n folded\r\n\r\n"},
+      std::string {"GET /serverinfo HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\nContent-Length: 0\r\n\r\n"},
+    };
+    for (const auto &raw_request : malformed_requests) {
+      tcp::socket sock {client_io};
+      sock.connect({boost::asio::ip::address_v4::loopback(), port});
+      boost::system::error_code write_error;
+      boost::asio::write(sock, boost::asio::buffer(raw_request), write_error);
+      EXPECT_TRUE(closed_without_response(sock));
+    }
+
+    EXPECT_TRUE(sds::http::canonical_header_lines("GET /sds/v1/clipboard HTTP/1.1\r\nHost: localhost\r\n\r\n"));
+    EXPECT_FALSE(sds::http::canonical_header_lines("GET /sds/v1/clipboard HTTP/1.1\nHost: localhost\r\n\r\n"));
+    EXPECT_FALSE(sds::http::canonical_header_lines("GET /sds/v1/clipboard HTTP/1.1\rHost: localhost\r\n\r\n"));
+    EXPECT_FALSE(sds::http::canonical_header_lines(std::string_view {"GET /\0 HTTP/1.1\r\nHost: localhost\r\n\r\n", 36}));
   }
 }  // namespace

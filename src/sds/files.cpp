@@ -10,6 +10,7 @@
 #include <utility>
 
 // lib includes
+#include <openssl/crypto.h>
 #include <openssl/hmac.h>
 #include <openssl/rand.h>
 
@@ -81,7 +82,9 @@ namespace sds::files {
       if (RAND_bytes(bytes.data(), static_cast<int>(bytes.size())) != 1) {
         return {};
       }
-      return to_hex(bytes.data(), bytes.size());
+      auto hex = to_hex(bytes.data(), bytes.size());
+      OPENSSL_cleanse(bytes.data(), bytes.size());
+      return hex;
     }
 
     /**
@@ -222,6 +225,9 @@ namespace sds::files {
   }  // namespace
 
   std::optional<std::string> sanitize_file_name(std::string_view name) {
+    if (name.size() > 1024) {
+      return std::nullopt;
+    }
     const auto decoded = text::decode_utf8(name);
     if (!decoded || decoded->empty()) {
       return std::nullopt;
@@ -296,15 +302,17 @@ namespace sds::files {
 
   manager_t::manager_t(options_t options):
       options_(std::move(options)) {
-    if (RAND_bytes(id_key_.data(), static_cast<int>(id_key_.size())) != 1) {
-      // Without a key the ids would be predictable; derive one from fresh upload ids instead.
-      const auto fallback = random_id() + random_id();
-      std::copy_n(fallback.begin(), std::min(fallback.size(), id_key_.size()), id_key_.begin());
+    id_key_ready_ = RAND_bytes(id_key_.data(), static_cast<int>(id_key_.size())) == 1;
+    if (!id_key_ready_) {
+      OPENSSL_cleanse(id_key_.data(), id_key_.size());
+      BOOST_LOG(error) << "sds: could not initialize outbox id key from OpenSSL CSPRNG"sv;
     }
   }
 
   manager_t::~manager_t() {
     shutdown();
+    OPENSSL_cleanse(id_key_.data(), id_key_.size());
+    id_key_ready_ = false;
   }
 
   const options_t &manager_t::options() const {
@@ -633,7 +641,10 @@ namespace sds::files {
     outbox_baseline_.reset();
   }
 
-  std::string manager_t::outbox_id(const fs::entry_t &entry) const {
+  std::optional<std::string> manager_t::outbox_id(const fs::entry_t &entry) const {
+    if (!id_key_ready_) {
+      return std::nullopt;
+    }
     std::string message = entry.name;
     message.push_back('\0');
     message += std::to_string(entry.size);
@@ -645,11 +656,16 @@ namespace sds::files {
     message += std::to_string(entry.device);
     std::array<unsigned char, EVP_MAX_MD_SIZE> mac {};
     unsigned int length = 0;
-    HMAC(EVP_sha256(), id_key_.data(), static_cast<int>(id_key_.size()), reinterpret_cast<const unsigned char *>(message.data()), message.size(), mac.data(), &length);
+    if (!HMAC(EVP_sha256(), id_key_.data(), static_cast<int>(id_key_.size()), reinterpret_cast<const unsigned char *>(message.data()), message.size(), mac.data(), &length) || length < 16) {
+      return std::nullopt;
+    }
     return to_hex(mac.data(), 16);
   }
 
   std::error_code manager_t::refresh_outbox(std::unique_ptr<fs::directory_t> &out) {
+    if (!id_key_ready_) {
+      return std::make_error_code(std::errc::io_error);
+    }
     if (const auto ec = fs::open_directory(outbox_dir(), true, out); ec) {
       return ec;
     }
@@ -664,11 +680,14 @@ namespace sds::files {
     std::map<std::string, outbox_entry_t, std::less<>> fresh;
     for (auto &entry : entries) {
       auto id = outbox_id(entry);
+      if (!id) {
+        return std::make_error_code(std::errc::io_error);
+      }
       outbox_entry_t value {std::move(entry), std::nullopt};
-      if (const auto previous = outbox_.find(id); previous != outbox_.end()) {
+      if (const auto previous = outbox_.find(*id); previous != outbox_.end()) {
         value.sha256 = previous->second.sha256;
       }
-      fresh.emplace(std::move(id), std::move(value));
+      fresh.emplace(std::move(*id), std::move(value));
     }
     outbox_ = std::move(fresh);
     return {};
@@ -730,6 +749,9 @@ namespace sds::files {
     fs::entry_t current;
     if (file->stat(current) || current.size != cached.entry.size || current.mtime_ns != cached.entry.mtime_ns || current.file_id != cached.entry.file_id || current.device != cached.entry.device) {
       return reply_t::failure(404, "not_found", "outbox file changed");
+    }
+    if (current.size > options_.file_max) {
+      return reply_t::failure(413, "too_large", "file exceeds file_max");
     }
     if (offset > current.size) {
       return reply_t::failure(400, "bad_request", "offset beyond end of file");

@@ -7,6 +7,7 @@ vi.mock('../../src_assets/common/assets/web/Navbar.vue', () => ({
 
 import ClipboardFiles from '../../src_assets/common/assets/web/configs/tabs/ClipboardFiles.vue'
 import Troubleshooting from '../../src_assets/common/assets/web/Troubleshooting.vue'
+import { resetCsrfTokenCacheForTesting } from '../../src_assets/common/assets/web/fetch_utils.js'
 import configTabs from '../../src_assets/common/assets/web/configs/config_tabs.json'
 import en from '../../src_assets/common/assets/web/public/assets/locale/en.json'
 
@@ -59,6 +60,9 @@ function baseResponse(url) {
   if (url === './api/logs') {
     return { text: async () => '' }
   }
+  if (url === './api/csrf-token') {
+    return { ok: true, status: 200, json: async () => ({ csrf_token: 'test-csrf-token' }) }
+  }
   return null
 }
 
@@ -102,18 +106,21 @@ describe('Clipboard & Files configuration tab', () => {
 
 describe('client permission toggles', () => {
   afterEach(() => {
+    resetCsrfTokenCacheForTesting()
     vi.unstubAllGlobals()
     vi.restoreAllMocks()
   })
 
   it('shows and updates per-client permissions', async () => {
     const posted = []
+    let lastCsrfHeader = null
     let permissions = ['clipboard_read']
     vi.stubGlobal('fetch', vi.fn(async (url, options) => {
       if (url === './api/clients/list') {
         return { json: async () => ({ status: true, named_certs: [{ name: 'Mac', uuid: 'u1', enabled: true, permissions }] }) }
       }
       if (url === './api/clients/permissions') {
+        lastCsrfHeader = options?.headers?.['X-CSRF-Token'] ?? null
         const body = JSON.parse(options.body)
         posted.push(body)
         permissions = body.permissions
@@ -134,6 +141,7 @@ describe('client permission toggles', () => {
     await wrapper.get('#permission-file_upload-u1').setValue(true)
     await flushPromises()
     expect(posted).toEqual([{ uuid: 'u1', permissions: ['clipboard_read', 'file_upload'] }])
+    expect(lastCsrfHeader).toBe('test-csrf-token')
     expect(wrapper.get('#permission-file_upload-u1').element.checked).toBe(true)
     expect(wrapper.find('.alert-danger').exists()).toBe(false)
   })

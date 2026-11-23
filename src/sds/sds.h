@@ -22,6 +22,10 @@
 #include "reply.h"
 
 namespace sds {
+  namespace file_clipboard {
+    class stage_t;
+  }
+
   /**
    * @brief Protocol version reported in `/serverinfo` and capabilities.
    */
@@ -44,6 +48,8 @@ namespace sds {
     std::chrono::milliseconds outbox_poll_interval = std::chrono::seconds {2};  ///< Outbox change detection period.
     std::chrono::milliseconds coalesce_window = std::chrono::milliseconds {500};  ///< Clipboard PUT coalescing window.
     std::chrono::milliseconds clipboard_read_timeout = std::chrono::seconds {1};  ///< Backend read timeout.
+    std::chrono::milliseconds file_clipboard_lease_grace = std::chrono::seconds {15};  ///< Grace period before freeing retired file-clipboard leases.
+    std::chrono::milliseconds file_clipboard_lease_ttl = std::chrono::minutes {3};  ///< Maximum lifetime of a published file-clipboard lease.
     std::size_t event_queue_max = 64;  ///< Per-client event queue bound.
   };
 
@@ -61,6 +67,7 @@ namespace sds {
     std::function<bool(std::string_view cert)> stream_active;  ///< Default: rtsp_stream::has_running_session.
     std::function<std::optional<client_t>(std::string_view cert)> find_client;  ///< Default: nvhttp paired-client store.
     std::function<std::unique_ptr<clipboard::backend_t>()> make_clipboard_backend;  ///< Default: clipboard::make_backend.
+    std::function<std::shared_ptr<const file_clipboard::stage_t>(std::string_view body, const std::function<bool()> &allowed)> stage_file_clipboard;  ///< Default: file_clipboard::stage.
     bool observe_sessions = true;  ///< Register with rtsp_stream for session start/stop notifications.
   };
 
@@ -212,6 +219,7 @@ namespace sds {
     bool clipboard_watching = false;  ///< Backend watched.
     bool clipboard_content = false;  ///< Clipboard content cached.
     std::uint64_t clipboard_seq = 0;  ///< Host clipboard seq.
+    std::size_t file_clipboard_leases = 0;  ///< Active or grace-retained file-clipboard leases.
   };
 
   /**

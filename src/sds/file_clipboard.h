@@ -31,4 +31,12 @@ namespace sds::file_clipboard {
   // lease controls lifetime and owns the only directory cleanup operation.
   std::shared_ptr<const stage_t> stage(std::string_view body, const std::function<bool()> &allowed);
   std::string_view native_offer(const stage_t &stage);
+
+  /**
+   * @brief Create an in-memory lease stage with no filesystem backing (for dispatcher tests).
+   *
+   * @param offer Native clipboard offer payload.
+   * @return Opaque stage lease.
+   */
+  std::shared_ptr<const stage_t> make_test_stage(std::string offer);
 }  // namespace sds::file_clipboard

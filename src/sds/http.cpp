@@ -19,6 +19,7 @@
 #include "auth.h"
 #include "http.h"
 #include "sds.h"
+#include "src/httpcommon.h"
 #include "src/nvhttp.h"
 
 namespace sds::http {
@@ -117,26 +118,6 @@ namespace sds::http {
      */
     constexpr const char *NAMESPACE_PATTERN = "^/sds(?:/.*)?$";
 
-    /** @brief Refuse malformed/obsolete header lines the upstream permissive parser ignores. */
-    bool canonical_header_lines(std::string_view raw) {
-      auto end = raw.find("\r\n");
-      if (end == std::string_view::npos) { return false; }
-      raw.remove_prefix(end + 2);
-      while (raw != "\r\n") {
-        end = raw.find("\r\n");
-        if (end == std::string_view::npos || end == 0) { return false; }
-        const auto line = raw.substr(0, end);
-        const auto colon = line.find(':');
-        if (colon == 0 || colon == std::string_view::npos) { return false; }
-        for (const unsigned char ch : line.substr(0, colon)) {
-          if (!((ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9') || std::string_view("!#$%&'*+-.^_`|~").find(ch) != std::string_view::npos)) { return false; }
-        }
-        if (line.find('\0') != std::string_view::npos || line.find('\r') != std::string_view::npos || line.find('\n') != std::string_view::npos) { return false; }
-        raw.remove_prefix(end + 2);
-      }
-      return true;
-    }
-
     /**
      * @brief One API route.
      */
@@ -206,6 +187,9 @@ namespace sds::http {
         return;
       }
       response.write(static_cast<SimpleWeb::StatusCode>(reply.status), body, headers);
+      if (reply.status == 401) {
+        response.close_connection_after_response = true;
+      }
     }
 
     /**
@@ -292,6 +276,16 @@ namespace sds::http {
           return;
         }
       }
+      if (matched->op == op_e::clipboard_put ||
+          matched->op == op_e::upload_create ||
+          matched->op == op_e::upload_chunk ||
+          matched->op == op_e::upload_cancel ||
+          matched->op == op_e::upload_complete) {
+        if (request->header.count("Content-Type") > 1 || request->header.count("X-SDS-Client-Seq") > 1) {
+          respond(reply_t::failure(400, "bad_request", "duplicate header"));
+          return;
+        }
+      }
       if (const auto it = request->header.find("Content-Type"); it != request->header.end()) {
         fields.content_type = it->second;
       }
@@ -352,20 +346,15 @@ namespace sds::http {
       return true;
     };
     server.on_request_header = [state](auto request) {
-      if (!canonical_header_lines(request->raw_header)) { return false; }
       const bool sds = request->path == "/sds" || request->path.starts_with("/sds/");
-      if (request->header.count("Content-Length") > 1 || request->header.count("Transfer-Encoding")) {
-        return false;
-      }
       std::size_t length = 0;
-      if (const auto it = request->header.find("Content-Length"); it != request->header.end()) {
-        const auto &value = it->second;
-        const auto [end, error] = std::from_chars(value.data(), value.data() + value.size(), length);
-        if (value.empty() || error != std::errc {} || end != value.data() + value.size()) {
-          return false;
-        }
-      }
-      if (length > (sds ? max_request_body_size() : nvhttp::HTTP_MAX_REQUEST_SIZE) || length > std::numeric_limits<std::size_t>::max() / 2) {
+      if (!::http::validate_request_framing(
+            request->raw_header,
+            request->header,
+            sds ? max_request_body_size() : nvhttp::HTTP_MAX_REQUEST_SIZE,
+            &length
+          ) ||
+          length > std::numeric_limits<std::size_t>::max() / 2) {
         return false;
       }
       auto connection = std::static_pointer_cast<transport_budget_t::state_t::connection_t>(request->connection_context());
@@ -411,5 +400,8 @@ namespace sds::http {
         write_reply(*response, reply_t::failure(404, "not_found", "not found"));
       };
     }
+  }
+  bool canonical_header_lines(const std::string_view raw) {
+    return ::http::has_canonical_header_lines(raw);
   }
 }  // namespace sds::http
