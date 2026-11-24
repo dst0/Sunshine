@@ -15,6 +15,10 @@
 #include "crypto.h"
 #include "video.h"
 
+namespace sds::mic {
+  struct session_config_t;
+}
+
 namespace stream {
   constexpr auto VIDEO_STREAM_PORT = 9;  ///< GameStream base-port offset used for the video UDP stream.
   constexpr auto CONTROL_PORT = 10;  ///< GameStream base-port offset used for the control channel.
@@ -94,5 +98,26 @@ namespace stream {
      * @return PEM certificate associated with the session's client.
      */
     const std::string &client_cert(session_t &session);
+
+#ifdef SUNSHINE_TESTS
+    namespace test_support {
+      /**
+       * @brief Create a session object in a given state without starting any worker thread.
+       *
+       * @param client_cert Client certificate of the session.
+       * @param state Initial state.
+       * @return Session suitable for rtsp_stream::test_support::insert_session().
+       */
+      std::shared_ptr<session_t> make_session(std::string client_cert, state_e state);
+
+      /**
+       * @brief Exercise production stream activation with optional microphone parameters.
+       *
+       * @param session Synthetic streaming session.
+       * @param config Microphone parameters.
+       */
+      void activate_with_microphone(session_t &session, sds::mic::session_config_t config);
+    }  // namespace test_support
+#endif
   }  // namespace session
 }  // namespace stream

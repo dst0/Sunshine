@@ -164,6 +164,16 @@ namespace platf {
   int open_drm_card_fd(const std::filesystem::path &path, int flags = O_RDWR);
 
   /**
+   * @brief Resolve canonical lowercase PCI slot (e.g. "0000:02:00.0") for a DRM sysfs node name (e.g. "card0", "renderD128").
+   */
+  std::string drm_node_pci_slot(std::string_view drm_node_name);
+
+  /**
+   * @brief Resolve canonical lowercase PCI slot for a DRM kernel connector ID via `/sys/class/drm`.
+   */
+  std::string drm_connector_id_pci_slot(unsigned long connector_id);
+
+  /**
    * @brief Generic frame pacing logic for Linux capture methods.
    *
    * Advances the frame pacing timeline and re-anchors it if the capture thread falls behind.

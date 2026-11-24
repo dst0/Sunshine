@@ -23,7 +23,7 @@ if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
         endif()
     endif()
 
-    # GCC 15 will complain about uninitialized variables in some cases (Simple-Web-Server)
+    # GCC 15 will complain about uninitialized variables in some cases (Boost / third-party headers)
     if(CMAKE_CXX_COMPILER_VERSION VERSION_GREATER_EQUAL 15)
         list(APPEND SUNSHINE_COMPILE_OPTIONS -Wno-uninitialized)
     endif()
@@ -130,6 +130,52 @@ endif()
 
 list(APPEND PLATFORM_TARGET_FILES ${NVENC_SOURCES})
 
+# secure-desktop-stream host core (clipboard core, file transfer, /sds/v1 endpoints)
+set(SDS_SOURCES
+        "${CMAKE_SOURCE_DIR}/src/sds/auth.cpp"
+        "${CMAKE_SOURCE_DIR}/src/sds/auth.h"
+        "${CMAKE_SOURCE_DIR}/src/sds/clipboard.cpp"
+        "${CMAKE_SOURCE_DIR}/src/sds/clipboard.h"
+        "${CMAKE_SOURCE_DIR}/src/sds/clipboard_backend.h"
+        "${CMAKE_SOURCE_DIR}/src/sds/events.cpp"
+        "${CMAKE_SOURCE_DIR}/src/sds/events.h"
+        "${CMAKE_SOURCE_DIR}/src/sds/file_clipboard.cpp"
+        "${CMAKE_SOURCE_DIR}/src/sds/file_clipboard.h"
+        "${CMAKE_SOURCE_DIR}/src/sds/files.cpp"
+        "${CMAKE_SOURCE_DIR}/src/sds/files.h"
+        "${CMAKE_SOURCE_DIR}/src/sds/fs.h"
+        "${CMAKE_SOURCE_DIR}/src/sds/fs_common.cpp"
+        "${CMAKE_SOURCE_DIR}/src/sds/http.cpp"
+        "${CMAKE_SOURCE_DIR}/src/sds/http.h"
+        "${CMAKE_SOURCE_DIR}/src/sds/nfc_data.h"
+        "${CMAKE_SOURCE_DIR}/src/sds/permissions.cpp"
+        "${CMAKE_SOURCE_DIR}/src/sds/permissions.h"
+        "${CMAKE_SOURCE_DIR}/src/sds/reply.h"
+        "${CMAKE_SOURCE_DIR}/src/sds/sds.cpp"
+        "${CMAKE_SOURCE_DIR}/src/sds/sds.h"
+        "${CMAKE_SOURCE_DIR}/src/sds/text.cpp"
+        "${CMAKE_SOURCE_DIR}/src/sds/text.h"
+        "${CMAKE_SOURCE_DIR}/src/sds/worker.cpp"
+        "${CMAKE_SOURCE_DIR}/src/sds/worker.h")
+if(WIN32)
+    list(APPEND SDS_SOURCES "${CMAKE_SOURCE_DIR}/src/sds/fs_windows.cpp")
+    list(APPEND PLATFORM_LIBRARIES ole32)
+else()
+    list(APPEND SDS_SOURCES "${CMAKE_SOURCE_DIR}/src/sds/fs_posix.cpp")
+endif()
+# Platform clipboard backends (src/platform/<os>/clipboard*.cpp) define sds::clipboard::make_backend();
+# without one, link the fallback that reports the clipboard as unavailable.
+set(SDS_HAS_PLATFORM_CLIPBOARD OFF)
+foreach(sds_platform_source IN LISTS PLATFORM_TARGET_FILES)
+    if(sds_platform_source MATCHES "/src/platform/[^/]+/clipboard[^/]*\\.(cpp|mm)$")
+        set(SDS_HAS_PLATFORM_CLIPBOARD ON)
+    endif()
+endforeach()
+if(NOT SDS_HAS_PLATFORM_CLIPBOARD)
+    list(APPEND SDS_SOURCES "${CMAKE_SOURCE_DIR}/src/sds/clipboard_backend_none.cpp")
+endif()
+list(APPEND PLATFORM_TARGET_FILES ${SDS_SOURCES})
+
 set(SUNSHINE_TARGET_FILES
         "${CMAKE_SOURCE_DIR}/third-party/moonlight-common-c/src/Input.h"
         "${CMAKE_SOURCE_DIR}/third-party/moonlight-common-c/src/Rtsp.h"
@@ -165,6 +211,8 @@ set(SUNSHINE_TARGET_FILES
         "${CMAKE_SOURCE_DIR}/src/httpcommon.h"
         "${CMAKE_SOURCE_DIR}/src/confighttp.cpp"
         "${CMAKE_SOURCE_DIR}/src/confighttp.h"
+        "${CMAKE_SOURCE_DIR}/src/webui_auth.cpp"
+        "${CMAKE_SOURCE_DIR}/src/webui_auth.h"
         "${CMAKE_SOURCE_DIR}/src/compat/moonlight.h"
         "${CMAKE_SOURCE_DIR}/src/rtsp.cpp"
         "${CMAKE_SOURCE_DIR}/src/rtsp.h"
@@ -174,6 +222,8 @@ set(SUNSHINE_TARGET_FILES
         "${CMAKE_SOURCE_DIR}/src/video.h"
         "${CMAKE_SOURCE_DIR}/src/video_colorspace.cpp"
         "${CMAKE_SOURCE_DIR}/src/video_colorspace.h"
+        "${CMAKE_SOURCE_DIR}/src/video_packed444.cpp"
+        "${CMAKE_SOURCE_DIR}/src/video_packed444.h"
         "${CMAKE_SOURCE_DIR}/src/input.cpp"
         "${CMAKE_SOURCE_DIR}/src/input.h"
         "${CMAKE_SOURCE_DIR}/src/audio.cpp"
@@ -195,6 +245,8 @@ set(SUNSHINE_TARGET_FILES
         "${CMAKE_SOURCE_DIR}/src/round_robin.h"
         "${CMAKE_SOURCE_DIR}/src/stat_trackers.h"
         "${CMAKE_SOURCE_DIR}/src/stat_trackers.cpp"
+        "${CMAKE_SOURCE_DIR}/src/sds/mic.cpp"
+        "${CMAKE_SOURCE_DIR}/src/sds/mic.h"
         ${PLATFORM_TARGET_FILES})
 
 if(NOT SUNSHINE_ASSETS_DIR_DEF)
@@ -213,6 +265,7 @@ include_directories(
         BEFORE
         SYSTEM
         "${CMAKE_SOURCE_DIR}/third-party"
+        "${CMAKE_SOURCE_DIR}/third-party/sds-http-rs/include"
         "${CMAKE_SOURCE_DIR}/third-party/moonlight-common-c/enet/include"
         "${CMAKE_SOURCE_DIR}/third-party/moonlight-common-c/nanors"
         "${CMAKE_SOURCE_DIR}/third-party/moonlight-common-c/nanors/deps/obl"
@@ -230,6 +283,7 @@ list(APPEND SUNSHINE_EXTERNAL_LIBRARIES
         ${MINIUPNP_LIBRARIES}
         ${CMAKE_THREAD_LIBS_INIT}
         enet
+        simple-web-server
         libdisplaydevice::display_device
         lizardbyte::common
         nlohmann_json::nlohmann_json

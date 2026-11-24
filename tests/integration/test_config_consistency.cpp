@@ -37,6 +37,7 @@ protected:
       {"Network", "network"},
       {"Config Files", "files"},
       {"Advanced", "advanced"},
+      {"Clipboard & Files", "sds"},
       {"NVIDIA NVENC Encoder", "nv"},
       {"Intel QuickSync Encoder", "qsv"},
       {"AMD AMF Encoder", "amd"},
@@ -71,7 +72,8 @@ protected:
       std::regex(R"DELIM((?:double_f|double_between_f)\s*\(\s*vars\s*,\s*"([^"]+)")DELIM"),
       std::regex(R"DELIM(generic_f\s*\(\s*vars\s*,\s*"([^"]+)")DELIM"),
       std::regex(R"DELIM(list_prep_cmd_f\s*\(\s*vars\s*,\s*"([^"]+)")DELIM"),
-      std::regex(R"DELIM(map_int_int_f\s*\(\s*vars\s*,\s*"([^"]+)")DELIM")
+      std::regex(R"DELIM(map_int_int_f\s*\(\s*vars\s*,\s*"([^"]+)")DELIM"),
+      std::regex(R"DELIM((?:byte_size_between|unit_int_between|absolute_dir_f)\s*\(\s*vars\s*,\s*"([^"]+)")DELIM")
     };
 
     for (const auto &pattern : patterns) {

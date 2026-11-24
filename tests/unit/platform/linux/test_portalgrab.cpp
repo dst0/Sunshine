@@ -7,6 +7,7 @@
   #include "../../../tests_common.h"
 
   // standard includes
+  #include <algorithm>
   #include <array>
   #include <atomic>
   #include <csignal>
@@ -18,6 +19,7 @@
   #include <functional>
   #include <future>
   #include <map>
+  #include <mutex>
   #include <optional>
   #include <string>
   #include <thread>
@@ -33,8 +35,10 @@
   #include <unistd.h>
 
   // local includes
+  #include "src/config.h"
   #include "src/logging.h"
   #include "src/platform/linux/misc.h"
+  #include "src/utility.h"
 
 namespace platf {
   std::vector<std::string> portal_display_names(bool allow_start_timeout);
@@ -67,6 +71,16 @@ namespace {
     </method>
   </interface>
   <interface name='org.freedesktop.portal.ScreenCast'>
+    <method name='CreateSession'>
+      <arg type='a{sv}' direction='in'/>
+      <arg type='o' direction='out'/>
+    </method>
+    <method name='Start'>
+      <arg type='o' direction='in'/>
+      <arg type='s' direction='in'/>
+      <arg type='a{sv}' direction='in'/>
+      <arg type='o' direction='out'/>
+    </method>
     <method name='SelectSources'>
       <arg type='o' direction='in'/>
       <arg type='a{sv}' direction='in'/>
@@ -77,6 +91,16 @@ namespace {
       <arg type='a{sv}' direction='in'/>
       <arg type='h' direction='out'/>
     </method>
+  </interface>
+</node>)";
+
+  /**
+   * @brief Portal Session interface XML used to observe explicit Close() calls.
+   */
+  constexpr const char *SESSION_XML = R"(
+<node>
+  <interface name='org.freedesktop.portal.Session'>
+    <method name='Close'/>
   </interface>
 </node>)";
 
@@ -175,6 +199,61 @@ namespace {
       return saw_restore_token_.load();
     }
 
+    /** @brief Simulate an unavailable RemoteDesktop portal while keeping ScreenCast available. */
+    void reject_remote_desktop() {
+      reject_remote_desktop_.store(true);
+    }
+
+    /** @brief Return the source type which the client actually requested, or zero if absent. */
+    guint32 requested_source_type() const {
+      return requested_source_type_.load();
+    }
+
+    /** @brief Return the multiplicity which the client actually requested, or -1 if absent. */
+    int requested_multiple() const {
+      return requested_multiple_.load();
+    }
+
+    /** @brief Simulate a virtual stream whose size is negotiated by PipeWire after Start. */
+    void omit_stream_geometry() {
+      omit_stream_geometry_.store(true);
+    }
+
+    /** @brief Override the reported stream type independently of the selected source type. */
+    void set_reported_source_type(guint32 source_type) {
+      reported_source_type_.store(source_type);
+    }
+
+    /** @brief Make RemoteDesktop.SelectDevices fail so fallback to ScreenCast-only triggers. */
+    void set_fail_select_devices(bool fail) {
+      fail_select_devices_.store(fail);
+    }
+
+    /** @brief Make ScreenCast.SelectSources fail for RemoteDesktop sessions so fallback triggers. */
+    void set_fail_remote_desktop_select_sources(bool fail) {
+      fail_remote_desktop_select_sources_.store(fail);
+    }
+
+    /**
+     * @brief Return the session paths explicitly closed via org.freedesktop.portal.Session.Close.
+     *
+     * @return Closed session object paths in call order.
+     */
+    std::vector<std::string> closed_sessions() const {
+      std::lock_guard lock {state_mutex_};
+      return closed_sessions_;
+    }
+
+    /**
+     * @brief Return the RemoteDesktop session paths created by the client.
+     *
+     * @return RemoteDesktop session object paths in creation order.
+     */
+    std::vector<std::string> remote_desktop_sessions() const {
+      std::lock_guard lock {state_mutex_};
+      return remote_desktop_sessions_;
+    }
+
   private:
     /**
      * @brief Connect to the bus, claim the portal name and export the portal object.
@@ -226,9 +305,39 @@ namespace {
     }
 
     /**
+     * @brief Record explicit org.freedesktop.portal.Session.Close calls.
+     */
+    static void handle_session_method_call([[maybe_unused]] GDBusConnection *conn, [[maybe_unused]] const gchar *sender, const gchar *object_path, [[maybe_unused]] const gchar *interface_name, const gchar *method_name, [[maybe_unused]] GVariant *parameters, GDBusMethodInvocation *invocation, gpointer user_data) {  // NOSONAR(cpp:S107): GDBusInterfaceMethodCallFunc signature.
+      auto *portal = static_cast<fake_portal_t *>(user_data);
+      if (g_str_equal(method_name, "Close")) {
+        {
+          std::lock_guard lock {portal->state_mutex_};
+          portal->closed_sessions_.emplace_back(object_path);
+        }
+        g_dbus_method_invocation_return_value(invocation, nullptr);
+        return;
+      }
+      g_dbus_method_invocation_return_error_literal(invocation, G_DBUS_ERROR, G_DBUS_ERROR_UNKNOWN_METHOD, "Unknown session method");
+    }
+
+    /**
+     * @brief Register org.freedesktop.portal.Session on a newly created session path.
+     *
+     * @param session_path D-Bus object path of the portal session.
+     */
+    void register_session_object(const gchar *session_path) {
+      g_autoptr(GDBusNodeInfo) node = g_dbus_node_info_new_for_xml(SESSION_XML, nullptr);
+      static const GDBusInterfaceVTable session_vtable {handle_session_method_call, nullptr, nullptr, {}};
+      const auto id = g_dbus_connection_register_object(conn_, session_path, node->interfaces[0], &session_vtable, this, nullptr, nullptr);
+      if (id != 0) {
+        registrations_.push_back(id);
+      }
+    }
+
+    /**
      * @brief Answer a portal method call, emitting the request's Response first.
      */
-    static void handle_method_call(GDBusConnection *conn, const gchar *sender, [[maybe_unused]] const gchar *object_path, [[maybe_unused]] const gchar *interface_name, const gchar *method_name, GVariant *parameters, GDBusMethodInvocation *invocation, gpointer user_data) {  // NOSONAR(cpp:S107): GDBusInterfaceMethodCallFunc signature.
+    static void handle_method_call(GDBusConnection *conn, const gchar *sender, [[maybe_unused]] const gchar *object_path, const gchar *interface_name, const gchar *method_name, GVariant *parameters, GDBusMethodInvocation *invocation, gpointer user_data) {  // NOSONAR(cpp:S107): GDBusInterfaceMethodCallFunc signature.
       auto *portal = static_cast<fake_portal_t *>(user_data);
       if (g_str_equal(method_name, "OpenPipeWireRemote")) {
         g_autoptr(GUnixFDList) fd_list = g_unix_fd_list_new();
@@ -253,6 +362,7 @@ namespace {
       g_autofree gchar *sender_id = g_strdelimit(g_strdup(sender + 1), ".", '_');
       g_autofree gchar *request_path = g_strdup_printf("%s/request/%s/%s", PORTAL_PATH, sender_id, handle_token);
 
+      guint32 response_code = g_str_equal(method_name, "CreateSession") && g_str_equal(interface_name, "org.freedesktop.portal.RemoteDesktop") && portal->reject_remote_desktop_.load() ? 2u : 0u;
       GVariantBuilder results;
       g_variant_builder_init(&results, G_VARIANT_TYPE_VARDICT);
       if (g_str_equal(method_name, "CreateSession")) {
@@ -260,11 +370,39 @@ namespace {
         g_variant_lookup(options, "session_handle_token", "&s", &session_token);
         g_autofree gchar *session_path = g_strdup_printf("%s/session/%s/%s", PORTAL_PATH, sender_id, session_token);
         portal->session_restore_tokens_[session_path] = false;
+        if (response_code == 0u) {
+          const bool is_remote_desktop = g_str_equal(interface_name, "org.freedesktop.portal.RemoteDesktop");
+          if (is_remote_desktop) {
+            std::lock_guard lock {portal->state_mutex_};
+            portal->remote_desktop_sessions_.emplace_back(session_path);
+          }
+          portal->register_session_object(session_path);
+        }
         g_variant_builder_add(&results, "{sv}", "session_handle", g_variant_new_string(session_path));
       } else {
         g_autoptr(GVariant) session_value = g_variant_get_child_value(parameters, 0);
         const gchar *session_path = g_variant_get_string(session_value, nullptr);
+        if (g_str_equal(method_name, "SelectDevices")) {
+          if (portal->fail_select_devices_.load()) {
+            response_code = 2u;
+          }
+        }
         if (g_str_equal(method_name, "SelectDevices") || g_str_equal(method_name, "SelectSources")) {
+          if (g_str_equal(method_name, "SelectSources")) {
+            if (portal->fail_remote_desktop_select_sources_.load()) {
+              std::lock_guard lock {portal->state_mutex_};
+              if (std::ranges::find(portal->remote_desktop_sessions_, session_path) != portal->remote_desktop_sessions_.end()) {
+                response_code = 2u;
+              }
+            }
+            guint32 types = 0;
+            gboolean multiple = FALSE;
+            g_variant_lookup(options, "types", "u", &types);
+            portal->requested_source_type_.store(types);
+            if (g_variant_lookup(options, "multiple", "b", &multiple)) {
+              portal->requested_multiple_.store(multiple);
+            }
+          }
           if (has_restore_token) {
             portal->session_restore_tokens_[session_path] = true;
             portal->saw_restore_token_.store(true);
@@ -276,8 +414,12 @@ namespace {
             // A geometry no real monitor has, so the stream is named by position and resolution
             GVariantBuilder properties;
             g_variant_builder_init(&properties, G_VARIANT_TYPE_VARDICT);
-            g_variant_builder_add(&properties, "{sv}", "size", g_variant_new("(ii)", 1234, 567));
-            g_variant_builder_add(&properties, "{sv}", "position", g_variant_new("(ii)", 7, 9));
+            if (!portal->omit_stream_geometry_.load()) {
+              g_variant_builder_add(&properties, "{sv}", "size", g_variant_new("(ii)", 1234, 567));
+              g_variant_builder_add(&properties, "{sv}", "position", g_variant_new("(ii)", 7, 9));
+            }
+            const auto reported_type = portal->reported_source_type_.load();
+            g_variant_builder_add(&properties, "{sv}", "source_type", g_variant_new_uint32(reported_type ? reported_type : portal->requested_source_type_.load()));
             GVariantBuilder streams;
             g_variant_builder_init(&streams, G_VARIANT_TYPE("a(ua{sv})"));
             g_variant_builder_add(&streams, "(ua{sv})", 42u, &properties);
@@ -293,7 +435,7 @@ namespace {
         }
       }
 
-      g_dbus_connection_emit_signal(conn, sender, request_path, "org.freedesktop.portal.Request", "Response", g_variant_new("(ua{sv})", 0u, &results), nullptr);
+      g_dbus_connection_emit_signal(conn, sender, request_path, "org.freedesktop.portal.Request", "Response", g_variant_new("(ua{sv})", response_code, &results), nullptr);
       g_dbus_method_invocation_return_value(invocation, g_variant_new("(o)", request_path));
     }
 
@@ -303,8 +445,18 @@ namespace {
     std::vector<guint> registrations_;
     std::map<std::string, bool> session_restore_tokens_;
     std::atomic<bool> saw_restore_token_ {false};
+    std::atomic<bool> reject_remote_desktop_ {false};
+    std::atomic<guint32> requested_source_type_ {0};
+    std::atomic<int> requested_multiple_ {-1};
+    std::atomic<guint32> reported_source_type_ {0};
+    std::atomic<bool> omit_stream_geometry_ {false};
+    std::atomic<bool> fail_select_devices_ {false};
+    std::atomic<bool> fail_remote_desktop_select_sources_ {false};
     std::atomic<bool> reject_restored_sessions_ {true};
     std::atomic<bool> emit_empty_streams_array_ {false};
+    mutable std::mutex state_mutex_;
+    std::vector<std::string> remote_desktop_sessions_;
+    std::vector<std::string> closed_sessions_;
     std::jthread thread_;
   };
 
@@ -467,7 +619,72 @@ TEST_F(PortalRequestTest, ReceivesResponseEmittedBeforeMethodReturns) {
   const auto names = platf::portal_display_names(true);
 
   EXPECT_EQ(names, std::vector<std::string> {"position-7x9-resolution-1234x567"});
+  EXPECT_EQ(fake_portal().requested_source_type(), 1u);
+  EXPECT_EQ(fake_portal().requested_multiple(), TRUE);
 }
+
+TEST_F(PortalRequestTest, SelectsSeparateVirtualRestoreTokenWithoutMigratingLegacyToken) {
+  const auto restore = util::fail_guard([original = config::video.capture]() {
+    config::video.capture = original;
+  });
+  const auto directory = token_path().parent_path();
+  const auto legacy_path = directory / "portal_token";
+  const auto monitor_path = directory / "portal_token.gnome";
+  std::ofstream(legacy_path) << "legacy-monitor-token";
+  ASSERT_TRUE(std::filesystem::exists(legacy_path));
+
+  config::video.capture = "portal-virtual";
+  EXPECT_EQ(portal::get_saved_token_path_for_testing(directory, "GNOME"), directory / "portal_token.gnome.virtual");
+  EXPECT_TRUE(std::filesystem::exists(legacy_path));
+  EXPECT_FALSE(std::filesystem::exists(monitor_path));
+
+  config::video.capture = "portal";
+  EXPECT_EQ(portal::get_saved_token_path_for_testing(directory, "GNOME"), monitor_path);
+  EXPECT_TRUE(std::filesystem::exists(monitor_path));
+  EXPECT_FALSE(std::filesystem::exists(legacy_path));
+}
+
+/** @brief Exercise virtual source selection in both combined and ScreenCast-only sessions. */
+class PortalVirtualSourceTest: public PortalRequestTest, public testing::WithParamInterface<bool> {};
+
+TEST_P(PortalVirtualSourceTest, RequestsExactlyOneVirtualDisplay) {
+  const auto restore = util::fail_guard([original = config::video.capture]() {
+    config::video.capture = original;
+  });
+  config::video.capture = "portal-virtual";
+  if (GetParam()) {
+    fake_portal().reject_remote_desktop();
+  }
+
+  fake_portal().omit_stream_geometry();
+  EXPECT_EQ(platf::portal_display_names(true), std::vector<std::string> {"portal-virtual"});
+  EXPECT_EQ(fake_portal().requested_source_type(), 4u);
+  EXPECT_EQ(fake_portal().requested_multiple(), FALSE);
+}
+
+TEST_P(PortalVirtualSourceTest, RefusesPhysicalStreamAndDoesNotSaveItsToken) {
+  const auto restore = util::fail_guard([original = config::video.capture]() {
+    config::video.capture = original;
+  });
+  config::video.capture = "portal-virtual";
+  if (GetParam()) {
+    fake_portal().reject_remote_desktop();
+  }
+  fake_portal().set_reported_source_type(1u);
+
+  EXPECT_TRUE(platf::portal_display_names(true).empty());
+  EXPECT_EQ(fake_portal().requested_source_type(), 4u);
+  EXPECT_FALSE(portal::has_saved_token());
+}
+
+INSTANTIATE_TEST_SUITE_P(
+  SessionType,
+  PortalVirtualSourceTest,
+  testing::Bool(),
+  [](const testing::TestParamInfo<bool> &info) {
+    return info.param ? "ScreenCastOnly" : "RemoteDesktop";
+  }
+);
 
 /**
  * @brief Parameterized stale-token recovery tests for omitted and empty `streams` responses.
@@ -513,5 +730,38 @@ TEST_F(PortalRequestTest, KeepsRestoreTokenWhenStartReturnsStreams) {
   std::string token;
   std::getline(file, token);
   EXPECT_EQ(token, "valid-token");
+}
+
+TEST_F(PortalRequestTest, SavesRestoreTokenWithOwnerOnlyPermissions) {
+  const auto names = platf::portal_display_names(true);
+
+  EXPECT_EQ(names, std::vector<std::string> {"position-7x9-resolution-1234x567"});
+  ASSERT_TRUE(std::filesystem::exists(token_path()));
+  const auto perms = std::filesystem::status(token_path()).permissions() & std::filesystem::perms::all;
+  EXPECT_EQ(perms, std::filesystem::perms::owner_read | std::filesystem::perms::owner_write);
+}
+
+TEST_F(PortalRequestTest, ClosesRemoteDesktopSessionWhenSelectDevicesFails) {
+  fake_portal().set_fail_select_devices(true);
+
+  const auto names = platf::portal_display_names(true);
+
+  EXPECT_EQ(names, std::vector<std::string> {"position-7x9-resolution-1234x567"});
+  const auto rd_sessions = fake_portal().remote_desktop_sessions();
+  const auto closed = fake_portal().closed_sessions();
+  ASSERT_EQ(rd_sessions.size(), 1u);
+  EXPECT_NE(std::ranges::find(closed, rd_sessions.front()), closed.end());
+}
+
+TEST_F(PortalRequestTest, ClosesRemoteDesktopSessionWhenSelectSourcesFails) {
+  fake_portal().set_fail_remote_desktop_select_sources(true);
+
+  const auto names = platf::portal_display_names(true);
+
+  EXPECT_EQ(names, std::vector<std::string> {"position-7x9-resolution-1234x567"});
+  const auto rd_sessions = fake_portal().remote_desktop_sessions();
+  const auto closed = fake_portal().closed_sessions();
+  ASSERT_EQ(rd_sessions.size(), 1u);
+  EXPECT_NE(std::ranges::find(closed, rd_sessions.front()), closed.end());
 }
 #endif

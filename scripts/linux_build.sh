@@ -285,7 +285,6 @@ function add_arch_deps() {
     'boost'
     'boost-libs'
     'cmake'
-    'curl'
     'doxygen'
     "gcc${gcc_version}"
     "gcc${gcc_version}-libs"
@@ -312,6 +311,7 @@ function add_arch_deps() {
     'python-jinja'  # glad OpenGL/EGL loader generator
     'qt6-base'
     'qt6-svg'
+    'rust'
     'shaderc'
     'udev'
     'vulkan-icd-loader'
@@ -337,6 +337,7 @@ function add_debian_based_deps() {
     "appstream"
     "bison"  # required if we need to compile doxygen
     "build-essential"
+    "cargo"
     "cmake"
     "desktop-file-utils"
     "${DOXYGEN}"
@@ -349,7 +350,6 @@ function add_debian_based_deps() {
     "graphviz"
     "imagemagick"  # necessary for system tray screenshots in unit tests
     "libcap-dev"  # KMS
-    "libcurl4-openssl-dev"
     "libdrm-dev"  # KMS
     "libevdev-dev"
     "libgbm-dev"
@@ -374,6 +374,7 @@ function add_debian_based_deps() {
     "npm"  # web-ui
     "python3-jinja2"  # glad OpenGL/EGL loader generator
     "qt6-base-dev"
+    "rustc"
     "systemd"
     "udev"
     "wget"  # necessary for cuda install with `run` file
@@ -461,6 +462,7 @@ function add_ubuntu_deps() {
 function add_fedora_deps() {
   dependencies+=(
     "appstream"
+    "cargo"
     "cmake"
     "desktop-file-utils"
     "${DOXYGEN}"
@@ -472,7 +474,6 @@ function add_fedora_deps() {
     "ImageMagick"  # necessary for system tray screenshots in unit tests
     "libappstream-glib"
     "libcap-devel"
-    "libcurl-devel"
     "libdrm-devel"
     "libevdev-devel"
     "libX11-devel"  # X11
@@ -497,6 +498,7 @@ function add_fedora_deps() {
     "qt6-qtbase-devel"
     "qt6-qtsvg-devel"
     "rpm-build"  # if you want to build an RPM binary package
+    "rust"
     "vulkan-loader-devel"
     "wget"  # necessary for cuda install with `run` file
     "which"  # necessary for cuda install with `run` file
@@ -615,6 +617,80 @@ if [[ "$(printf '%s\n' "$installed_version" "$min_version" | sort -V | head -n1)
   fi
 }
 
+function ensure_rust_toolchain() {
+  local min_rustc_version="1.82.0"
+
+  refresh_rust_env() {
+    for rust_bin in /cargo/bin "$HOME/.cargo/bin"; do
+      if [[ -d "$rust_bin" && ":$PATH:" != *":$rust_bin:"* ]]; then
+        export PATH="$rust_bin:$PATH"
+      fi
+    done
+  }
+
+  check_rust_ready() {
+    cargo --version >/dev/null 2>&1 || return 1
+    local rustc_out
+    rustc_out=$(rustc --version 2>/dev/null) || return 1
+    local rustc_ver
+    rustc_ver=$(awk '{print $2}' <<< "$rustc_out")
+    [[ -n "$rustc_ver" ]] || return 1
+    [[ "$(printf '%s\n' "$min_rustc_version" "$rustc_ver" | sort -V | head -n1)" == "$min_rustc_version" ]]
+  }
+
+  refresh_rust_env
+  if check_rust_ready; then
+    cargo --version
+    rustc --version
+    return 0
+  fi
+
+  if [[ "${SDS_AUTO_INSTALL_DEPS:-1}" != "1" ]]; then
+    echo "Rust toolchain (cargo/rustc >= ${min_rustc_version}) is missing or too old and SDS_AUTO_INSTALL_DEPS=0" >&2
+    return 1
+  fi
+
+  if command -v rustup >/dev/null 2>&1; then
+    echo "Installing/updating Rust stable toolchain via rustup..."
+    rustup toolchain install stable --profile minimal
+    rustup default stable
+  else
+    if [[ $EUID -ne 0 && -z "${sudo_cmd}" ]]; then
+      echo "Rust toolchain (cargo/rustc >= ${min_rustc_version}) is missing and automatic installation requires root or sudo (omit --sudo-off or mount /cargo/bin)" >&2
+      return 1
+    fi
+
+    if [[ "$distro" == "$DISTRO_DEBIAN" || "$distro" == "$DISTRO_UBUNTU" ]] && apt-cache show rustup >/dev/null 2>&1; then
+      echo "Installing rustup + stable toolchain..."
+      $package_update_command
+      $package_install_command rustup
+      rustup toolchain install stable --profile minimal
+      rustup default stable
+    else
+      local -a rust_pkgs=()
+      if [[ "$distro" == "$DISTRO_ARCH" ]]; then
+        rust_pkgs=("rust")
+      elif [[ "$distro" == "$DISTRO_FEDORA" ]]; then
+        rust_pkgs=("rust" "cargo")
+      else
+        rust_pkgs=("rustc" "cargo")
+      fi
+      echo "Installing missing Rust toolchain packages: ${rust_pkgs[*]}"
+      $package_update_command
+      $package_install_command "${rust_pkgs[@]}"
+    fi
+  fi
+
+  refresh_rust_env
+  if ! check_rust_ready; then
+    echo "Failed to install a working cargo/rustc toolchain >= ${min_rustc_version}" >&2
+    rustc --version 2>/dev/null || true
+    return 1
+  fi
+  cargo --version
+  rustc --version
+}
+
 function run_step_deps() {
   echo "Running step: Install dependencies"
 
@@ -634,6 +710,7 @@ function run_step_deps() {
 
   # Install the dependencies
   $package_install_command "${dependencies[@]}"
+  ensure_rust_toolchain
 
   # reload the environment
   # shellcheck source=/dev/null
@@ -709,6 +786,8 @@ function run_step_deps() {
 
 function run_step_cmake() {
   echo "Running step: CMake configure"
+
+  ensure_rust_toolchain
 
   # Setup NVM environment if needed (for web UI builds)
   setup_nvm_environment

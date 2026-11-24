@@ -9,6 +9,7 @@
 // standard includes
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <charconv>
 #include <filesystem>
 #include <format>
@@ -21,12 +22,15 @@
 
 // lib includes
 #include <boost/algorithm/string.hpp>
-#include <boost/asio/ssl/context.hpp>
 #include <boost/filesystem.hpp>
 #include <lizardbyte/common/env.h>
 #include <nlohmann/json.hpp>
+#include <openssl/rand.h>
 #include <Simple-Web-Server/crypto.hpp>
 #include <Simple-Web-Server/server_https.hpp>
+
+// local includes
+#include "confighttp.h"
 
 #if defined(_WIN32) || defined(__APPLE__)
   #include "platform/virtualhid_input.h"
@@ -43,9 +47,9 @@
   #include <CoreFoundation/CoreFoundation.h>
 #endif
 
+
 // local includes
 #include "config.h"
-#include "confighttp.h"
 #include "crypto.h"
 #include "display_device.h"
 #include "file_handler.h"
@@ -59,9 +63,12 @@
 #include "platform/permissions.h"
 #include "process.h"
 #include "rtsp.h"
+#include "sds/permissions.h"
+#include "sds/sds.h"
 #include "system_tray.h"
 #include "utility.h"
 #include "uuid.h"
+#include "webui_auth.h"
 
 using namespace std::literals;
 
@@ -570,17 +577,8 @@ namespace confighttp {
     BOOST_LOG(debug) << "METHOD :: "sv << request->method;
     BOOST_LOG(debug) << "DESTINATION :: "sv << request->path;
 
-    for (auto &[name, val] : request->header) {
-      BOOST_LOG(debug) << name << " -- " << (name == "Authorization" ? "CREDENTIALS REDACTED" : val);
-    }
-
-    BOOST_LOG(debug) << " [--] "sv;
-
-    for (auto &[name, val] : request->parse_query_string()) {
-      BOOST_LOG(debug) << name << " -- " << val;
-    }
-
-    BOOST_LOG(debug) << " [--] "sv;
+    // Authorization and CSRF tokens can appear in headers or query fields.
+    // Keep only the method and route in the request log.
   }
 
   /**
@@ -592,7 +590,7 @@ namespace confighttp {
     SimpleWeb::CaseInsensitiveMultimap headers;
     headers.emplace("Content-Type", "application/json");
     headers.emplace("X-Frame-Options", "DENY");
-    headers.emplace("Content-Security-Policy", "frame-ancestors 'none';");
+    headers.emplace("Content-Security-Policy", WEB_UI_CSP);
     response->write(output_tree.dump(), headers);
   }
 
@@ -602,7 +600,7 @@ namespace confighttp {
    * @param request The HTTP request object.
    */
   void send_unauthorized(const resp_https_t &response, const req_https_t &request) {
-    auto address = net::addr_to_normalized_string(request->remote_endpoint().address());
+    auto address = net::addr_to_normalized_string(boost::asio::ip::make_address(request->remote_endpoint().address().to_string()));
     BOOST_LOG(info) << "Web UI: ["sv << address << "] -- not authorized"sv;
 
     constexpr auto code = SimpleWeb::StatusCode::client_error_unauthorized;
@@ -616,7 +614,7 @@ namespace confighttp {
       {"Content-Type", "application/json"},
       {"WWW-Authenticate", R"(Basic realm="Sunshine Gamestream Host", charset="UTF-8")"},
       {"X-Frame-Options", "DENY"},
-      {"Content-Security-Policy", "frame-ancestors 'none';"}
+      {"Content-Security-Policy", WEB_UI_CSP}
     };
 
     response->write(code, tree.dump(), headers);
@@ -629,14 +627,42 @@ namespace confighttp {
    * @param path The path to redirect to.
    */
   void send_redirect(const resp_https_t &response, const req_https_t &request, const char *path) {
-    auto address = net::addr_to_normalized_string(request->remote_endpoint().address());
+    auto address = net::addr_to_normalized_string(boost::asio::ip::make_address(request->remote_endpoint().address().to_string()));
     BOOST_LOG(info) << "Web UI: ["sv << address << "] -- not authorized"sv;
     const SimpleWeb::CaseInsensitiveMultimap headers {
       {"Location", path},
       {"X-Frame-Options", "DENY"},
-      {"Content-Security-Policy", "frame-ancestors 'none';"}
+      {"Content-Security-Policy", WEB_UI_CSP}
     };
     response->write(SimpleWeb::StatusCode::redirection_temporary_redirect, headers);
+  }
+
+  /**
+   * @brief Send a 429 Too Many Requests response for a locked-out login.
+   * @param response The HTTP response object.
+   * @param request The HTTP request object.
+   * @param retry_after Remaining lockout, sent in the Retry-After header.
+   */
+  void send_too_many_requests(const resp_https_t &response, const req_https_t &request, const std::chrono::seconds retry_after) {
+    auto address = net::addr_to_normalized_string(boost::asio::ip::make_address(request->remote_endpoint().address().to_string()));
+    BOOST_LOG(warning) << "Web UI: ["sv << address << "] -- login refused while locked out ("sv << retry_after.count() << "s remaining)"sv;
+
+    constexpr auto code = SimpleWeb::StatusCode::client_error_too_many_requests;
+
+    nlohmann::json tree;
+    tree["status_code"] = code;
+    tree["status"] = false;
+    tree["error"] = "Too many failed login attempts";
+
+    // No WWW-Authenticate header: the browser must not prompt for credentials again while locked.
+    const SimpleWeb::CaseInsensitiveMultimap headers {
+      {"Content-Type", "application/json"},
+      {"Retry-After", std::to_string(retry_after.count())},
+      {"X-Frame-Options", "DENY"},
+      {"Content-Security-Policy", WEB_UI_CSP}
+    };
+
+    response->write(code, tree.dump(), headers);
   }
 
   /**
@@ -646,46 +672,42 @@ namespace confighttp {
    * @return True if the user is authenticated, false otherwise.
    */
   bool authenticate(const resp_https_t &response, const req_https_t &request) {
-    auto address = net::addr_to_normalized_string(request->remote_endpoint().address());
+    const auto remote = boost::asio::ip::make_address(request->remote_endpoint().address().to_string());
+    auto address = net::addr_to_normalized_string(remote);
 
     if (const auto ip_type = net::from_address(address); ip_type > http::origin_web_ui_allowed) {
       BOOST_LOG(info) << "Web UI: ["sv << address << "] -- denied"sv;
-      response->write(SimpleWeb::StatusCode::client_error_forbidden);
+      const SimpleWeb::CaseInsensitiveMultimap headers {
+        {"X-Frame-Options", "DENY"},
+        {"Content-Security-Policy", WEB_UI_CSP}
+      };
+      response->write(SimpleWeb::StatusCode::client_error_forbidden, headers);
       return false;
     }
 
-    // If credentials are shown, redirect the user to a /welcome page
+    // Credentials are created before startup; if they are missing, show the instructions page.
     if (config::sunshine.username.empty()) {
       send_redirect(response, request, "/welcome");
       return false;
     }
 
-    auto fg = util::fail_guard([&]() {
-      send_unauthorized(response, request);
-    });
-
-    const auto auth = request->header.find("authorization");
-    if (auth == request->header.end()) {
-      return false;
+    std::optional<std::string_view> authorization;
+    if (const auto auth = request->header.find("authorization"); auth != request->header.end()) {
+      authorization = auth->second;
     }
 
-    const auto &rawAuth = auth->second;
-    auto authData = SimpleWeb::Crypto::Base64::decode(rawAuth.substr("Basic "sv.length()));
-
-    const auto index = static_cast<int>(authData.find(':'));
-    if (index >= authData.size() - 1) {
-      return false;
+    switch (const auto result = webui_auth::authenticate(authorization, remote); result.outcome) {
+      case webui_auth::outcome_e::authenticated:
+        return true;
+      case webui_auth::outcome_e::locked_out:
+        send_too_many_requests(response, request, result.retry_after);
+        return false;
+      case webui_auth::outcome_e::missing:
+      case webui_auth::outcome_e::rejected:
+      default:
+        send_unauthorized(response, request);
+        return false;
     }
-
-    const auto username = authData.substr(0, index);
-    const auto password = authData.substr(index + 1);
-
-    if (const auto hash = util::hex(crypto::hash(password + config::sunshine.salt)).to_string(); !boost::iequals(username, config::sunshine.username) || hash != config::sunshine.password) {
-      return false;
-    }
-
-    fg.disable();
-    return true;
   }
 
   /**
@@ -704,7 +726,7 @@ namespace confighttp {
     SimpleWeb::CaseInsensitiveMultimap headers;
     headers.emplace("Content-Type", "application/json");
     headers.emplace("X-Frame-Options", "DENY");
-    headers.emplace("Content-Security-Policy", "frame-ancestors 'none';");
+    headers.emplace("Content-Security-Policy", WEB_UI_CSP);
 
     response->write(code, tree.dump(), headers);
   }
@@ -726,7 +748,7 @@ namespace confighttp {
     SimpleWeb::CaseInsensitiveMultimap headers;
     headers.emplace("Content-Type", "application/json");
     headers.emplace("X-Frame-Options", "DENY");
-    headers.emplace("Content-Security-Policy", "frame-ancestors 'none';");
+    headers.emplace("Content-Security-Policy", WEB_UI_CSP);
 
     response->write(code, tree.dump(), headers);
   }
@@ -777,17 +799,20 @@ namespace confighttp {
     }
 
     // Fall back to IP address if no username
-    return net::addr_to_normalized_string(request->remote_endpoint().address());
+    return net::addr_to_normalized_string(boost::asio::ip::make_address(request->remote_endpoint().address().to_string()));
   }
 
   /**
    * @brief Generate a new CSRF token for a client.
    * @param client_id A unique identifier for the client (e.g., session ID or username).
-   * @return The generated CSRF token.
+   * @return The generated CSRF token, or no value if the random generator fails.
    */
-  std::string generate_csrf_token(const std::string &client_id) {
-    // Generate a cryptographically secure random token
-    std::string token = crypto::rand_alphabet(CSRF_TOKEN_SIZE);
+  static std::optional<std::string> generate_csrf_token(const std::string &client_id) {
+    std::array<unsigned char, CSRF_TOKEN_SIZE> bytes {};
+    if (RAND_bytes(bytes.data(), static_cast<int>(bytes.size())) != 1) {
+      return std::nullopt;
+    }
+    auto token = util::hex_vec(bytes);
 
     std::scoped_lock lock(csrf_tokens_mutex);
 
@@ -819,7 +844,7 @@ namespace confighttp {
     const auto token_it = csrf_tokens.find(client_id);
 
     if (token_it == csrf_tokens.end()) {
-      auto address = net::addr_to_normalized_string(request->remote_endpoint().address());
+      auto address = net::addr_to_normalized_string(boost::asio::ip::make_address(request->remote_endpoint().address().to_string()));
       BOOST_LOG(error) << "Web UI: ["sv << address << "] -- CSRF token validation failed: no token found for client"sv;
       bad_request(response, "Invalid CSRF token");
       return false;
@@ -827,14 +852,14 @@ namespace confighttp {
 
     if (const auto now = std::chrono::steady_clock::now(); token_it->second.expiration < now) {
       csrf_tokens.erase(token_it);
-      auto address = net::addr_to_normalized_string(request->remote_endpoint().address());
+      auto address = net::addr_to_normalized_string(boost::asio::ip::make_address(request->remote_endpoint().address().to_string()));
       BOOST_LOG(error) << "Web UI: ["sv << address << "] -- CSRF token validation failed: token expired"sv;
       bad_request(response, "CSRF token expired");
       return false;
     }
 
-    if (token_it->second.token != provided_token) {
-      auto address = net::addr_to_normalized_string(request->remote_endpoint().address());
+    if (!webui_auth::constant_time_equals(token_it->second.token, provided_token)) {
+      auto address = net::addr_to_normalized_string(boost::asio::ip::make_address(request->remote_endpoint().address().to_string()));
       BOOST_LOG(error) << "Web UI: ["sv << address << "] -- CSRF token validation failed: token mismatch"sv;
       bad_request(response, "Invalid CSRF token");
       return false;
@@ -860,45 +885,51 @@ namespace confighttp {
       });
     };
 
-    // Check if the request is from the same origin (Origin or Referer header matches configured allowed origins)
-    const auto origin_it = request->header.find("Origin");
-    if (origin_it != request->header.end() && is_allowed_origin(origin_it->second)) {
-      // Same origin request - allow without CSRF token
-      return true;
-    }
-
-    // If we have a Referer header, check if it's same-origin
-    const auto referer_it = request->header.find("Referer");
-    if (referer_it != request->header.end() && is_allowed_origin(referer_it->second)) {
-      // Same origin request - allow without CSRF token
-      return true;
-    }
-
-    // If neither Origin nor Referer is present, this cannot be a browser-initiated CSRF attack.
-    // Non-browser clients (e.g. curl, scripts) never send these headers, and a malicious web page
-    // cannot cause a non-browser client to make requests on a user's behalf.
-    if (origin_it == request->header.end() && referer_it == request->header.end()) {
-      return true;
-    }
-
-    // A browser-like request arrived with an Origin/Referer that doesn't match an allowed origin.
-    // Require a CSRF token.
-    const std::string_view blocked_origin = (origin_it != request->header.end()) ? origin_it->second : referer_it->second;
-    // Extract token from X-CSRF-Token header
     const auto header_it = request->header.find("X-CSRF-Token");
-    if (header_it == request->header.end()) {
-      // Also check query parameters as fallback
-      auto query_params = request->parse_query_string();
-      const auto query_it = query_params.find("csrf_token");
-      if (query_it == query_params.end()) {
-        auto address = net::addr_to_normalized_string(request->remote_endpoint().address());
-        BOOST_LOG(error) << "Web UI: ["sv << address << "] -- CSRF protection blocked request from origin: "sv << blocked_origin;
-        BOOST_LOG(error) << "Web UI: To allow this origin, add it to the 'csrf_allowed_origins' option in your Sunshine configuration"sv;
-        bad_request(response, "Missing CSRF token");
+    const auto token_count = request->header.count("X-CSRF-Token");
+
+    // If Origin is present, it is authoritative: a disallowed or duplicated Origin must fail
+    // immediately without falling back to Referer.
+    const auto origin_count = request->header.count("Origin");
+    if (origin_count > 1) {
+      auto address = net::addr_to_normalized_string(boost::asio::ip::make_address(request->remote_endpoint().address().to_string()));
+      BOOST_LOG(error) << "Web UI: ["sv << address << "] -- CSRF protection blocked request: multiple Origin headers"sv;
+      bad_request(response, header_it == request->header.end() ? "Missing CSRF token" : "Origin not allowed");
+      return false;
+    }
+
+    const auto origin_it = request->header.find("Origin");
+    if (origin_it != request->header.end()) {
+      if (!is_allowed_origin(origin_it->second)) {
+        auto address = net::addr_to_normalized_string(boost::asio::ip::make_address(request->remote_endpoint().address().to_string()));
+        BOOST_LOG(error) << "Web UI: ["sv << address << "] -- CSRF protection blocked request: browser origin not allowed"sv;
+        bad_request(response, header_it == request->header.end() ? "Missing CSRF token" : "Origin not allowed");
         return false;
       }
+    } else {
+      const auto referer_count = request->header.count("Referer");
+      const auto referer_it = request->header.find("Referer");
+      if (referer_count > 1 || (referer_it != request->header.end() && !is_allowed_origin(referer_it->second))) {
+        auto address = net::addr_to_normalized_string(boost::asio::ip::make_address(request->remote_endpoint().address().to_string()));
+        BOOST_LOG(error) << "Web UI: ["sv << address << "] -- CSRF protection blocked request: browser referer not allowed"sv;
+        bad_request(response, header_it == request->header.end() ? "Missing CSRF token" : "Origin not allowed");
+        return false;
+      }
+    }
 
-      return validate_stored_csrf_token(response, request, client_id, query_it->second);
+    // Same-origin Origin/Referer headers never bypass token verification: every state-changing
+    // request must carry a valid X-CSRF-Token header.
+    if (header_it == request->header.end()) {
+      auto address = net::addr_to_normalized_string(boost::asio::ip::make_address(request->remote_endpoint().address().to_string()));
+      BOOST_LOG(error) << "Web UI: ["sv << address << "] -- CSRF protection blocked request: missing CSRF token"sv;
+      bad_request(response, "Missing CSRF token");
+      return false;
+    }
+    if (token_count > 1) {
+      auto address = net::addr_to_normalized_string(boost::asio::ip::make_address(request->remote_endpoint().address().to_string()));
+      BOOST_LOG(error) << "Web UI: ["sv << address << "] -- CSRF protection blocked request: duplicate CSRF token header"sv;
+      bad_request(response, "Invalid CSRF token");
+      return false;
     }
 
     // Validate token from header
@@ -943,7 +974,7 @@ namespace confighttp {
 
     // prevent click jacking
     headers.emplace("X-Frame-Options", "DENY");
-    headers.emplace("Content-Security-Policy", "frame-ancestors 'none';");
+    headers.emplace("Content-Security-Policy", WEB_UI_CSP);
 
     response->write(content, headers);
   }
@@ -976,7 +1007,7 @@ namespace confighttp {
     SimpleWeb::CaseInsensitiveMultimap headers;
     headers.emplace("Content-Type", "image/x-icon");
     headers.emplace("X-Frame-Options", "DENY");
-    headers.emplace("Content-Security-Policy", "frame-ancestors 'none';");
+    headers.emplace("Content-Security-Policy", WEB_UI_CSP);
     response->write(SimpleWeb::StatusCode::success_ok, in, headers);
   }
 
@@ -994,7 +1025,7 @@ namespace confighttp {
     SimpleWeb::CaseInsensitiveMultimap headers;
     headers.emplace("Content-Type", "image/png");
     headers.emplace("X-Frame-Options", "DENY");
-    headers.emplace("Content-Security-Policy", "frame-ancestors 'none';");
+    headers.emplace("Content-Security-Policy", WEB_UI_CSP);
     response->write(SimpleWeb::StatusCode::success_ok, in, headers);
   }
 
@@ -1047,7 +1078,7 @@ namespace confighttp {
     SimpleWeb::CaseInsensitiveMultimap headers;
     headers.emplace("Content-Type", mimeType->second);
     headers.emplace("X-Frame-Options", "DENY");
-    headers.emplace("Content-Security-Policy", "frame-ancestors 'none';");
+    headers.emplace("Content-Security-Policy", WEB_UI_CSP);
     std::ifstream in(filePath.string(), std::ios::binary);
     response->write(SimpleWeb::StatusCode::success_ok, in, headers);
   }
@@ -1066,11 +1097,15 @@ namespace confighttp {
 
     print_req(request);
 
-    std::string client_id = get_client_id(request);
-    std::string token = generate_csrf_token(client_id);
+    const auto token = generate_csrf_token(get_client_id(request));
+    if (!token) {
+      BOOST_LOG(error) << "Web UI: could not generate CSRF token"sv;
+      response->write(SimpleWeb::StatusCode::server_error_internal_server_error);
+      return;
+    }
 
     nlohmann::json output_tree;
-    output_tree["csrf_token"] = token;
+    output_tree["csrf_token"] = *token;
     send_response(response, output_tree);
   }
 
@@ -1289,7 +1324,6 @@ namespace confighttp {
       nlohmann::json output_tree;
       nlohmann::json input_tree = nlohmann::json::parse(ss);
       std::string file = file_handler::read_file(config::stream.file_apps.c_str());
-      BOOST_LOG(info) << file;
       nlohmann::json file_tree = nlohmann::json::parse(file);
 
       normalize_optional_app_fields(input_tree);
@@ -1323,9 +1357,9 @@ namespace confighttp {
 
       output_tree["status"] = true;
       send_response(response, output_tree);
-    } catch (std::exception &e) {
-      BOOST_LOG(warning) << "SaveApp: "sv << e.what();
-      bad_request(response, e.what());
+    } catch (const std::exception &) {
+      BOOST_LOG(warning) << "SaveApp: could not process application configuration"sv;
+      bad_request(response, "Could not process application configuration");
     }
   }
 
@@ -1469,6 +1503,7 @@ namespace confighttp {
         auto cert = nvhttp::get_cert_by_uuid(uuid);
         if (!cert.empty()) {
           rtsp_stream::terminate_sessions_by_cert(cert);
+          sds::on_client_changed(cert);
         }
 
         if (rtsp_stream::session_count() == 0 && proc::proc.running() > 0) {
@@ -1481,6 +1516,56 @@ namespace confighttp {
       BOOST_LOG(warning) << "Update Client: "sv << e.what();
       bad_request(response, e.what());
     }
+  }
+
+  void updateClientPermissions(const resp_https_t &response, const req_https_t &request) {
+    if (!check_content_type(response, request, "application/json")) {
+      return;
+    }
+    if (!authenticate(response, request)) {
+      return;
+    }
+    std::string client_id = get_client_id(request);
+    if (!validate_csrf_token(response, request, client_id)) {
+      return;
+    }
+
+    print_req(request);
+
+    std::stringstream ss;
+    ss << request->content.rdbuf();
+    const nlohmann::json input_tree = nlohmann::json::parse(ss.str(), nullptr, false);
+    if (input_tree.is_discarded() || !input_tree.is_object()) {
+      bad_request(response, "Invalid JSON");
+      return;
+    }
+    const auto uuid_it = input_tree.find("uuid");
+    const auto permissions_it = input_tree.find("permissions");
+    if (uuid_it == input_tree.end() || !uuid_it->is_string() || permissions_it == input_tree.end() || !permissions_it->is_array()) {
+      bad_request(response, "uuid and permissions are required");
+      return;
+    }
+    std::vector<std::string> permissions;
+    for (const auto &permission : *permissions_it) {
+      if (!permission.is_string()) {
+        bad_request(response, "permissions must be strings");
+        return;
+      }
+      permissions.push_back(permission.get<std::string>());
+    }
+    if (!sds::all_permissions_known(permissions)) {
+      bad_request(response, "Unknown permission");
+      return;
+    }
+
+    const auto uuid = uuid_it->get<std::string>();
+    nlohmann::json output_tree;
+    output_tree["status"] = nvhttp::set_client_permissions(uuid, permissions);
+    if (output_tree["status"]) {
+      output_tree["permissions"] = sds::normalize_permissions(permissions);
+      sds::on_client_changed(nvhttp::get_cert_by_uuid(uuid));
+    }
+    send_response(response, output_tree);
   }
 
   /**
@@ -1519,8 +1604,13 @@ namespace confighttp {
       nlohmann::json output_tree;
       const nlohmann::json input_tree = nlohmann::json::parse(ss);
       const std::string uuid = input_tree.value("uuid", "");
+      const auto cert = nvhttp::get_cert_by_uuid(uuid);
       const bool removed = nvhttp::unpair_client(uuid);
       output_tree["status"] = removed;
+      if (removed && !cert.empty()) {
+        rtsp_stream::terminate_sessions_by_cert(cert);
+        sds::on_client_changed(cert);
+      }
 
       if (removed && nvhttp::get_all_clients().empty()) {
         proc::proc.terminate();
@@ -1552,7 +1642,12 @@ namespace confighttp {
 
     print_req(request);
 
+    const auto removed_certs = nvhttp::get_all_client_certs();
     nvhttp::erase_all_clients();
+    rtsp_stream::terminate_sessions();
+    for (const auto &cert : removed_certs) {
+      sds::on_client_changed(cert);
+    }
     proc::proc.terminate();
 
     nlohmann::json output_tree;
@@ -1717,13 +1812,37 @@ namespace confighttp {
       SimpleWeb::CaseInsensitiveMultimap headers;
       headers.emplace("Content-Type", "image/png");
       headers.emplace("X-Frame-Options", "DENY");
-      headers.emplace("Content-Security-Policy", "frame-ancestors 'none';");
+      headers.emplace("Content-Security-Policy", WEB_UI_CSP);
 
       response->write(SimpleWeb::StatusCode::success_ok, in, headers);
     } catch (std::exception &e) {
       BOOST_LOG(warning) << "GetCover: "sv << e.what();
       bad_request(response, e.what());
     }
+  }
+
+  std::optional<std::string_view> validate_cover_image(const std::string_view data, std::string &error) {
+    static constexpr std::string_view png_signature {"\x89PNG\r\n\x1a\n", 8};
+
+    if (data.empty()) {
+      error = "Cover image data is required";
+      return std::nullopt;
+    }
+    if (data.size() > COVER_MAX_SIZE) {
+      error = std::format("Cover image is too large (at most {} bytes)", COVER_MAX_SIZE);
+      return std::nullopt;
+    }
+    if (data.starts_with(png_signature)) {
+      return ".png"sv;
+    }
+    error = "Cover image must be a PNG file";
+    return std::nullopt;
+  }
+
+  bool is_valid_cover_key(const std::string_view key) {
+    return !key.empty() && key.size() <= 64 && std::ranges::all_of(key, [](const unsigned char c) {
+      return std::isalnum(c) || c == '_' || c == '-';
+    });
   }
 
   /**
@@ -1733,12 +1852,14 @@ namespace confighttp {
    * The body for the post request should be JSON serialized in the following format:
    * @code{.json}
    * {
-   *   "key": "igdb_<game_id>",
-   *   "url": "https://images.igdb.com/igdb/image/upload/t_cover_big_2x/<slug>.png"
+   *   "key": "<1-64 characters: letters, digits, '_' or '-'>",
+   *   "data": "<base64-encoded PNG image, at most COVER_MAX_SIZE bytes (about 2.95 MiB)>"
    * }
    * @endcode
    *
-   * @api_examples{/api/covers/upload|:| POST|:| {"key":"igdb_1234","url":"https://images.igdb.com/igdb/image/upload/t_cover_big_2x/abc123.png"}}
+   * Downloading covers from a URL is not supported: Sunshine makes no outbound connections.
+   *
+   * @api_examples{/api/covers/upload|:| POST|:| {"key":"my_game","data":"iVBORw0KGgo..."}}
    */
   void uploadCover(const resp_https_t &response, const req_https_t &request) {
     if (!check_content_type(response, request, "application/json")) {
@@ -1748,38 +1869,51 @@ namespace confighttp {
       return;
     }
 
+    std::string client_id = get_client_id(request);
+    if (!validate_csrf_token(response, request, client_id)) {
+      return;
+    }
+
     std::stringstream ss;
     ss << request->content.rdbuf();
     try {
       nlohmann::json output_tree;
       nlohmann::json input_tree = nlohmann::json::parse(ss);
 
-      std::string key = input_tree.value("key", "");
-      if (key.empty()) {
-        bad_request(response, "Cover key is required");
+      if (input_tree.contains("url")) {
+        bad_request(response, "Downloading covers from a URL is not supported");
         return;
       }
-      std::string url = input_tree.value("url", "");
 
-      const std::string coverdir = platf::appdata().string() + "/covers/";
-      file_handler::make_directory(coverdir);
-
-      std::basic_string path = coverdir + http::url_escape(key) + ".png";
-      if (!url.empty()) {
-        if (http::url_get_host(url) != "images.igdb.com") {
-          bad_request(response, "Only images.igdb.com is allowed");
-          return;
-        }
-        if (!http::download_file(url, path)) {
-          bad_request(response, "Failed to download cover");
-          return;
-        }
-      } else {
-        auto data = SimpleWeb::Crypto::Base64::decode(input_tree.value("data", ""));
-
-        std::ofstream imgfile(path);
-        imgfile.write(data.data(), static_cast<int>(data.size()));
+      const std::string key = input_tree.value("key", "");
+      if (!is_valid_cover_key(key)) {
+        bad_request(response, "Cover key must be 1-64 letters, digits, '_' or '-'");
+        return;
       }
+
+      const auto data = webui_auth::base64_decode(input_tree.value("data", ""));
+      if (!data) {
+        bad_request(response, "Cover image data is not valid base64");
+        return;
+      }
+      std::string error;
+      const auto extension = validate_cover_image(*data, error);
+      if (!extension) {
+        bad_request(response, error);
+        return;
+      }
+
+      const auto coverdir = platf::appdata() / "covers";
+      file_handler::make_directory(coverdir.string());
+      const auto path = (coverdir / (key + std::string {*extension})).string();
+
+      std::ofstream imgfile(path, std::ios::binary | std::ios::trunc);
+      imgfile.write(data->data(), static_cast<std::streamsize>(data->size()));
+      if (!imgfile) {
+        bad_request(response, "Failed to save the cover image");
+        return;
+      }
+
       output_tree["status"] = true;
       output_tree["path"] = path;
       send_response(response, output_tree);
@@ -1807,7 +1941,7 @@ namespace confighttp {
     SimpleWeb::CaseInsensitiveMultimap headers;
     headers.emplace("Content-Type", "text/plain");
     headers.emplace("X-Frame-Options", "DENY");
-    headers.emplace("Content-Security-Policy", "frame-ancestors 'none';");
+    headers.emplace("Content-Security-Policy", WEB_UI_CSP);
     response->write(SimpleWeb::StatusCode::success_ok, content, headers);
   }
 
@@ -1832,7 +1966,9 @@ namespace confighttp {
     if (!check_content_type(response, request, "application/json")) {
       return;
     }
-    if (!config::sunshine.username.empty() && !authenticate(response, request)) {
+    // Changing credentials always requires the current ones: there is no unauthenticated
+    // first-run setup (credentials are created with `sunshine --creds` before startup).
+    if (!authenticate(response, request)) {
       return;
     }
 
@@ -1862,13 +1998,16 @@ namespace confighttp {
       if (newUsername.empty()) {
         errors.emplace_back("Invalid Username");
       } else {
-        auto hash = util::hex(crypto::hash(password + config::sunshine.salt)).to_string();
-        if (config::sunshine.username.empty() || (boost::iequals(username, config::sunshine.username) && hash == config::sunshine.password)) {
+        const bool current_valid = !config::sunshine.username.empty() &&
+                                   webui_auth::constant_time_equals(boost::to_lower_copy(username), boost::to_lower_copy(config::sunshine.username)) &&
+                                   webui_auth::verify_password(password, config::sunshine.password, config::sunshine.salt) != webui_auth::password_match_e::mismatch;
+        if (current_valid) {
           if (newPassword.empty() || newPassword != confirmPassword) {
             errors.emplace_back("Password Mismatch");
+          } else if (http::save_user_creds(config::sunshine.credentials_file, newUsername, newPassword) != 0 || http::reload_user_creds(config::sunshine.credentials_file) != 0) {
+            errors.emplace_back("Failed to save the new credentials");
           } else {
-            http::save_user_creds(config::sunshine.credentials_file, newUsername, newPassword);
-            http::reload_user_creds(config::sunshine.credentials_file);
+            webui_auth::clear_verification_cache();
             output_tree["status"] = true;
           }
         } else {
@@ -1886,9 +2025,9 @@ namespace confighttp {
       }
 
       send_response(response, output_tree);
-    } catch (std::exception &e) {
-      BOOST_LOG(warning) << "SavePassword: "sv << e.what();
-      bad_request(response, e.what());
+    } catch (const std::exception &) {
+      BOOST_LOG(warning) << "SavePassword: could not process credential change"sv;
+      bad_request(response, "Could not process credential change");
     }
   }
 
@@ -2543,6 +2682,38 @@ namespace confighttp {
     }
   }
 
+  void configure_server_limits(https_server_t &server) {
+    server.config.max_request_streambuf_size = MAX_REQUEST_SIZE;
+    server.config.max_request_header_size = 64 * 1024;
+    server.config.timeout_content = 30;
+    auto limiter = std::make_shared<http::connection_limiter_t>(64);
+    server.on_connection_accepted = [limiter](const req_https_t &request) {
+      auto lease = limiter->try_acquire();
+      if (!lease) {
+        return false;
+      }
+      request->connection_context(std::move(lease));
+      return true;
+    };
+    server.on_request_header = [](const req_https_t &request) {
+      return http::validate_request_framing(request->raw_header, request->header, MAX_REQUEST_SIZE);
+    };
+    server.on_error = [](const req_https_t &, const SimpleWeb::error_code &ec) {
+      if (ec == SimpleWeb::error::operation_aborted || ec == SimpleWeb::error::eof) {
+        return;
+      }
+      BOOST_LOG(debug) << "Web UI HTTPS server transport error: "sv << ec.message();
+    };
+  }
+
+  std::string resolve_bind_address(const net::af_e address_family, const std::string_view origin_web_ui_allowed) {
+    if (net::from_enum_string(origin_web_ui_allowed) == net::PC) {
+      const auto effective_af = net::get_effective_address_family(address_family);
+      return effective_af == net::IPV4 ? "127.0.0.1" : "::1";
+    }
+    return net::get_bind_address(address_family);
+  }
+
   /**
    * @brief Start the HTTPS configuration server.
    */
@@ -2587,6 +2758,7 @@ namespace confighttp {
     server.resource["^/api/clients/unpair$"]["POST"] = unpair;
     server.resource["^/api/clients/unpair-all$"]["POST"] = unpairAll;
     server.resource["^/api/clients/update$"]["POST"] = updateClient;
+    server.resource["^/api/clients/permissions$"]["POST"] = updateClientPermissions;
     server.resource["^/api/config$"]["GET"] = getConfig;
     server.resource["^/api/config$"]["POST"] = saveConfig;
     server.resource["^/api/configLocale$"]["GET"] = getLocale;
@@ -2613,10 +2785,13 @@ namespace confighttp {
     server.resource["^/assets\\/.+$"]["GET"] = getAsset;
 
     server.config.reuse_address = true;
-    server.config.address = net::get_bind_address(address_family);
+    server.config.address = resolve_bind_address(address_family, config::nvhttp.origin_web_ui_allowed);
     server.config.port = port_https;
+    configure_server_limits(server);
 
-    const auto display_addr = net::get_bind_address_url_host();
+    const auto display_addr = net::from_enum_string(config::nvhttp.origin_web_ui_allowed) == net::PC
+      ? (server.config.address == "::1" ? "[::1]"s : "127.0.0.1"s)
+      : net::get_bind_address_url_host();
 
     auto accept_and_run = [&](auto *https_server) {
       try {
@@ -2624,7 +2799,7 @@ namespace confighttp {
         https_server->start([&display_addr](const unsigned short port) {
           BOOST_LOG(info) << "Configuration UI available at [https://"sv << display_addr << ":" << port << "]";
         });
-      } catch (boost::system::system_error &err) {
+      } catch (const std::exception &err) {
         // It's possible the exception gets thrown after calling server->stop() from a different thread
         if (shutdown_event->peek()) {
           return;

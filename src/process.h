@@ -100,6 +100,7 @@ namespace proc {
     ):
         _app_id(0),
         _env(std::move(env)),
+        _base_env(_env),
         _apps(std::move(apps)) {
     }
 
@@ -173,6 +174,7 @@ namespace proc {
     int _app_id;
 
     boost::process::v1::environment _env;
+    boost::process::v1::environment _base_env;
     std::vector<ctx_t> _apps;
     ctx_t _app;
     std::chrono::steady_clock::time_point _app_launch_time;
@@ -241,6 +243,11 @@ namespace proc {
    * @param exit_timeout The timeout to wait for the process group to gracefully exit.
    */
   void terminate_process_group(boost::process::v1::child &child_process, boost::process::v1::group &group, std::chrono::seconds exit_timeout);
+
+  /**
+   * @brief Populate per-session GPU render/capture offload environment variables from `adapter`.
+   */
+  void apply_capture_gpu_env(boost::process::v1::environment &env, const std::optional<platf::render_adapter_t> &adapter);
 
   extern proc_t proc;
 }  // namespace proc

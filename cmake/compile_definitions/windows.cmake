@@ -73,8 +73,13 @@ set(PLATFORM_TARGET_FILES
         "${CMAKE_SOURCE_DIR}/src/platform/windows/display_ram.cpp"
         "${CMAKE_SOURCE_DIR}/src/platform/windows/display_wgc.cpp"
         "${CMAKE_SOURCE_DIR}/src/platform/windows/audio.cpp"
+        "${CMAKE_SOURCE_DIR}/src/platform/windows/mic_wasapi.cpp"
         "${CMAKE_SOURCE_DIR}/src/platform/windows/utf_utils.cpp"
         "${CMAKE_SOURCE_DIR}/src/platform/windows/utf_utils.h"
+        "${CMAKE_SOURCE_DIR}/src/platform/windows/clipboard.cpp"
+        "${CMAKE_SOURCE_DIR}/src/sds/clipboard_backend.h"
+        "${CMAKE_SOURCE_DIR}/src/sds/clipboard_backend_util.h"
+        "${CMAKE_SOURCE_DIR}/src/sds/clipboard_backend_util.cpp"
         "${CMAKE_SOURCE_DIR}/third-party/ViGEmClient/src/ViGEmClient.cpp"
         "${CMAKE_SOURCE_DIR}/third-party/ViGEmClient/include/ViGEm/Client.h"
         "${CMAKE_SOURCE_DIR}/third-party/ViGEmClient/include/ViGEm/Common.h"
@@ -100,6 +105,8 @@ list(PREPEND PLATFORM_LIBRARIES
         libwinpthread.a
         minhook::minhook
         ntdll
+        ole32  # shared clipboard: COM and CreateStreamOnHGlobal for WIC
+        windowscodecs  # shared clipboard: WIC PNG encode/decode
         setupapi
         shlwapi
         synchronization.lib

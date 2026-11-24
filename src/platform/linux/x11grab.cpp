@@ -37,6 +37,7 @@
 #include "src/task_pool.h"
 #include "src/video.h"
 #include "vaapi.h"
+#include "x11_display_mode.h"
 #include "x11grab.h"
 
 using namespace std::literals;
@@ -542,10 +543,27 @@ namespace platf {
 
       refresh();
 
+      std::string effective_display_name = display_name;
+      if (effective_display_name.empty() && platf::is_session_capture_adapter_overridden()) {
+        if (const auto cap = platf::resolve_capture_adapter(); cap && !cap->pci_slot.empty()) {
+          const auto matched_output = platf::x11_mode::find_output_name_for_pci(cap->pci_slot);
+          if (!matched_output.empty()) {
+            effective_display_name = matched_output;
+            BOOST_LOG(info) << "Selecting X11 output ["sv << effective_display_name << "] matching session capture GPU ["sv << cap->pci_slot << ']';
+          } else {
+            const auto active_pci = platf::x11_mode::detect_active_display_pci();
+            if (!active_pci.empty() && active_pci != cap->pci_slot) {
+              BOOST_LOG(info) << "X11 display capture remains on active display GPU ["sv << active_pci
+                              << "]; session render offload (DRI_PRIME / Vulkan) targets ["sv << cap->pci_slot << ']';
+            }
+          }
+        }
+      }
+
       int streamedMonitor = -1;
-      if (!display_name.empty() && std::ranges::all_of(display_name, ::isdigit)) {
+      if (!effective_display_name.empty() && std::ranges::all_of(effective_display_name, ::isdigit)) {
         // Resolve (legacy) monitor index from display_name
-        streamedMonitor = (int) util::from_view(display_name);
+        streamedMonitor = (int) util::from_view(effective_display_name);
       }
 
       screen_res_t screenr {x11::rr::GetScreenResources(xdisplay.get(), xwindow)};
@@ -562,7 +580,7 @@ namespace platf {
         output_info_t out_info {x11::rr::GetOutputInfo(xdisplay.get(), screenr.get(), screenr->outputs[x])};
         if (out_info) {
           // Match monitor by index if a valid one is present, otherwise try to resolve by matching output name to display_name
-          if ((streamedMonitor >= 0 && monitor == streamedMonitor) || (streamedMonitor < 0 && out_info->name == display_name)) {
+          if ((streamedMonitor >= 0 && monitor == streamedMonitor) || (streamedMonitor < 0 && out_info->name == effective_display_name)) {
             result = std::move(out_info);
             result_found = true;
             break;
@@ -574,7 +592,7 @@ namespace platf {
       if (result_found && result->crtc) {
         crtc_info_t crt_info {x11::rr::GetCrtcInfo(xdisplay.get(), screenr.get(), result->crtc)};
         if (!crt_info) {
-          BOOST_LOG(error) << "Could not query CRTC info for display ["sv << display_name << ']';
+          BOOST_LOG(error) << "Could not query CRTC info for display ["sv << effective_display_name << ']';
           return -1;
         }
 
@@ -586,7 +604,7 @@ namespace platf {
         offset_x = crt_info->x;
         offset_y = crt_info->y;
       } else {
-        BOOST_LOG(warning) << "Couldn't get info for requested display ["sv << display_name << "], defaulting to recording entire virtual desktop"sv;
+        BOOST_LOG(warning) << "Couldn't get info for requested display ["sv << effective_display_name << "], defaulting to recording entire virtual desktop"sv;
         width = xattr.width;
         height = xattr.height;
       }

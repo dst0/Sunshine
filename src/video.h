@@ -17,6 +17,7 @@
 #include "platform/common.h"
 #include "thread_safe.h"
 #include "video_colorspace.h"
+#include "video_packed444.h"
 
 extern "C" {
 #include <libavcodec/avcodec.h>
@@ -51,6 +52,7 @@ namespace video {
     int dynamicRange;  ///< Encoding color depth: 0 = 8-bit, 1 = 10-bit.
     int chromaSamplingType;  ///< Chroma sampling type: 0 = 4:2:0, 1 = 4:4:4.
     int enableIntraRefresh;  ///< Intra refresh setting: 0 = disabled, 1 = enabled.
+    int packed_ycocgr_mode = 0;  ///< Packed YCoCg-R 4:4:4 mode: 0 = disabled, 1 = Layout A1.
   };
 
   /**
@@ -767,10 +769,25 @@ namespace video {
 
   extern int active_hevc_mode;
   extern int active_av1_mode;
+  extern bool last_encoder_probe_is_vaapi;
   extern bool last_encoder_probe_supported_ref_frames_invalidation;
   extern std::array<bool, 3> last_encoder_probe_supported_yuv444_for_codec;  // 0 - H.264, 1 - HEVC, 2 - AV1
   extern std::array<bool, 3> last_encoder_probe_supported_dynamic_range_for_codec;  // 0 - H.264, 1 - HEVC, 2 - AV1
   extern std::array<bool, 3> last_encoder_probe_supported_dynamic_range_yuv444_for_codec;  // 0 - H.264, 1 - HEVC, 2 - AV1
+
+  /**
+   * @brief Check whether the active probed encoder backend is VAAPI.
+   *
+   * @return `true` when the most recently selected/probed encoder is `vaapi`.
+   */
+  bool is_vaapi_encoder_active();
+
+  /**
+   * @brief Check whether VAAPI HEVC 10-bit (`DYNAMIC_RANGE`) is active and supported.
+   *
+   * @return `true` when VAAPI is active and passed the HEVC `DYNAMIC_RANGE` probe.
+   */
+  bool is_vaapi_hevc_10bit_supported();
 
   /**
    * @brief Resolve a client-requested dynamic range against probed encoder capabilities.
@@ -826,6 +843,36 @@ namespace video {
    * @return 0 when a usable encoder is selected; nonzero when probing fails.
    */
   int probe_encoders();
+
+  /**
+   * @brief List compiled-in encoder backend names available on this host.
+   * @return Ordered backend names such as {"vaapi", "software"}.
+   */
+  std::vector<std::string> available_encoders();
+
+  /**
+   * @brief Compute ServerCodecModeSupport bitmask supported by the software encoder.
+   * @return Codec mode bitmask advertising H.264/HEVC SDR/4:4:4/10-bit support.
+   */
+  uint32_t software_codec_mode_flags();
+
+  /**
+   * @brief Set a thread-safe per-session encoder override for the next stream launch.
+   * @param encoder Allowed encoder name (e.g. "vaapi", "vulkan", "software"), or std::nullopt/empty for auto.
+   * @param hevc_requested True if client requested HEVC encoding (enables libx265 probe on software).
+   * @param adapter_overridden True if a per-session render adapter override was also applied.
+   */
+  void set_session_encoder_override(std::optional<std::string> encoder, bool hevc_requested = false, bool adapter_overridden = false);
+
+  /**
+   * @brief Clear any active per-session encoder/adapter overrides and restore cached host defaults.
+   */
+  void clear_session_encoder_override();
+
+  /**
+   * @brief Return the active per-session encoder override, if any.
+   */
+  std::optional<std::string> current_session_encoder_override();
 
   // Several NTSC standard refresh rates are hardcoded here, because their
   // true rate requires a denominator of 1001. ffmpeg's av_d2q() would assume it could

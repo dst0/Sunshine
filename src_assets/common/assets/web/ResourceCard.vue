@@ -3,19 +3,19 @@
         <div class="card-body">
             <h2>{{ $t('resource_card.resources') }}</h2>
             <div class="d-flex flex-wrap gap-2 mt-4">
-                <a class="btn btn-success" href="https://app.lizardbyte.dev" target="_blank">
+                <a class="btn btn-success" href="https://app.lizardbyte.dev" target="_blank" rel="noopener noreferrer">
                   <Globe :size="18" class="icon"></Globe>
                   {{ $t('resource_card.lizardbyte_website') }}
                 </a>
-                <a class="btn btn-info" :href="documentationUrl" target="_blank">
+                <a class="btn btn-info" :href="documentationUrl" target="_blank" rel="noopener noreferrer">
                   <BookOpen :size="18" class="icon"></BookOpen>
                   {{ $t('resource_card.documentation') }}
                 </a>
-                <a class="btn btn-primary" href="https://app.lizardbyte.dev/discord" target="_blank">
+                <a class="btn btn-primary" href="https://app.lizardbyte.dev/discord" target="_blank" rel="noopener noreferrer">
                   <SimpleIcon icon="Discord" :size="18" class="icon"></SimpleIcon>
                   Discord
                 </a>
-                <a class="btn btn-secondary" href="https://github.com/orgs/LizardByte/discussions" target="_blank">
+                <a class="btn btn-secondary" href="https://github.com/orgs/LizardByte/discussions" target="_blank" rel="noopener noreferrer">
                   <SimpleIcon icon="GitHub" :size="18" class="icon"></SimpleIcon>
                   {{ $t('resource_card.github_discussions') }}
                 </a>
@@ -29,12 +29,12 @@
             <p>{{ $t('resource_card.legal_desc') }}</p>
             <div class="d-flex flex-wrap gap-2 mt-4">
                 <a class="btn btn-danger" href="https://github.com/SunshineStream/Sunshine/blob/master/LICENSE"
-                    target="_blank">
+                    target="_blank" rel="noopener noreferrer">
                   <FileText :size="18" class="icon"></FileText>
                   {{ $t('resource_card.license') }}
                 </a>
                 <a class="btn btn-danger" href="https://github.com/SunshineStream/Sunshine/blob/master/NOTICE"
-                    target="_blank">
+                    target="_blank" rel="noopener noreferrer">
                   <AlertCircle :size="18" class="icon"></AlertCircle>
                   {{ $t('resource_card.third_party_notice') }}
                 </a>
@@ -53,12 +53,6 @@ import {
 import SimpleIcon from './SimpleIcon.vue'
 
 export default {
-  props: {
-    installedVersionNotStable: {
-      type: Boolean,
-      default: false
-    }
-  },
   components: {
     SimpleIcon,
     AlertCircle,
@@ -68,8 +62,7 @@ export default {
   },
   computed: {
     documentationUrl() {
-      const docsVersion = this.installedVersionNotStable ? 'master' : 'latest'
-      return `https://docs.lizardbyte.dev/projects/sunshine/${docsVersion}/`
+      return 'https://docs.lizardbyte.dev/projects/sunshine/latest/'
     }
   }
 }

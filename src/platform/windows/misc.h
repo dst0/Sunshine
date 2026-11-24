@@ -7,8 +7,10 @@
 // standard includes
 #include <chrono>
 #include <filesystem>
+#include <functional>
 #include <string>
 #include <string_view>
+#include <system_error>
 
 // platform includes
 #include <Windows.h>
@@ -61,4 +63,21 @@ namespace platf {
    * @return true if version info was successfully extracted, false otherwise.
    */
   bool getFileVersionInfo(const std::filesystem::path &file_path, std::string &version_str);
+
+  /**
+   * @brief Obtain the active console session user's primary token.
+   *
+   * @param elevated Return the linked administrator token when the user has one.
+   * @return Token handle owned by the caller (close with CloseHandle), or `nullptr` without a session.
+   */
+  HANDLE retrieve_users_token(bool elevated);
+
+  /**
+   * @brief Run a callback while impersonating a user token on the calling thread.
+   *
+   * @param user_token Token obtained from retrieve_users_token().
+   * @param callback Work to run under impersonation.
+   * @return Error when impersonation could not start.
+   */
+  std::error_code impersonate_current_user(HANDLE user_token, std::function<void()> callback);
 }  // namespace platf

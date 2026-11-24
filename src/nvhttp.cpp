@@ -11,16 +11,18 @@
 #include <chrono>
 #include <filesystem>
 #include <format>
+#include <iostream>
+#include <map>
 #include <mutex>
 #include <string>
+#include <unordered_map>
 #include <utility>
 
 // lib includes
-#include <boost/asio/ssl/context.hpp>
-#include <boost/asio/ssl/context_base.hpp>
 #include <boost/property_tree/json_parser.hpp>
 #include <boost/property_tree/ptree.hpp>
 #include <boost/property_tree/xml_parser.hpp>
+#include <openssl/x509.h>
 #include <Simple-Web-Server/server_http.hpp>
 
 // local includes
@@ -33,13 +35,21 @@
 #include "network.h"
 #include "nvhttp.h"
 #include "platform/common.h"
+#ifdef SUNSHINE_BUILD_X11
+  #include "platform/linux/x11_display_mode.h"
+#endif
 #include "process.h"
 #include "rtsp.h"
+#include "sds/auth.h"
+#include "sds/http.h"
+#include "sds/permissions.h"
+#include "sds/sds.h"
 #include "string_hash.h"
 #include "system_tray.h"
 #include "utility.h"
 #include "uuid.h"
 #include "video.h"
+#include "video_packed444.h"
 
 using namespace std::literals;
 
@@ -62,11 +72,18 @@ namespace nvhttp {
     return mutex;
   }
 
+  namespace {
+    bool remember_verified_client(std::uint64_t connection_id, verified_client_t client);
+    void forget_verified_client(std::uint64_t connection_id) noexcept;
+  }  // namespace
+
   /**
    * @brief HTTPS server backend that adds Sunshine's client-certificate verification.
    */
   class SunshineHTTPSServer: public SimpleWeb::ServerBase<SunshineHTTPS> {
   public:
+    using verify_callback_t = std::function<std::optional<verified_client_t>(const std::uint8_t *, std::size_t)>;
+
     /**
      * @brief Initialize the HTTPS server with Sunshine's certificate and key files.
      *
@@ -75,96 +92,102 @@ namespace nvhttp {
      */
     SunshineHTTPSServer(const std::string &certification_file, const std::string &private_key_file):
         ServerBase<SunshineHTTPS>::ServerBase(443) {
-      // Disabling TLS 1.0 and 1.1 (see RFC 8996)
-      context.set_options(boost::asio::ssl::context::no_tlsv1);
-      context.set_options(boost::asio::ssl::context::no_tlsv1_1);
-      context.use_certificate_chain_file(certification_file);
-      context.use_private_key_file(private_key_file, boost::asio::ssl::context::pem);
+      config.is_https = true;
+      config.cert_file = certification_file;
+      config.key_file = private_key_file;
+      // Reject oversized requests before their body is buffered.
+      config.max_request_streambuf_size = HTTPS_MAX_REQUEST_SIZE;
+      config.max_request_header_size = 64 * 1024;
+      config.timeout_content = 30;
+      auto limiter = std::make_shared<http::connection_limiter_t>(64);
+      on_connection_accepted = [limiter](const std::shared_ptr<Request> &request) {
+        auto lease = limiter->try_acquire();
+        if (!lease) {
+          return false;
+        }
+        request->connection_context(std::move(lease));
+        return true;
+      };
+      on_connection_closed = [](const std::uint64_t connection_id) {
+        forget_verified_client(connection_id);
+      };
+      on_request_header = [](const std::shared_ptr<Request> &request) {
+        return http::validate_request_framing(request->raw_header, request->header, HTTPS_MAX_REQUEST_SIZE);
+      };
+      on_error = [](const std::shared_ptr<Request> &, const SimpleWeb::error_code &ec) {
+        if (ec == SimpleWeb::error::operation_aborted || ec == SimpleWeb::error::eof) {
+          return;
+        }
+        BOOST_LOG(debug) << "nvhttp HTTPS server transport error: "sv << ec.message();
+      };
     }
 
-    std::function<int(SSL *)> verify;  ///< Callback that validates a client's TLS certificate after handshake.
-    std::function<void(std::shared_ptr<Response>, std::shared_ptr<Request>)> on_verify_failed;  ///< Handler used to return the pairing challenge when client verification fails.
-
-  protected:
-    boost::asio::ssl::context context {boost::asio::ssl::context::tls_server};  ///< TLS server context configured with Sunshine's certificate and protocol policy.
-
     /**
-     * @brief Enable client-certificate verification after the listening socket is bound.
-     * @details Ignore the TLS preverification result and context so failed authorization can receive an HTTP error.
+     * @brief Configure client certificate verification callback executed after mTLS handshake.
      */
-    void after_bind() override {
-      if (verify) {
-        context.set_verify_mode(boost::asio::ssl::verify_peer | boost::asio::ssl::verify_fail_if_no_peer_cert | boost::asio::ssl::verify_client_once);
-        context.set_verify_callback([](int, boost::asio::ssl::verify_context &) {
-          // To respond with an error message, a connection must be established
-          return 1;
-        });
+    void set_verify_callback(verify_callback_t cb) {
+      verify_ = std::move(cb);
+      if (verify_) {
+        config.require_client_cert = true;
+        on_verify_client = [this](const std::uint64_t connection_id, const std::uint8_t *cert_der, const std::size_t cert_der_len) {
+          auto client = verify_(cert_der, cert_der_len);
+          if (!client) {
+            return false;
+          }
+          return remember_verified_client(connection_id, std::move(*client));
+        };
+      } else {
+        config.require_client_cert = false;
+        on_verify_client = nullptr;
       }
     }
 
-    /**
-     * @brief Process a completed TLS handshake under the callback's server lifetime guard.
-     *
-     * @param session Session whose TLS handshake has completed.
-     * @param ec Result of the asynchronous handshake.
-     * @pre The caller holds the session's handler scope guard.
-     */
-    void handle_handshake(const std::shared_ptr<Session> &session, const SimpleWeb::error_code &ec) {
-      if (!ec) {
-        if (verify && !verify(session->connection->socket->native_handle())) {
-          this->write(session, on_verify_failed);
-        } else {
-          this->read(session);
-        }
-      } else if (this->on_error) {
-        this->on_error(session->request, ec);
-      }
-    }
-
-    // This is Server<HTTPS>::accept() with SSL validation support added
-    /**
-     * @brief Accept a pending connection and arm the server for the next client.
-     * @details Keep each handler's scope guard alive until all access to the server has finished.
-     */
-    void accept() override {
-      auto connection = create_connection(*io_service, context);
-
-      acceptor->async_accept(connection->socket->lowest_layer(), [this, connection](const SimpleWeb::error_code &ec) {
-        if (auto lock = connection->handler_runner->continue_lock(); lock) {
-          if (ec != SimpleWeb::error::operation_aborted) {
-            this->accept();
-          }
-
-          auto session = std::make_shared<Session>(config.max_request_streambuf_size, connection);
-
-          if (!ec) {
-            boost::asio::ip::tcp::no_delay option(true);
-            SimpleWeb::error_code option_error;
-            session->connection->socket->lowest_layer().set_option(option, option_error);
-
-            session->connection->set_timeout(config.timeout_request);
-            session->connection->socket->async_handshake(boost::asio::ssl::stream_base::server, [this, session](const SimpleWeb::error_code &ec) {
-              session->connection->cancel_timeout();
-              if (auto lock = session->connection->handler_runner->continue_lock(); lock) {
-                this->handle_handshake(session, ec);
-              }
-            });
-          } else if (this->on_error) {
-            this->on_error(session->request, ec);
-          }
-        }
-      });
-    }
+  private:
+    verify_callback_t verify_;  ///< Callback that validates a client's TLS certificate after handshake.
   };
 
   /**
    * @brief HTTPS server type used for GameStream endpoints requiring TLS.
    */
   using https_server_t = SunshineHTTPSServer;
+
+  /**
+   * @brief Plain HTTP GameStream server with Sunshine's request size limit.
+   */
+  class SunshineHTTPServer: public SimpleWeb::Server<SimpleWeb::HTTP> {
+  public:
+    /**
+     * @brief Initialize the plain HTTP server and reject oversized requests before buffering them.
+     */
+    SunshineHTTPServer() {
+      config.max_request_streambuf_size = HTTP_MAX_REQUEST_SIZE;
+      config.max_request_header_size = 64 * 1024;
+      config.timeout_content = 30;
+      auto limiter = std::make_shared<http::connection_limiter_t>(64);
+      on_connection_accepted = [limiter](const std::shared_ptr<Request> &request) {
+        auto lease = limiter->try_acquire();
+        if (!lease) {
+          return false;
+        }
+        request->connection_context(std::move(lease));
+        return true;
+      };
+      on_request_header = [](const std::shared_ptr<Request> &request) {
+        return http::validate_request_framing(request->raw_header, request->header, HTTP_MAX_REQUEST_SIZE);
+      };
+      on_error = [](const std::shared_ptr<Request> &, const SimpleWeb::error_code &ec) {
+        if (ec == SimpleWeb::error::operation_aborted || ec == SimpleWeb::error::eof) {
+          return;
+        }
+        BOOST_LOG(debug) << "nvhttp HTTP server transport error: "sv << ec.message();
+      };
+    }
+  };
+
   /**
    * @brief Plain HTTP server type used for GameStream endpoints without TLS.
    */
-  using http_server_t = SimpleWeb::Server<SimpleWeb::HTTP>;
+  using http_server_t = SunshineHTTPServer;
 
   /**
    * @brief Internal HTTPS credential paths for the configuration server.
@@ -184,6 +207,7 @@ namespace nvhttp {
     std::string uuid;  ///< Persistent Moonlight client UUID associated with the certificate.
     std::string cert;  ///< Certificate PEM string or path.
     bool enabled = true;  ///< Whether this persisted client entry may connect.
+    std::vector<std::string> permissions;  ///< Granted secure-desktop-stream permissions (canonical names).
   };
 
   /**
@@ -209,9 +233,84 @@ namespace nvhttp {
   client_t client_root;  ///< In-memory representation of the paired-client database.
   std::atomic<uint32_t> session_id_counter;  ///< Monotonic counter used to allocate GameStream session IDs.
 
-  // Set by TLS verify callback, read by launch/resume handler (single-threaded HTTPS server)
-  std::string last_verified_client_cert;  ///< Last client certificate accepted by the TLS verify callback.  // NOSONAR(cpp:S5421): intentionally mutable global
-  std::string last_verified_client_name;  ///< Friendly name of last client certificate accepted by the TLS verify callback. // NOSONAR(cpp:S5421): intentionally mutable global
+  namespace {
+    /**
+     * @brief Registry of verified client identities for live HTTPS connections.
+     */
+    struct verified_connections_t {
+      std::mutex mutex;  ///< Protects `entries`.
+      std::unordered_map<std::uint64_t, verified_client_t> entries;  ///< Entries keyed by opaque connection ID.
+    };
+
+    /**
+     * @brief Get the process-wide registry of verified HTTPS connections.
+     *
+     * @return Registry shared by all GameStream HTTPS servers.
+     */
+    verified_connections_t &verified_connections() {
+      static verified_connections_t registry;
+      return registry;
+    }
+
+    bool remember_verified_client(const std::uint64_t connection_id, verified_client_t client) {
+      if (connection_id == 0) {
+        return false;
+      }
+      auto &registry = verified_connections();
+      std::scoped_lock lock {registry.mutex};
+      registry.entries.insert_or_assign(connection_id, std::move(client));
+      return true;
+    }
+
+    void forget_verified_client(const std::uint64_t connection_id) noexcept {
+      if (connection_id == 0) {
+        return;
+      }
+      auto &registry = verified_connections();
+      std::scoped_lock lock {registry.mutex};
+      registry.entries.erase(connection_id);
+    }
+  }  // namespace
+
+  bool is_client_enabled(const X509 *certificate);
+
+  std::optional<verified_client_t> verified_client(const req_https_t &request) {
+    if (!request) {
+      return std::nullopt;
+    }
+
+    const auto connection_id = request->connection_id();
+    if (connection_id == 0) {
+      return std::nullopt;
+    }
+
+    std::optional<verified_client_t> client;
+    {
+      auto &registry = verified_connections();
+      std::scoped_lock lock {registry.mutex};
+      if (const auto it = registry.entries.find(connection_id); it != registry.entries.end()) {
+        client = it->second;
+      }
+    }
+    if (!client) {
+      return std::nullopt;
+    }
+
+    // The client may have been unpaired or disabled after this connection's handshake.
+    const auto certificate = crypto::x509(client->cert);
+    std::scoped_lock lock {client_auth_mutex()};
+    if (!certificate || !is_client_enabled(certificate.get())) {
+      return std::nullopt;
+    }
+    return client;
+  }
+
+  std::optional<std::string> verified_client_cert(const req_https_t &request) {
+    if (auto client = verified_client(request)) {
+      return std::move(client->cert);
+    }
+    return std::nullopt;
+  }
 
   /**
    * @brief Case-insensitive map used for HTTP headers and query parameters.
@@ -221,10 +320,6 @@ namespace nvhttp {
    * @brief Shared HTTPS response object passed to GameStream handlers.
    */
   using resp_https_t = std::shared_ptr<typename SimpleWeb::ServerBase<SunshineHTTPS>::Response>;
-  /**
-   * @brief Shared HTTPS request object received by GameStream handlers.
-   */
-  using req_https_t = std::shared_ptr<typename SimpleWeb::ServerBase<SunshineHTTPS>::Request>;
   /**
    * @brief Shared HTTP response object passed to redirect and discovery handlers.
    */
@@ -290,6 +385,13 @@ namespace nvhttp {
       named_cert_node.put("cert"s, named_cert.cert);
       named_cert_node.put("uuid"s, named_cert.uuid);
       named_cert_node.put("enabled"s, named_cert.enabled);
+      pt::ptree permission_nodes;
+      for (const auto &permission : named_cert.permissions) {
+        pt::ptree permission_node;
+        permission_node.put_value(permission);
+        permission_nodes.push_back(std::make_pair(""s, permission_node));
+      }
+      named_cert_node.add_child("permissions"s, permission_nodes);
       named_cert_nodes.push_back(std::make_pair(""s, named_cert_node));
     }
     root.add_child("root.named_devices"s, named_cert_nodes);
@@ -426,6 +528,15 @@ namespace nvhttp {
         named_cert.cert = el.get_child("cert").get_value<std::string>();
         named_cert.uuid = el.get_child("uuid").get_value<std::string>();
         named_cert.enabled = el.get<bool>("enabled", true);
+        if (const auto permission_nodes = el.get_child_optional("permissions"); permission_nodes) {
+          std::vector<std::string> names;
+          for (const auto &[_, permission_node] : *permission_nodes) {
+            names.push_back(permission_node.get_value<std::string>());
+          }
+          named_cert.permissions = sds::normalize_permissions(names);
+        } else {
+          named_cert.permissions = sds::normalize_permissions(config::sds.default_permissions);
+        }
         client.named_devices.emplace_back(named_cert);
       }
     }
@@ -461,6 +572,7 @@ namespace nvhttp {
     named_cert.name = name;
     named_cert.cert = crypto::pem(certificate);
     named_cert.uuid = uuid_util::uuid_t::generate().string();
+    named_cert.permissions = sds::normalize_permissions(config::sds.default_permissions);
     const auto uuid = named_cert.uuid;
 
     std::lock_guard lock {client_auth_mutex()};
@@ -477,14 +589,123 @@ namespace nvhttp {
     return uuid;
   }
 
+  namespace {
+    /**
+     * @brief Validate that a GameStream `surroundParams` string contains 1 to 16 ASCII digits.
+     *
+     * @param params Candidate parameter value.
+     * @return `true` when valid.
+     */
+    bool is_valid_surround_params_value(const std::string_view params) {
+      return !params.empty() && params.size() <= 16 && std::ranges::all_of(params, [](const unsigned char ch) {
+        return ch >= '0' && ch <= '9';
+      });
+    }
+
+    /**
+     * @brief Return `params` if valid (`^[0-9]{1,16}$`), otherwise an empty string.
+     *
+     * @param params Candidate parameter value.
+     * @return Sanitized parameter value.
+     */
+    std::string sanitize_surround_params_value(const std::string_view params) {
+      if (params.empty()) {
+        return {};
+      }
+      if (!is_valid_surround_params_value(params)) {
+        BOOST_LOG(warning) << "Ignoring invalid surroundParams parameter"sv;
+        return {};
+      }
+      return std::string {params};
+    }
+
+    /**
+     * @brief Write an HTTP 401 XML response and close the keep-alive socket after sending.
+     *
+     * @param response HTTPS response object.
+     */
+    void write_unauthorized(const resp_https_t &response) {
+      pt::ptree tree;
+      tree.put("root.<xmlattr>.status_code", 401);
+      tree.put("root.<xmlattr>.status_message", "The client is not authorized. Certificate verification failed.");
+      std::ostringstream data;
+      pt::write_xml(data, tree);
+      response->write(SimpleWeb::StatusCode::client_error_unauthorized, data.str());
+      response->close_connection_after_response = true;
+    }
+
+    /**
+     * @brief Validate client `sdsChromaMode` before touching display configuration.
+     */
+    bool validate_pre_probe_packed_chroma(
+      std::string_view sds_chroma_mode,
+      const rtsp_stream::launch_session_t &launch_session,
+      std::string_view &error_msg
+    ) {
+      if (sds_chroma_mode.empty()) {
+        return true;
+      }
+      if (sds_chroma_mode != video::PACKED_YCOCGR_MODE_NAME) {
+        error_msg = "Invalid sdsChromaMode parameter";
+        return false;
+      }
+      if (launch_session.enable_hdr || !video::compute_ycocgr_a1_layout(launch_session.width, launch_session.height).has_value()) {
+        error_msg = "Unsupported sdsChromaMode configuration";
+        return false;
+      }
+      return true;
+    }
+
+    /**
+     * @brief Validate `sdsChromaMode` against the probed encoder and activate session packed mode.
+     */
+    bool activate_packed_chroma_after_probe(
+      std::string_view sds_chroma_mode,
+      rtsp_stream::launch_session_t &launch_session,
+      bool no_active_sessions,
+      bool &packed_activated,
+      std::string_view &error_msg
+    ) {
+      if (sds_chroma_mode.empty()) {
+        if (no_active_sessions) {
+          video::clear_session_packed_ycocgr_mode();
+        }
+        return true;
+      }
+
+      int packed_mode = 0;
+      if (!video::validate_packed_ycocgr_request(
+            sds_chroma_mode,
+            video::is_vaapi_encoder_active(),
+            video::is_vaapi_hevc_10bit_supported(),
+            1,
+            launch_session.enable_hdr ? 1 : 0,
+            launch_session.width,
+            launch_session.height,
+            packed_mode
+          )) {
+        error_msg = "Unsupported sdsChromaMode on active encoder";
+        return false;
+      }
+
+      launch_session.packed_ycocgr_mode = packed_mode;
+      if (packed_mode == 1) {
+        video::set_session_packed_ycocgr_mode(1);
+        packed_activated = true;
+      }
+      return true;
+    }
+  }  // namespace
+
   /**
    * @brief Create launch session.
    *
    * @param host_audio Host audio.
    * @param args Arguments forwarded to the callable or parser.
+   * @param client Paired client verified on the connection that requested the launch.
    * @return Constructed launch session object.
    */
-  std::shared_ptr<rtsp_stream::launch_session_t> make_launch_session(bool host_audio, const args_t &args) {
+  std::shared_ptr<rtsp_stream::launch_session_t> make_launch_session(bool host_audio, const args_t &args, const verified_client_t &client) {
     auto launch_session = std::make_shared<rtsp_stream::launch_session_t>();
 
     launch_session->id = ++session_id_counter;
@@ -517,7 +738,7 @@ namespace nvhttp {
     launch_session->appid = (int) util::from_view(get_arg(args, "appid", "unknown"));
     launch_session->enable_sops = util::from_view(get_arg(args, "sops", "0"));
     launch_session->surround_info = (int) util::from_view(get_arg(args, "surroundAudioInfo", "196610"));
-    launch_session->surround_params = (get_arg(args, "surroundParams", ""));
+    launch_session->surround_params = sanitize_surround_params_value(get_arg(args, "surroundParams", ""));
     launch_session->continuous_audio = util::from_view(get_arg(args, "continuousAudio", "0"));
     launch_session->gcmap = (int) util::from_view(get_arg(args, "gcmap", "0"));
     launch_session->enable_hdr = util::from_view(get_arg(args, "hdrMode", "0"));
@@ -532,8 +753,8 @@ namespace nvhttp {
       launch_session->rtsp_iv_counter = 0;
     }
     launch_session->rtsp_url_scheme = launch_session->rtsp_cipher ? "rtspenc://"s : "rtsp://"s;
-    launch_session->client_cert = last_verified_client_cert;
-    launch_session->client_name = last_verified_client_name;
+    launch_session->client_cert = client.cert;
+    launch_session->client_name = client.name;
 
     // Generate the unique identifiers for this connection that we will send later during RTSP handshake
     std::array<unsigned char, 8> raw_payload;
@@ -948,17 +1169,7 @@ namespace nvhttp {
     BOOST_LOG(debug) << "METHOD :: "sv << request->method;
     BOOST_LOG(debug) << "DESTINATION :: "sv << request->path;
 
-    for (auto &[name, val] : request->header) {
-      BOOST_LOG(debug) << name << " -- " << val;
-    }
-
-    BOOST_LOG(debug) << " [--] "sv;
-
-    for (auto &[name, val] : request->parse_query_string()) {
-      BOOST_LOG(debug) << name << " -- " << val;
-    }
-
-    BOOST_LOG(debug) << " [--] "sv;
+    // Headers and query fields can carry pairing material and session keys.
   }
 
   /**
@@ -1012,7 +1223,7 @@ namespace nvhttp {
       fresh_sess.client.cert = util::from_hex_vec(get_arg(args, "clientcert"), true);
       fresh_sess.async_insert_pin.salt = get_arg(args, "salt");
       fresh_sess.async_insert_pin.device_name = get_arg(args, "devicename");
-      fresh_sess.async_insert_pin.address = net::addr_to_normalized_string(request->remote_endpoint().address());
+      fresh_sess.async_insert_pin.address = net::addr_to_normalized_string(boost::asio::ip::make_address(request->remote_endpoint().address().to_string()));
       if (!pin_stdin) {
         fresh_sess.async_insert_pin.response = response;
       }
@@ -1085,6 +1296,13 @@ namespace nvhttp {
   template<class T>
   void pair(std::shared_ptr<typename SimpleWeb::ServerBase<T>::Response> response, std::shared_ptr<typename SimpleWeb::ServerBase<T>::Request> request) {
     print_req<T>(request);
+
+    if constexpr (std::is_same_v<SunshineHTTPS, T>) {
+      if (!verified_client(request)) {
+        write_unauthorized(response);
+        return;
+      }
+    }
 
     pt::ptree tree;
 
@@ -1204,6 +1422,177 @@ namespace nvhttp {
     return false;
   }
 
+  namespace {
+    struct parsed_session_overrides_t {
+      std::optional<std::string> encoder;
+      std::optional<std::string> adapter;
+      std::optional<std::string> capture_adapter;
+      bool hevc_requested = false;
+      bool match_resolution = false;
+      bool revert_resolution = false;
+    };
+
+    bool is_allowed_session_encoder(std::string_view encoder) {
+      static constexpr std::array<std::string_view, 9> allowed {
+        "",
+        "auto",
+        "vaapi",
+        "vulkan",
+        "software",
+        "nvenc",
+        "quicksync",
+        "amdvce",
+        "videotoolbox",
+      };
+      return std::ranges::find(allowed, encoder) != allowed.end();
+    }
+
+    bool is_binary_flag_or_empty(std::string_view value) {
+      return value.empty() || value == "0" || value == "1";
+    }
+
+    std::string build_paired_sds_features() {
+      std::string features = sds::server_features();
+      const auto has_token = [&features](std::string_view token) {
+        std::size_t pos = 0;
+        while (pos < features.size()) {
+          const auto comma = features.find(',', pos);
+          const auto piece = (comma == std::string::npos) ?
+                               std::string_view {features}.substr(pos) :
+                               std::string_view {features}.substr(pos, comma - pos);
+          if (piece == token) {
+            return true;
+          }
+          if (comma == std::string::npos) {
+            break;
+          }
+          pos = comma + 1;
+        }
+        return false;
+      };
+      const auto append_token = [&features, &has_token](std::string_view token) {
+        if (has_token(token)) {
+          return;
+        }
+        if (!features.empty()) {
+          features.push_back(',');
+        }
+        features += token;
+      };
+
+      if (has_token("file_clipboard"sv)) {
+        append_token("lazy_clipboard"sv);
+      }
+      if (has_token("files"sv)) {
+        append_token("xdnd_drop"sv);
+      }
+      if (video::is_vaapi_hevc_10bit_supported()) {
+        append_token("hw_ycocgr_444"sv);
+      }
+      append_token("host_encoder"sv);
+      append_token("host_capture_adapter"sv);
+      append_token("host_resolution"sv);
+      return features;
+    }
+
+    std::string join_available_encoders() {
+      std::string out;
+      for (const auto &enc : video::available_encoders()) {
+        if (!out.empty()) {
+          out.push_back(',');
+        }
+        out += enc;
+      }
+      return out;
+    }
+
+    std::optional<parsed_session_overrides_t> validate_session_overrides(
+      const args_t &args,
+      pt::ptree &tree,
+      std::string_view root_flag_key
+    ) {
+      parsed_session_overrides_t parsed;
+      const auto set_bad_request = [&](std::string_view msg) -> std::nullopt_t {
+        tree.put(std::string {"root."} + std::string {root_flag_key}, 0);
+        tree.put("root.<xmlattr>.status_code", 400);
+        tree.put("root.<xmlattr>.status_message", std::string {msg});
+        return std::nullopt;
+      };
+
+      if (const auto enc_it = args.find("sdsEncoder"); enc_it != args.end() && !enc_it->second.empty()) {
+        if (!is_allowed_session_encoder(enc_it->second)) {
+          return set_bad_request("Invalid sdsEncoder parameter");
+        }
+        if (enc_it->second != "auto") {
+          parsed.encoder = enc_it->second;
+        }
+      }
+
+      if (const auto ad_it = args.find("sdsAdapter"); ad_it != args.end() && !ad_it->second.empty()) {
+        auto validated = platf::validate_render_adapter_id(ad_it->second);
+        if (!validated) {
+          return set_bad_request("Invalid sdsAdapter parameter");
+        }
+        parsed.adapter = std::move(validated);
+      }
+
+      if (const auto cap_it = args.find("sdsCaptureAdapter"); cap_it != args.end() && !cap_it->second.empty()) {
+        auto validated = platf::validate_render_adapter_id(cap_it->second);
+        if (!validated) {
+          return set_bad_request("Invalid sdsCaptureAdapter parameter");
+        }
+        parsed.capture_adapter = std::move(validated);
+      }
+
+      const auto parse_bool_arg = [&](const char *key, bool &out) -> bool {
+        const auto it = args.find(key);
+        if (it == args.end() || it->second.empty()) {
+          out = false;
+          return true;
+        }
+        if (!is_binary_flag_or_empty(it->second)) {
+          return false;
+        }
+        out = (it->second == "1");
+        return true;
+      };
+
+      if (!parse_bool_arg("sdsHevc", parsed.hevc_requested) ||
+          !parse_bool_arg("sdsMatchRes", parsed.match_resolution) ||
+          !parse_bool_arg("sdsRevertRes", parsed.revert_resolution)) {
+        return set_bad_request("Invalid sds session flag");
+      }
+
+      return parsed;
+    }
+
+    void apply_session_overrides(const parsed_session_overrides_t &overrides, const rtsp_stream::launch_session_t &launch_session) {
+      platf::set_session_render_device_override(overrides.adapter);
+      platf::set_session_capture_adapter_override(overrides.capture_adapter);
+      video::set_session_encoder_override(overrides.encoder, overrides.hevc_requested, overrides.adapter.has_value());
+#ifdef SUNSHINE_BUILD_X11
+      if (overrides.match_resolution && launch_session.width > 0 && launch_session.height > 0 && launch_session.fps > 0) {
+        if (!platf::x11_mode::apply_and_maybe_save(launch_session.width, launch_session.height, launch_session.fps, overrides.revert_resolution)) {
+          BOOST_LOG(warning) << "Host X11 resolution match skipped or refused for "
+                             << launch_session.width << 'x' << launch_session.height << '@' << launch_session.fps;
+        }
+      }
+#else
+      (void) launch_session;
+#endif
+    }
+
+    void revert_session_overrides_and_display() {
+      display_device::revert_configuration();
+#ifdef SUNSHINE_BUILD_X11
+      platf::x11_mode::revert_if_saved();
+#endif
+      platf::set_session_capture_adapter_override(std::nullopt);
+      video::clear_session_encoder_override();
+      video::clear_session_packed_ycocgr_mode();
+    }
+  }  // namespace
+
   uint32_t get_codec_mode_flags() {
     uint32_t codec_mode_flags = SCM_H264;
     if (video::last_encoder_probe_supported_yuv444_for_codec[0]) {
@@ -1249,6 +1638,11 @@ namespace nvhttp {
 
     int pair_status = 0;
     if constexpr (std::is_same_v<SunshineHTTPS, T>) {
+      if (!verified_client(request)) {
+        write_unauthorized(response);
+        return;
+      }
+
       auto args = request->parse_query_string();
       auto clientID = args.find("uniqueid"s);
 
@@ -1257,7 +1651,7 @@ namespace nvhttp {
       }
     }
 
-    auto local_endpoint = request->local_endpoint();
+    const auto local_addr = boost::asio::ip::make_address(request->local_endpoint().address().to_string());
 
     pt::ptree tree;
 
@@ -1274,7 +1668,7 @@ namespace nvhttp {
     // Only include the MAC address for requests sent from paired clients over HTTPS.
     // For HTTP requests, use a placeholder MAC address that Moonlight knows to ignore.
     if constexpr (std::is_same_v<SunshineHTTPS, T>) {
-      tree.put("root.mac", platf::get_mac_address(net::addr_to_normalized_string(local_endpoint.address())));
+      tree.put("root.mac", platf::get_mac_address(net::addr_to_normalized_string(local_addr)));
     } else {
       tree.put("root.mac", "00:00:00:00:00:00");
     }
@@ -1288,10 +1682,10 @@ namespace nvhttp {
     // have that implemented. For now, we will emulate the behavior of GFE+GS-IPv6-Forwarder,
     // which returns 127.0.0.1 as LocalIP for IPv6 connections. Moonlight clients with IPv6
     // support know to ignore this bogus address.
-    if (local_endpoint.address().is_v6() && !local_endpoint.address().to_v6().is_v4_mapped()) {
+    if (local_addr.is_v6() && !local_addr.to_v6().is_v4_mapped()) {
       tree.put("root.LocalIP", "127.0.0.1");
     } else {
-      tree.put("root.LocalIP", net::addr_to_normalized_string(local_endpoint.address()));
+      tree.put("root.LocalIP", net::addr_to_normalized_string(local_addr));
     }
 
     const uint32_t codec_mode_flags = get_codec_mode_flags();
@@ -1305,6 +1699,35 @@ namespace nvhttp {
     tree.put("root.PairStatus", pair_status);
     tree.put("root.currentgame", current_appid);
     tree.put("root.state", current_appid > 0 ? "SUNSHINE_SERVER_BUSY" : "SUNSHINE_SERVER_FREE");
+
+    // secure-desktop-stream feature discovery (DESIGN 3.1), only for paired HTTPS clients.
+    if constexpr (std::is_same_v<SunshineHTTPS, T>) {
+      if (video::is_vaapi_hevc_10bit_supported()) {
+        tree.put(
+          "root.sdsPacked444MaxSize",
+          std::format("{}x{}", video::PACKED_YCOCGR_MAX_ENC_W, video::PACKED_YCOCGR_MAX_ENC_H)
+        );
+      }
+      tree.put("root.sdsVersion", sds::PROTOCOL_VERSION);
+      tree.put("root.sdsFeatures", build_paired_sds_features());
+      tree.put("root.sdsEncoders", join_available_encoders());
+      tree.put("root.sdsSoftwareCodecModeSupport", video::software_codec_mode_flags());
+
+      pt::ptree adapters_tree;
+      for (const auto &adapter : platf::enumerate_render_adapters()) {
+        pt::ptree adapter_node;
+        adapter_node.put("ID", adapter.id);
+        adapter_node.put("Name", adapter.name);
+        adapter_node.put("Vendor", adapter.vendor);
+        if (!adapter.pci_slot.empty()) {
+          adapter_node.put("PciSlot", adapter.pci_slot);
+        }
+        adapter_node.put("Default", adapter.is_default ? 1 : 0);
+        adapter_node.put("CaptureDefault", adapter.is_capture_default ? 1 : 0);
+        adapters_tree.push_back(std::make_pair("Adapter", std::move(adapter_node)));
+      }
+      tree.add_child("root.sdsAdapters", adapters_tree);
+    }
 
     std::ostringstream data;
 
@@ -1321,10 +1744,23 @@ namespace nvhttp {
       named_cert_node["name"] = named_cert.name;
       named_cert_node["uuid"] = named_cert.uuid;
       named_cert_node["enabled"] = named_cert.enabled;
+      named_cert_node["permissions"] = named_cert.permissions;
       named_cert_nodes.push_back(named_cert_node);
     }
 
     return named_cert_nodes;
+  }
+
+  std::vector<std::string> get_all_client_certs() {
+    std::vector<std::string> certs;
+    std::lock_guard lock {client_auth_mutex()};
+    certs.reserve(client_root.named_devices.size());
+    for (const auto &named_cert : client_root.named_devices) {
+      if (!named_cert.cert.empty()) {
+        certs.push_back(named_cert.cert);
+      }
+    }
+    return certs;
   }
 
   /**
@@ -1335,6 +1771,11 @@ namespace nvhttp {
    */
   void applist(resp_https_t response, req_https_t request) {
     print_req<SunshineHTTPS>(request);
+    if (!verified_client(request)) {
+      write_unauthorized(response);
+      return;
+    }
+
     proc::refresh(config::stream.file_apps);
 
     pt::ptree tree;
@@ -1372,6 +1813,12 @@ namespace nvhttp {
   void launch(bool &host_audio, resp_https_t response, req_https_t request) {
     print_req<SunshineHTTPS>(request);
 
+    const auto client = verified_client(request);
+    if (!client) {
+      write_unauthorized(response);
+      return;
+    }
+
     pt::ptree tree;
     bool revert_display_configuration {false};
     auto g = util::fail_guard([&]() {
@@ -1386,7 +1833,7 @@ namespace nvhttp {
       response->close_connection_after_response = true;
 
       if (revert_display_configuration) {
-        display_device::revert_configuration();
+        revert_session_overrides_and_display();
       }
     });
 
@@ -1404,6 +1851,26 @@ namespace nvhttp {
       return;
     }
 
+    if (const auto surround_it = args.find("surroundParams"); surround_it != args.end() && !surround_it->second.empty() && !is_valid_surround_params_value(surround_it->second)) {
+      tree.put("root.resume", 0);
+      tree.put("root.<xmlattr>.status_code", 400);
+      tree.put("root.<xmlattr>.status_message", "Invalid surroundParams parameter");
+      return;
+    }
+
+    const auto session_overrides = validate_session_overrides(args, tree, "gamesession"sv);
+    if (!session_overrides) {
+      return;
+    }
+
+    const auto sds_chroma_mode = get_arg(args, "sdsChromaMode", "");
+    if (!sds_chroma_mode.empty() && sds_chroma_mode != video::PACKED_YCOCGR_MODE_NAME) {
+      tree.put("root.gamesession", 0);
+      tree.put("root.<xmlattr>.status_code", 400);
+      tree.put("root.<xmlattr>.status_message", "Invalid sdsChromaMode parameter");
+      return;
+    }
+
     auto appid = util::from_view(get_arg(args, "appid"));
 
     auto current_appid = proc::proc.running();
@@ -1416,11 +1883,29 @@ namespace nvhttp {
     }
 
     host_audio = util::from_view(get_arg(args, "localAudioPlayMode"));
-    auto launch_session = make_launch_session(host_audio, args);
+    auto launch_session = make_launch_session(host_audio, args, *client);
 
-    if (rtsp_stream::session_count() == 0) {
+    std::string_view chroma_error;
+    if (!validate_pre_probe_packed_chroma(sds_chroma_mode, *launch_session, chroma_error)) {
+      tree.put("root.gamesession", 0);
+      tree.put("root.<xmlattr>.status_code", 400);
+      tree.put("root.<xmlattr>.status_message", chroma_error);
+      return;
+    }
+
+    bool packed_activated = false;
+    auto packed_guard = util::fail_guard([&packed_activated]() {
+      if (packed_activated) {
+        video::clear_session_packed_ycocgr_mode();
+      }
+    });
+
+    const bool no_active_sessions = (rtsp_stream::session_count() == 0);
+    if (no_active_sessions) {
       // The display should be restored in case something fails as there are no other sessions.
       revert_display_configuration = true;
+
+      apply_session_overrides(*session_overrides, *launch_session);
 
       // We want to prepare display only if there are no active sessions at
       // the moment. This should be done before probing encoders as it could
@@ -1440,7 +1925,14 @@ namespace nvhttp {
       }
     }
 
-    auto encryption_mode = net::encryption_mode_for_address(request->remote_endpoint().address());
+    if (!activate_packed_chroma_after_probe(sds_chroma_mode, *launch_session, no_active_sessions, packed_activated, chroma_error)) {
+      tree.put("root.gamesession", 0);
+      tree.put("root.<xmlattr>.status_code", 400);
+      tree.put("root.<xmlattr>.status_message", chroma_error);
+      return;
+    }
+
+    auto encryption_mode = net::encryption_mode_for_address(boost::asio::ip::make_address(request->remote_endpoint().address().to_string()));
     if (!launch_session->rtsp_cipher && encryption_mode == config::ENCRYPTION_MODE_MANDATORY) {
       BOOST_LOG(error) << "Rejecting client that cannot comply with mandatory encryption requirement"sv;
 
@@ -1468,13 +1960,14 @@ namespace nvhttp {
       std::format(
         "{}{}:{}",
         launch_session->rtsp_url_scheme,
-        net::addr_to_url_escaped_string(request->local_endpoint().address()),
+        net::addr_to_url_escaped_string(boost::asio::ip::make_address(request->local_endpoint().address().to_string())),
         static_cast<int>(net::map_port(rtsp_stream::RTSP_SETUP_PORT))
       )
     );
     tree.put("root.gamesession", 1);
 
     rtsp_stream::launch_session_raise(launch_session);
+    packed_activated = false;
 
     // Stream was started successfully, we will revert the config when the app or session terminates
     revert_display_configuration = false;
@@ -1490,7 +1983,14 @@ namespace nvhttp {
   void resume(bool &host_audio, resp_https_t response, req_https_t request) {
     print_req<SunshineHTTPS>(request);
 
+    const auto client = verified_client(request);
+    if (!client) {
+      write_unauthorized(response);
+      return;
+    }
+
     pt::ptree tree;
+    bool revert_display_configuration {false};
     auto g = util::fail_guard([&]() {
       std::ostringstream data;
 
@@ -1501,6 +2001,10 @@ namespace nvhttp {
       pt::write_xml(data, tree);
       response->write(data.str());
       response->close_connection_after_response = true;
+
+      if (revert_display_configuration) {
+        revert_session_overrides_and_display();
+      }
     });
 
     auto current_appid = proc::proc.running();
@@ -1524,6 +2028,26 @@ namespace nvhttp {
       return;
     }
 
+    if (const auto surround_it = args.find("surroundParams"); surround_it != args.end() && !surround_it->second.empty() && !is_valid_surround_params_value(surround_it->second)) {
+      tree.put("root.resume", 0);
+      tree.put("root.<xmlattr>.status_code", 400);
+      tree.put("root.<xmlattr>.status_message", "Invalid surroundParams parameter");
+      return;
+    }
+
+    const auto session_overrides = validate_session_overrides(args, tree, "resume"sv);
+    if (!session_overrides) {
+      return;
+    }
+
+    const auto sds_chroma_mode = get_arg(args, "sdsChromaMode", "");
+    if (!sds_chroma_mode.empty() && sds_chroma_mode != video::PACKED_YCOCGR_MODE_NAME) {
+      tree.put("root.resume", 0);
+      tree.put("root.<xmlattr>.status_code", 400);
+      tree.put("root.<xmlattr>.status_message", "Invalid sdsChromaMode parameter");
+      return;
+    }
+
     // Newer Moonlight clients send localAudioPlayMode on /resume too,
     // so we should use it if it's present in the args and there are
     // no active sessions we could be interfering with.
@@ -1531,9 +2055,27 @@ namespace nvhttp {
     if (no_active_sessions && args.find("localAudioPlayMode"s) != std::end(args)) {
       host_audio = util::from_view(get_arg(args, "localAudioPlayMode"));
     }
-    const auto launch_session = make_launch_session(host_audio, args);
+    const auto launch_session = make_launch_session(host_audio, args, *client);
+
+    std::string_view chroma_error;
+    if (!validate_pre_probe_packed_chroma(sds_chroma_mode, *launch_session, chroma_error)) {
+      tree.put("root.resume", 0);
+      tree.put("root.<xmlattr>.status_code", 400);
+      tree.put("root.<xmlattr>.status_message", chroma_error);
+      return;
+    }
+
+    bool packed_activated = false;
+    auto packed_guard = util::fail_guard([&packed_activated]() {
+      if (packed_activated) {
+        video::clear_session_packed_ycocgr_mode();
+      }
+    });
 
     if (no_active_sessions) {
+      revert_display_configuration = true;
+      apply_session_overrides(*session_overrides, *launch_session);
+
       // We want to prepare display only if there are no active sessions at
       // the moment. This should be done before probing encoders as it could
       // change the active displays.
@@ -1552,7 +2094,14 @@ namespace nvhttp {
       }
     }
 
-    auto encryption_mode = net::encryption_mode_for_address(request->remote_endpoint().address());
+    if (!activate_packed_chroma_after_probe(sds_chroma_mode, *launch_session, no_active_sessions, packed_activated, chroma_error)) {
+      tree.put("root.resume", 0);
+      tree.put("root.<xmlattr>.status_code", 400);
+      tree.put("root.<xmlattr>.status_message", chroma_error);
+      return;
+    }
+
+    auto encryption_mode = net::encryption_mode_for_address(boost::asio::ip::make_address(request->remote_endpoint().address().to_string()));
     if (!launch_session->rtsp_cipher && encryption_mode == config::ENCRYPTION_MODE_MANDATORY) {
       BOOST_LOG(error) << "Rejecting client that cannot comply with mandatory encryption requirement"sv;
 
@@ -1569,13 +2118,15 @@ namespace nvhttp {
       std::format(
         "{}{}:{}",
         launch_session->rtsp_url_scheme,
-        net::addr_to_url_escaped_string(request->local_endpoint().address()),
+        net::addr_to_url_escaped_string(boost::asio::ip::make_address(request->local_endpoint().address().to_string())),
         static_cast<int>(net::map_port(rtsp_stream::RTSP_SETUP_PORT))
       )
     );
     tree.put("root.resume", 1);
 
     rtsp_stream::launch_session_raise(launch_session);
+    revert_display_configuration = false;
+    packed_activated = false;
   }
 
   /**
@@ -1586,6 +2137,10 @@ namespace nvhttp {
    */
   void cancel(resp_https_t response, req_https_t request) {
     print_req<SunshineHTTPS>(request);
+    if (!verified_client(request)) {
+      write_unauthorized(response);
+      return;
+    }
 
     pt::ptree tree;
     auto g = util::fail_guard([&tree, &response]() {
@@ -1606,7 +2161,7 @@ namespace nvhttp {
     }
 
     // The config needs to be reverted regardless of whether "proc::proc.terminate()" was called or not.
-    display_device::revert_configuration();
+    revert_session_overrides_and_display();
   }
 
   /**
@@ -1617,6 +2172,10 @@ namespace nvhttp {
    */
   void appasset(resp_https_t response, req_https_t request) {
     print_req<SunshineHTTPS>(request);
+    if (!verified_client(request)) {
+      write_unauthorized(response);
+      return;
+    }
 
     auto args = request->parse_query_string();
     auto app_image = proc::proc.get_app_image((int) util::from_view(get_arg(args, "appid")));
@@ -1641,6 +2200,53 @@ namespace nvhttp {
              enabled device and "name" is the friendly client name set during pairing.
    */
   std::pair<bool, std::string> get_client_status(const std::string_view cert_pem);
+
+  /**
+   * @brief Verify the DER-encoded client certificate presented on a completed TLS handshake against the paired clients.
+   *
+   * @param cert_der DER-encoded leaf certificate bytes.
+   * @param cert_der_len Length of `cert_der` in bytes.
+   * @return Verified client identity, or no value when the client must be denied.
+   */
+  std::optional<verified_client_t> verify_client_connection(const std::uint8_t *cert_der, const std::size_t cert_der_len) {
+    const unsigned char *der_ptr = cert_der;
+    crypto::x509_t x509 {
+      (cert_der && cert_der_len > 0) ? d2i_X509(nullptr, &der_ptr, static_cast<long>(cert_der_len)) : nullptr
+    };
+    if (!x509 || der_ptr != cert_der + cert_der_len) {
+      BOOST_LOG(info) << "unknown -- denied"sv;
+      return std::nullopt;
+    }
+
+    bool verified = false;
+
+    auto fg = util::fail_guard([&]() {
+      std::array<char, 256> subject_name;
+
+      X509_NAME_oneline(X509_get_subject_name(x509.get()), subject_name.data(), subject_name.size());
+
+      BOOST_LOG(debug) << subject_name.data() << " -- "sv << (verified ? "verified"sv : "denied"sv);
+    });
+
+    std::lock_guard lock {client_auth_mutex()};
+    auto err_str = verify_client_certificate(x509.get());
+    if (err_str) {
+      BOOST_LOG(warning) << "SSL Verification error :: "sv << err_str;
+
+      return std::nullopt;
+    }
+
+    // Check if this client is enabled
+    auto pem = crypto::pem(x509);
+    auto [enabled, client_name] = get_client_status(pem);
+    if (!enabled) {
+      BOOST_LOG(info) << "Client is disabled -- denied"sv;
+      return std::nullopt;
+    }
+
+    verified = true;
+    return verified_client_t {std::move(pem), std::move(client_name)};
+  }
 
   void start() {
     platf::set_thread_name("nvhttp");
@@ -1668,51 +2274,7 @@ namespace nvhttp {
     http_server_t http_server;
 
     // Verify certificates after establishing connection
-    https_server.verify = [](SSL *ssl) {
-      crypto::x509_t x509 {
-#if OPENSSL_VERSION_MAJOR >= 3
-        SSL_get1_peer_certificate(ssl)
-#else
-        SSL_get_peer_certificate(ssl)
-#endif
-      };
-      if (!x509) {
-        BOOST_LOG(info) << "unknown -- denied"sv;
-        return 0;
-      }
-
-      int verified = 0;
-
-      auto fg = util::fail_guard([&]() {
-        std::array<char, 256> subject_name;
-
-        X509_NAME_oneline(X509_get_subject_name(x509.get()), subject_name.data(), subject_name.size());
-
-        BOOST_LOG(debug) << subject_name.data() << " -- "sv << (verified ? "verified"sv : "denied"sv);
-      });
-
-      std::lock_guard lock {client_auth_mutex()};
-      auto err_str = verify_client_certificate(x509.get());
-      if (err_str) {
-        BOOST_LOG(warning) << "SSL Verification error :: "sv << err_str;
-
-        return verified;
-      }
-
-      // Check if this client is enabled
-      auto pem = crypto::pem(x509);
-      auto [enabled, client_name] = get_client_status(pem);
-      if (!enabled) {
-        BOOST_LOG(info) << "Client is disabled -- denied"sv;
-        return verified;
-      }
-
-      last_verified_client_cert = pem;
-      last_verified_client_name = client_name;
-      verified = 1;
-
-      return verified;
-    };
+    https_server.set_verify_callback(verify_client_connection);
 
     https_server.on_verify_failed = [](resp_https_t resp, req_https_t req) {
       pt::ptree tree;
@@ -1743,6 +2305,8 @@ namespace nvhttp {
       resume(host_audio, resp, req);
     };
     https_server.resource["^/cancel$"]["GET"] = cancel;
+    sds::start();
+    sds::http::register_routes(https_server);  // SDS-MERGE: keep max_request_streambuf_size >= sds::max_request_body_size()
 
     https_server.config.reuse_address = true;
     https_server.config.address = net::get_bind_address(address_family);
@@ -1753,6 +2317,7 @@ namespace nvhttp {
     http_server.resource["^/pair$"]["GET"] = [](auto resp, auto req) {
       pair<SimpleWeb::HTTP>(resp, req);
     };
+    sds::http::register_plain_http_guard(http_server);
 
     http_server.config.reuse_address = true;
     http_server.config.address = net::get_bind_address(address_family);
@@ -1763,13 +2328,13 @@ namespace nvhttp {
         std::string name = "nvhttp::" + std::to_string(web_server->config.port);
         platf::set_thread_name(name);
         web_server->start();
-      } catch (boost::system::system_error &err) {
+      } catch (const std::exception &err) {
         // It's possible the exception gets thrown after calling http_server->stop() from a different thread
         if (shutdown_event->peek()) {
           return;
         }
 
-        BOOST_LOG(fatal) << "Couldn't start http server on ports ["sv << port_https << ", "sv << port_https << "]: "sv << err.what();
+        BOOST_LOG(fatal) << "Couldn't start http server on ports ["sv << port_http << ", "sv << port_https << "]: "sv << err.what();
         shutdown_event->raise(true);
         return;
       }
@@ -1780,6 +2345,8 @@ namespace nvhttp {
     // Wait for any event
     shutdown_event->view();
 
+    // Release parked long-polls and in-flight sds responses while the servers still exist.
+    sds::stop();
     https_server.stop();
     http_server.stop();
 
@@ -1847,7 +2414,40 @@ namespace nvhttp {
         return {named_cert.enabled, named_cert.name};
       }
     }
-    return {true, {}};
+    return {false, {}};
+  }
+
+  std::optional<client_info_t> find_enabled_client(const std::string_view cert_pem) {
+    if (cert_pem.empty()) {
+      return std::nullopt;
+    }
+    std::lock_guard lock {client_auth_mutex()};
+    std::optional<client_info_t> found;
+    for (const auto &named_cert : client_root.named_devices) {
+      if (named_cert.cert != cert_pem) {
+        continue;
+      }
+      if (found || !named_cert.enabled) {
+        // Duplicate or disabled identities fail closed, like the TLS verify callback.
+        return std::nullopt;
+      }
+      found = client_info_t {named_cert.uuid, named_cert.name, named_cert.permissions};
+    }
+    return found;
+  }
+
+  bool set_client_permissions(const std::string_view uuid, const std::vector<std::string> &permissions) {
+    std::lock_guard lock {client_auth_mutex()};
+    for (auto &named_cert : client_root.named_devices) {
+      if (named_cert.uuid == uuid) {
+        named_cert.permissions = sds::normalize_permissions(permissions);
+        if (!config::sunshine.flags[config::flag::FRESH_STATE]) {
+          save_state();
+        }
+        return true;
+      }
+    }
+    return false;
   }
 
 #ifdef SUNSHINE_TESTS
@@ -1855,7 +2455,8 @@ namespace nvhttp {
     std::unique_ptr<SimpleWeb::ServerBase<SunshineHTTPS>> make_https_server(
       const std::string &certificate_file,
       const std::string &private_key_file,
-      std::shared_ptr<SimpleWeb::ScopeRunner> &handler_scope
+      std::shared_ptr<SimpleWeb::ScopeRunner> &handler_scope,
+      const bool verify_paired_clients
     ) {
       /**
        * @brief Expose the production HTTPS handler scope to lifetime regression tests.
@@ -1868,7 +2469,65 @@ namespace nvhttp {
 
       auto server = std::make_unique<test_https_server_t>(certificate_file, private_key_file);
       handler_scope = server->handler_runner;
+      if (verify_paired_clients) {
+        server->set_verify_callback(verify_client_connection);
+        server->on_verify_failed = [](const resp_https_t &response, const req_https_t &) {
+          response->close_connection_after_response = true;
+          response->write(SimpleWeb::StatusCode::client_error_unauthorized);
+        };
+      }
       return server;
+    }
+
+    std::unique_ptr<SimpleWeb::ServerBase<SunshineHTTPS>> make_verifying_https_server(
+      const std::string &certificate_file,
+      const std::string &private_key_file,
+      std::shared_ptr<SimpleWeb::ScopeRunner> &handler_scope
+    ) {
+      return make_https_server(certificate_file, private_key_file, handler_scope, true);
+    }
+
+    void serverinfo_https(resp_https_t response, req_https_t request) {
+      serverinfo<SunshineHTTPS>(std::move(response), std::move(request));
+    }
+
+    void applist_https(resp_https_t response, req_https_t request) {
+      applist(std::move(response), std::move(request));
+    }
+
+    void appasset_https(resp_https_t response, req_https_t request) {
+      appasset(std::move(response), std::move(request));
+    }
+
+    void cancel_https(resp_https_t response, req_https_t request) {
+      cancel(std::move(response), std::move(request));
+    }
+
+    void pair_https(resp_https_t response, req_https_t request) {
+      pair<SunshineHTTPS>(std::move(response), std::move(request));
+    }
+
+    std::pair<bool, std::string> get_client_status(const std::string_view cert_pem) {
+      std::lock_guard lock {client_auth_mutex()};
+      return nvhttp::get_client_status(cert_pem);
+    }
+
+    bool is_valid_surround_params(const std::string_view params) {
+      return is_valid_surround_params_value(params);
+    }
+
+    std::string sanitize_surround_params(const std::string_view params) {
+      return sanitize_surround_params_value(params);
+    }
+
+    std::unique_ptr<SimpleWeb::ServerBase<SimpleWeb::HTTP>> make_http_server() {
+      return std::make_unique<http_server_t>();
+    }
+
+    std::size_t verified_connection_count() {
+      auto &registry = verified_connections();
+      std::scoped_lock lock {registry.mutex};
+      return registry.entries.size();
     }
 
     void pair_http(

@@ -9,10 +9,17 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
+#include <memory>
+#include <string_view>
 
 // local includes
 #include "crypto.h"
 #include "thread_safe.h"
+
+namespace stream {
+  struct session_t;
+}  // namespace stream
 
 namespace rtsp_stream {
   constexpr auto RTSP_SETUP_PORT = 21;  ///< GameStream base-port offset used for the RTSP setup listener.
@@ -99,6 +106,13 @@ namespace rtsp_stream {
     std::string rtsp_url_scheme;  ///< URL scheme selected by the RTSP SETUP flow.
     uint32_t rtsp_iv_counter;  ///< Counter value mixed into encrypted RTSP IVs.
     std::string client_cert;  ///< PEM certificate for the paired Moonlight client.
+
+    // secure-desktop-stream microphone passthrough (set by RTSP SETUP streamid=mic)
+    bool mic_requested = false;  ///< Whether the client completed SETUP for the microphone stream.
+    std::string mic_ping_payload;  ///< Ping payload that binds the client's microphone UDP endpoint.
+
+    // Packed YCoCg-R P010 4:4:4 mode negotiated on /launch or /resume (0 = off, 1 = Layout A1)
+    int packed_ycocgr_mode = 0;  ///< Packed YCoCg-R mode requested for this launch session.
   };
 
   /**
@@ -130,6 +144,57 @@ namespace rtsp_stream {
    * @param cert Certificate data or object used by the operation.
    */
   void terminate_sessions_by_cert(std::string_view cert);
+
+  /**
+   * @brief Check whether a streaming session of this client certificate is running.
+   *
+   * Walks the session slots under their lock and never joins or clears sessions.
+   *
+   * @param cert_pem Canonical PEM certificate of the client.
+   * @return `true` when a session for the certificate is in the RUNNING state.
+   */
+  bool has_running_session(std::string_view cert_pem);
+
+  /**
+   * @brief Observer notified when a streaming session starts running or begins to stop.
+   *
+   * Called from session and RTSP threads, possibly while the session slots are locked: it must not
+   * block and must not call back into rtsp_stream synchronously.
+   */
+  using session_observer_t = std::function<void(std::string_view cert_pem, bool running)>;
+
+  /**
+   * @brief Install (or clear with an empty function) the session observer.
+   *
+   * @param observer Observer.
+   */
+  void set_session_observer(session_observer_t observer);
+
+  /**
+   * @brief Notify the observer about a session state change (called by stream::session).
+   *
+   * @param cert_pem Client certificate of the session.
+   * @param running `true` when the session started running, `false` when it began stopping.
+   */
+  void notify_session_state(std::string_view cert_pem, bool running);
+
+#ifdef SUNSHINE_TESTS
+  namespace test_support {
+    /**
+     * @brief Insert a session into the RTSP session slots without starting it.
+     *
+     * @param session Session to insert.
+     */
+    void insert_session(const std::shared_ptr<stream::session_t> &session);
+
+    /**
+     * @brief Remove a session from the RTSP session slots without stopping or joining it.
+     *
+     * @param session Session to remove.
+     */
+    void remove_session(const std::shared_ptr<stream::session_t> &session);
+  }  // namespace test_support
+#endif
 
   /**
    * @brief Runs the RTSP server loop.

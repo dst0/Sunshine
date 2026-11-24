@@ -27,6 +27,7 @@
 #include "display_geometry.h"
 #include "graphics.h"
 #include "kms_plane.h"
+#include "misc.h"
 #include "src/config.h"
 #include "src/logging.h"
 #include "src/platform/common.h"
@@ -1154,6 +1155,13 @@ namespace platf {
         int monitor_index = map_display_name_to_monitor_index(display_name);
         int monitor = 0;
 
+        std::string target_capture_pci;
+        if (platf::is_session_capture_adapter_overridden()) {
+          if (const auto cap = platf::resolve_capture_adapter(); cap && !cap->pci_slot.empty()) {
+            target_capture_pci = cap->pci_slot;
+          }
+        }
+
         fs::path card_dir {"/dev/dri"sv};
         for (auto &entry : fs::directory_iterator {card_dir}) {
           auto file = entry.path().filename();
@@ -1161,6 +1169,14 @@ namespace platf {
           auto filestring = file.generic_string();
           if (filestring.size() < 4 || std::string_view {filestring}.substr(0, 4) != "card"sv) {
             continue;
+          }
+
+          if (!target_capture_pci.empty()) {
+            const auto card_pci = platf::drm_node_pci_slot(filestring);
+            if (!card_pci.empty() && card_pci != target_capture_pci) {
+              BOOST_LOG(debug) << file << " ("sv << card_pci << ") does not match requested capture GPU ["sv << target_capture_pci << ']';
+              continue;
+            }
           }
 
           kms::card_t card;
@@ -2207,7 +2223,18 @@ namespace platf {
    * @return KMS display backend, or nullptr when initialization fails.
    */
   std::shared_ptr<display_t> kms_display(mem_type_e hwdevice_type, const std::string &display_name, const ::video::config_t &config) {
-    if (hwdevice_type == mem_type_e::vaapi || hwdevice_type == mem_type_e::cuda || hwdevice_type == mem_type_e::vulkan) {
+    bool separate_encode_gpu = false;
+    if (const auto cap = platf::resolve_capture_adapter(); cap && !cap->id.empty()) {
+      std::error_code ec_enc;
+      std::error_code ec_cap;
+      const auto enc_canon = fs::weakly_canonical(platf::resolve_render_device(), ec_enc);
+      const auto cap_canon = fs::weakly_canonical(cap->id, ec_cap);
+      if (!ec_enc && !ec_cap && !enc_canon.empty() && !cap_canon.empty() && enc_canon != cap_canon) {
+        separate_encode_gpu = true;
+      }
+    }
+
+    if (!separate_encode_gpu && (hwdevice_type == mem_type_e::vaapi || hwdevice_type == mem_type_e::cuda || hwdevice_type == mem_type_e::vulkan)) {
       auto disp = std::make_shared<kms::display_vram_t>(hwdevice_type);
 
       if (!disp->init(display_name, config)) {
@@ -2318,6 +2345,13 @@ namespace platf {
     std::vector<kms::card_descriptor_t> cds;
     std::vector<std::string> display_names;
 
+    std::string target_capture_pci;
+    if (platf::is_session_capture_adapter_overridden()) {
+      if (const auto cap = platf::resolve_capture_adapter(); cap && !cap->pci_slot.empty()) {
+        target_capture_pci = cap->pci_slot;
+      }
+    }
+
     fs::path card_dir {"/dev/dri"sv};
     for (auto &entry : fs::directory_iterator {card_dir}) {
       auto file = entry.path().filename();
@@ -2325,6 +2359,13 @@ namespace platf {
       auto filestring = file.generic_string();
       if (std::string_view {filestring}.substr(0, 4) != "card"sv) {
         continue;
+      }
+
+      if (!target_capture_pci.empty()) {
+        const auto card_pci = platf::drm_node_pci_slot(filestring);
+        if (!card_pci.empty() && card_pci != target_capture_pci) {
+          continue;
+        }
       }
 
       kms::card_t card;

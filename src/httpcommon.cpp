@@ -5,18 +5,26 @@
 #define BOOST_BIND_GLOBAL_PLACEHOLDERS
 
 // standard includes
+#include <atomic>
+#include <cerrno>
+#include <charconv>
 #include <filesystem>
+#include <fstream>
 #include <utility>
 
+#ifndef _WIN32
+  #include <fcntl.h>
+  #include <sys/stat.h>
+  #include <unistd.h>
+#endif
+
 // lib includes
-#include <boost/asio/ssl/context.hpp>
-#include <boost/asio/ssl/context_base.hpp>
 #include <boost/property_tree/json_parser.hpp>
 #include <boost/property_tree/ptree.hpp>
 #include <boost/property_tree/xml_parser.hpp>
-#include <curl/curl.h>
 #include <Simple-Web-Server/server_http.hpp>
 #include <Simple-Web-Server/server_https.hpp>
+#include <vector>
 
 // local includes
 #include "config.h"
@@ -31,6 +39,7 @@
 #include "rtsp.h"
 #include "utility.h"
 #include "uuid.h"
+#include "webui_auth.h"
 
 namespace http {
   using namespace std::literals;
@@ -63,15 +72,23 @@ namespace http {
       config::nvhttp.pkey = (dir / ("pkey-"s + unique_id)).string();
     }
 
+    if (require_user_creds(config::sunshine.credentials_file)) {
+      return -1;
+    }
     if ((!fs::exists(config::nvhttp.pkey) || !fs::exists(config::nvhttp.cert)) && create_creds(config::nvhttp.pkey, config::nvhttp.cert)) {
       return -1;
     }
-    if (!user_creds_exist(config::sunshine.credentials_file)) {
-      BOOST_LOG(info) << "Open the Web UI to set your new username and password and getting started";
-    } else if (reload_user_creds(config::sunshine.credentials_file)) {
-      return -1;
-    }
     return 0;
+  }
+
+  int require_user_creds(const std::string &file) {
+    if (user_creds_exist(file) && reload_user_creds(file) == 0 && !config::sunshine.username.empty() && !config::sunshine.password.empty()) {
+      return 0;
+    }
+
+    BOOST_LOG(fatal) << "No Web UI credentials are configured in ["sv << file << "]. Sunshine will not start without them."sv;
+    BOOST_LOG(fatal) << "Create them first by running: sunshine --creds <username>  (the password is prompted for)"sv;
+    return -1;
   }
 
   /**
@@ -95,16 +112,30 @@ namespace http {
       }
     }
 
-    auto salt = crypto::rand_alphabet(16);
+    // The PBKDF2 hash carries its own salt and iteration count; the legacy salt field is kept
+    // (empty) so the file keeps the layout older code and tools expect.
     outputTree.put("username", username);
-    outputTree.put("salt", salt);
-    outputTree.put("password", util::hex(crypto::hash(password + salt)).to_string());
+    outputTree.put("salt", "");
     try {
+      outputTree.put("password", webui_auth::hash_password(password));
+
+      // The file holds the password hash: make it private to the user running Sunshine before the
+      // hash is written (writing truncates the file and keeps its permissions).
+      {
+        std::ofstream touch {file, std::ios::app};
+      }
+      std::error_code permissions_error;
+      fs::permissions(file, fs::perms::owner_read | fs::perms::owner_write, fs::perm_options::replace, permissions_error);
+      if (permissions_error) {
+        BOOST_LOG(warning) << "Couldn't restrict permissions of ["sv << file << "]: "sv << permissions_error.message();
+      }
+
       pt::write_json(file, outputTree);
     } catch (std::exception &e) {
       BOOST_LOG(error) << "error writing to the credentials file, perhaps try this again as an administrator? Details: "sv << e.what();
       return -1;
     }
+    webui_auth::clear_verification_cache();
 
     BOOST_LOG(info) << "New credentials have been created"sv;
     return 0;
@@ -149,6 +180,130 @@ namespace http {
   }
 
   /**
+   * @brief Shared atomic connection counter for @ref connection_limiter_t.
+   */
+  struct connection_limiter_t::state_t {
+    /**
+     * @brief RAII slot lease decrementing @ref state_t on destruction.
+     */
+    struct lease_t {
+      /**
+       * @brief Acquire ownership of one counted connection slot.
+       *
+       * @param owner Shared counter state.
+       */
+      explicit lease_t(std::shared_ptr<state_t> owner):
+          state(std::move(owner)) {}
+
+      std::shared_ptr<state_t> state;  ///< Accounting owner.
+
+      ~lease_t() {
+        if (state) {
+          state->active.fetch_sub(1, std::memory_order_relaxed);
+        }
+      }
+    };
+
+    /**
+     * @brief Construct counter state with a maximum connection limit.
+     *
+     * @param max_connections Maximum concurrent leases.
+     */
+    explicit state_t(const std::size_t max_connections):
+        limit(max_connections) {}
+
+    std::atomic<std::size_t> active {0};  ///< Currently leased connection count.
+    std::size_t limit = 0;  ///< Maximum concurrent leases.
+  };
+
+  namespace {
+
+#ifndef _WIN32
+    /**
+     * @brief Create or truncate a file with owner-only (`0600`) permissions before writing bytes.
+     *
+     * @param path Destination path.
+     * @param content Contents to write.
+     * @return `0` on success, `-1` on failure.
+     */
+    int write_private_file(const std::string &path, const std::string_view content) {
+      const int fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, S_IRUSR | S_IWUSR);
+      if (fd < 0) {
+        return -1;
+      }
+
+      if (::fchmod(fd, S_IRUSR | S_IWUSR) != 0) {
+        ::close(fd);
+        return -1;
+      }
+
+      const char *data = content.data();
+      std::size_t remaining = content.size();
+      while (remaining > 0) {
+        const auto written = ::write(fd, data, remaining);
+        if (written < 0) {
+          if (errno == EINTR) {
+            continue;
+          }
+          ::close(fd);
+          return -1;
+        }
+        data += written;
+        remaining -= static_cast<std::size_t>(written);
+      }
+
+      return ::close(fd) == 0 ? 0 : -1;
+    }
+#endif
+  }  // namespace
+
+  connection_limiter_t::connection_limiter_t(const std::size_t max_connections):
+      state_(std::make_shared<state_t>(max_connections)) {}
+
+  std::shared_ptr<void> connection_limiter_t::try_acquire() {
+    auto current = state_->active.load(std::memory_order_relaxed);
+    while (current < state_->limit) {
+      if (state_->active.compare_exchange_weak(current, current + 1, std::memory_order_acq_rel, std::memory_order_relaxed)) {
+        return std::make_shared<state_t::lease_t>(state_);
+      }
+    }
+    return {};
+  }
+
+  bool has_canonical_header_lines(std::string_view raw) {
+    return sds_http_has_canonical_header_lines(
+      reinterpret_cast<const std::uint8_t *>(raw.data()),
+      raw.size()
+    );
+  }
+
+  bool validate_request_framing(
+    const std::string_view raw_header,
+    const SimpleWeb::CaseInsensitiveMultimap &header,
+    const std::size_t max_body_size,
+    std::size_t *content_length
+  ) {
+    std::vector<SdsHttpHeaderRef> header_refs;
+    header_refs.reserve(header.size());
+    for (const auto &entry : header) {
+      header_refs.push_back(SdsHttpHeaderRef {
+        reinterpret_cast<const std::uint8_t *>(entry.first.data()),
+        entry.first.size(),
+        reinterpret_cast<const std::uint8_t *>(entry.second.data()),
+        entry.second.size(),
+      });
+    }
+    return sds_http_validate_request_framing(
+      reinterpret_cast<const std::uint8_t *>(raw_header.data()),
+      raw_header.size(),
+      header_refs.empty() ? nullptr : header_refs.data(),
+      header_refs.size(),
+      max_body_size,
+      content_length
+    );
+  }
+
+  /**
    * @brief Generate HTTPS credential files from the provided key and certificate paths.
    */
   int create_creds(const std::string &pkey, const std::string &cert) {
@@ -163,22 +318,33 @@ namespace http {
     cert_dir.remove_filename();
 
     std::error_code err_code {};
-    fs::create_directories(pkey_dir, err_code);
-    if (err_code) {
-      BOOST_LOG(error) << "Couldn't create directory ["sv << pkey_dir << "] :"sv << err_code.message();
-      return -1;
+    if (!pkey_dir.empty()) {
+      fs::create_directories(pkey_dir, err_code);
+      if (err_code) {
+        BOOST_LOG(error) << "Couldn't create directory ["sv << pkey_dir << "] :"sv << err_code.message();
+        return -1;
+      }
     }
 
-    fs::create_directories(cert_dir, err_code);
-    if (err_code) {
-      BOOST_LOG(error) << "Couldn't create directory ["sv << cert_dir << "] :"sv << err_code.message();
-      return -1;
+    if (!cert_dir.empty()) {
+      fs::create_directories(cert_dir, err_code);
+      if (err_code) {
+        BOOST_LOG(error) << "Couldn't create directory ["sv << cert_dir << "] :"sv << err_code.message();
+        return -1;
+      }
     }
 
+#ifdef _WIN32
     if (file_handler::write_file(pkey.c_str(), creds.pkey)) {
       BOOST_LOG(error) << "Couldn't open ["sv << config::nvhttp.pkey << ']';
       return -1;
     }
+#else
+    if (write_private_file(pkey, creds.pkey) != 0) {
+      BOOST_LOG(error) << "Couldn't open ["sv << pkey << ']';
+      return -1;
+    }
+#endif
 
     if (file_handler::write_file(cert.c_str(), creds.x509)) {
       BOOST_LOG(error) << "Couldn't open ["sv << config::nvhttp.cert << ']';
@@ -200,70 +366,5 @@ namespace http {
     }
 
     return 0;
-  }
-
-  /**
-   * @brief Send a static file response for a Web UI request.
-   */
-  bool download_file(const std::string &url, const std::string &file, long ssl_version) {
-    CURL *curl = curl_easy_init();
-    if (!curl) {
-      BOOST_LOG(error) << "Couldn't create CURL instance";
-      return false;
-    }
-
-    if (std::string file_dir = file_handler::get_parent_directory(file); !file_handler::make_directory(file_dir)) {
-      BOOST_LOG(error) << "Couldn't create directory ["sv << file_dir << ']';
-      curl_easy_cleanup(curl);
-      return false;
-    }
-
-    FILE *fp = fopen(file.c_str(), "wb");
-    if (!fp) {
-      BOOST_LOG(error) << "Couldn't open ["sv << file << ']';
-      curl_easy_cleanup(curl);
-      return false;
-    }
-
-    curl_easy_setopt(curl, CURLOPT_SSLVERSION, ssl_version);
-    curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
-    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, fwrite);
-    curl_easy_setopt(curl, CURLOPT_WRITEDATA, fp);
-
-    CURLcode result = curl_easy_perform(curl);
-    if (result != CURLE_OK) {
-      BOOST_LOG(error) << "Couldn't download ["sv << url << ", code:" << result << ']';
-    }
-
-    curl_easy_cleanup(curl);
-    fclose(fp);
-    return result == CURLE_OK;
-  }
-
-  /**
-   * @brief Percent-encode URL data for use in HTTP query strings.
-   */
-  std::string url_escape(const std::string &url) {
-    char *string = curl_easy_escape(nullptr, url.c_str(), static_cast<int>(url.length()));
-    std::string result(string);
-    curl_free(string);
-    return result;
-  }
-
-  /**
-   * @brief Extract the host component from a URL string.
-   */
-  std::string url_get_host(const std::string &url) {
-    CURLU *curlu = curl_url();
-    curl_url_set(curlu, CURLUPART_URL, url.c_str(), static_cast<unsigned int>(url.length()));
-    char *host;
-    if (curl_url_get(curlu, CURLUPART_HOST, &host, 0) != CURLUE_OK) {
-      curl_url_cleanup(curlu);
-      return "";
-    }
-    std::string result(host);
-    curl_free(host);
-    curl_url_cleanup(curlu);
-    return result;
   }
 }  // namespace http

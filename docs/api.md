@@ -10,17 +10,19 @@ basic authentication with the admin username and password.
 State-changing API endpoints (POST, DELETE) are protected against Cross-Site Request Forgery (CSRF) attacks.
 
 **For Web Browsers:**
-- Requests from same-origin (configured via `csrf_allowed_origins`) are automatically allowed
-- Cross-origin requests require a CSRF token
+- Requests whose `Origin` (or, without it, `Referer`) matches an allowed origin (`https://localhost`,
+  `https://127.0.0.1`, `https://[::1]` on any port, plus `csrf_allowed_origins`) are allowed.
+  This covers the Web UI opened through an SSH tunnel.
+- All other requests require a CSRF token.
 
 **For Non-Browser Applications:**
-- Non-browser clients (e.g. `curl`, scripts, custom apps) are **exempt** from CSRF protection
-- CSRF attacks require a browser to silently attach credentials to a cross-origin request — this threat
-  does not apply to non-browser clients that explicitly provide credentials with every request
-- Requests with no `Origin` or `Referer` header (as is typical for non-browser clients) are automatically
-  allowed without a CSRF token
+- Requests without an `Origin` or `Referer` header (as is typical for `curl` and scripts) **require a
+  CSRF token**. A missing header does not prove that the request did not come from a browser.
+- Get a token from `GET /api/csrf-token` (authenticated) and send it in the `X-CSRF-Token` header
+  (or the `csrf_token` query parameter for compatibility). Tokens are valid for one hour and consist
+  of 64 hexadecimal characters. Prefer the header so the token stays out of the request URL.
 
-**Example (browser-equivalent cross-origin request):**
+**Example:**
 ```bash
 # Get CSRF token
 curl -u user:pass https://localhost:47990/api/csrf-token

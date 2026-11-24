@@ -590,6 +590,9 @@ namespace platf {
     virtual int convert(platf::img_t &img) = 0;
 
     video::sunshine_colorspace_t colorspace;  ///< Colorspace metadata expected by the encoder.
+    int packed_ycocgr_mode {0};  ///< Packed YCoCg-R mode (0 = off, 1 = Layout A1).
+    int packed_logical_width {0};  ///< Logical desktop width in pixels for packed YCoCg-R mode.
+    int packed_logical_height {0};  ///< Logical desktop height in pixels for packed YCoCg-R mode.
   };
 
   /**
@@ -1385,13 +1388,62 @@ namespace platf {
   std::string get_host_name();
 
   /**
+   * @brief Hardware render adapter metadata advertised to paired clients.
+   */
+  struct render_adapter_t {
+    std::string id;                   ///< Canonical device path (e.g. /dev/dri/by-path/pci-...-render).
+    std::string name;                 ///< Human-readable GPU name with PCI slot.
+    std::string vendor;               ///< Short vendor label or PCI vendor hex ID.
+    bool is_default;                  ///< True when matching the host default encoder render device.
+    std::string pci_slot {};          ///< Canonical PCI bus ID (e.g. "0000:02:00.0") when available.
+    std::string vendor_id {};         ///< Lowercase PCI vendor hex ID (e.g. "1002").
+    std::string device_id {};         ///< Lowercase PCI device hex ID (e.g. "73bf").
+    bool is_capture_default = false;  ///< True when matching the active host display/X11 capture GPU.
+  };
+
+  /**
    * @brief Resolves the render device path to use for hardware encoding.
-   * @details If `config::video.adapter_name` is set, returns that.
-   *          Otherwise, auto-detects the GPU with a connected display via `find_render_node_with_display()`.
-   *          Falls back to `/dev/dri/renderD128` if detection fails.
+   * @details Checks active per-session override first, then `config::video.adapter_name`,
+   *          then auto-detection via `find_render_node_with_display()`.
    * @return Resolved render device path (may be empty on non-Linux platforms).
    */
   std::string resolve_render_device();
+
+  /**
+   * @brief Enumerate available hardware render adapters on this host.
+   * @return Ordered list of render adapters with at most one marked default.
+   */
+  std::vector<render_adapter_t> enumerate_render_adapters();
+
+  /**
+   * @brief Set or clear the thread-safe per-session render device override.
+   * @param device Validated adapter device path or std::nullopt to clear.
+   */
+  void set_session_render_device_override(std::optional<std::string> device);
+
+  /**
+   * @brief Validate a client-requested adapter ID against enumerate_render_adapters().
+   * @param adapter_id Requested adapter ID.
+   * @return Canonical adapter ID on match, or std::nullopt if absent/invalid.
+   */
+  std::optional<std::string> validate_render_adapter_id(std::string_view adapter_id);
+
+  /**
+   * @brief Set or clear the thread-safe per-session X11/display capture adapter override.
+   * @param device Validated adapter device path or std::nullopt to clear.
+   */
+  void set_session_capture_adapter_override(std::optional<std::string> device);
+
+  /**
+   * @brief Return whether a per-session X11/display capture adapter override is currently active.
+   */
+  bool is_session_capture_adapter_overridden();
+
+  /**
+   * @brief Resolve metadata for the active capture/render adapter (session override or host capture default).
+   * @return Matching adapter metadata when available, or std::nullopt otherwise.
+   */
+  std::optional<render_adapter_t> resolve_capture_adapter();
 
   /**
    * @brief Gets the supported gamepads for this platform backend.

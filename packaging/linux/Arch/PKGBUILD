@@ -30,7 +30,6 @@ fi
 
 depends=(
   'avahi'
-  'curl'
   'gcc-libs'
   'gtk3'
   'hicolor-icon-theme'

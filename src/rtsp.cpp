@@ -14,6 +14,7 @@ extern "C" {
 #include <array>
 #include <cctype>
 #include <format>
+#include <mutex>
 #include <set>
 #include <unordered_map>
 #include <utility>
@@ -29,9 +30,11 @@ extern "C" {
 #include "logging.h"
 #include "network.h"
 #include "rtsp.h"
+#include "sds/mic.h"
 #include "stream.h"
 #include "sync.h"
 #include "video.h"
+#include "video_packed444.h"
 
 namespace asio = boost::asio;
 
@@ -636,6 +639,22 @@ namespace rtsp_stream {
     }
 
     /**
+     * @brief Check whether a running session belongs to a client certificate.
+     *
+     * @param cert Canonical PEM certificate.
+     * @return `true` when a session for the certificate is RUNNING.
+     */
+    bool has_running_session(std::string_view cert) {
+      auto lg = _session_slots.lock();
+      for (const auto &slot : *_session_slots) {
+        if (stream::session::client_cert(*slot) == cert && stream::session::state(*slot) == stream::session::state_e::RUNNING) {
+          return true;
+        }
+      }
+      return false;
+    }
+
+    /**
      * @brief Removes the provided session from the set of sessions.
      * @param session The session to remove.
      */
@@ -720,6 +739,63 @@ namespace rtsp_stream {
     server.clear_by_cert(cert);
     input::terminate_gamepads(cert);
   }
+
+  bool has_running_session(std::string_view cert_pem) {
+    if (cert_pem.empty()) {
+      return false;
+    }
+    return server.has_running_session(cert_pem);
+  }
+
+  namespace {
+    /**
+     * @brief Mutex protecting the session observer.
+     *
+     * @return Mutex.
+     */
+    std::mutex &session_observer_mutex() {
+      static std::mutex mutex;
+      return mutex;
+    }
+
+    /**
+     * @brief Installed session observer.
+     *
+     * @return Observer storage.
+     */
+    session_observer_t &session_observer() {
+      static session_observer_t observer;
+      return observer;
+    }
+  }  // namespace
+
+  void set_session_observer(session_observer_t observer) {
+    std::lock_guard lock {session_observer_mutex()};
+    session_observer() = std::move(observer);
+  }
+
+  void notify_session_state(std::string_view cert_pem, bool running) {
+    session_observer_t observer;
+    {
+      std::lock_guard lock {session_observer_mutex()};
+      observer = session_observer();
+    }
+    if (observer) {
+      observer(cert_pem, running);
+    }
+  }
+
+#ifdef SUNSHINE_TESTS
+  namespace test_support {
+    void insert_session(const std::shared_ptr<stream::session_t> &session) {
+      server.insert(session);
+    }
+
+    void remove_session(const std::shared_ptr<stream::session_t> &session) {
+      server.remove(session);
+    }
+  }  // namespace test_support
+#endif
 
   /**
    * @brief Send the serialized response over the active socket.
@@ -876,7 +952,11 @@ namespace rtsp_stream {
     std::stringstream ss;
 
     // Tell the client about our supported features
-    ss << "a=x-ss-general.featureFlags:" << (uint32_t) platf::get_capabilities() << std::endl;
+    auto feature_flags = (uint32_t) platf::get_capabilities();
+    if (sds::mic::should_advertise(session.client_cert)) {
+      feature_flags |= sds::mic::FEATURE_FLAG;
+    }
+    ss << "a=x-ss-general.featureFlags:" << feature_flags << std::endl;
 
     // Always request new control stream encryption if the client supports it
     uint32_t encryption_flags_supported = SS_ENC_CONTROL_V2 | SS_ENC_AUDIO;
@@ -979,6 +1059,13 @@ namespace rtsp_stream {
       port = net::map_port(stream::VIDEO_STREAM_PORT);
     } else if (type == "control"sv) {
       port = net::map_port(stream::CONTROL_PORT);
+    } else if (type == "mic"sv && sds::mic::should_advertise(session.client_cert)) {
+      // secure-desktop-stream microphone passthrough (DESIGN.md section 7.1)
+      port = net::map_port(sds::mic::PORT_OFFSET);
+      if (session.mic_ping_payload.empty()) {
+        session.mic_ping_payload = sds::mic::generate_ping_payload();
+      }
+      session.mic_requested = true;
     } else {
       cmd_not_found(sock, session, std::move(req));
 
@@ -1003,6 +1090,9 @@ namespace rtsp_stream {
     if (type == "control"sv) {
       payload_option.option = const_cast<char *>("X-SS-Connect-Data");
       payload_option.content = connect_data.data();
+    } else if (type == "mic"sv) {
+      payload_option.option = const_cast<char *>("X-SS-Ping-Payload");
+      payload_option.content = session.mic_ping_payload.data();
     } else {
       payload_option.option = const_cast<char *>("X-SS-Ping-Payload");
       payload_option.content = session.av_ping_payload.data();
@@ -1158,6 +1248,7 @@ namespace rtsp_stream {
       config.monitor.dynamicRange = (int) util::from_view(args.at("x-nv-video[0].dynamicRangeMode"sv));
       config.monitor.chromaSamplingType = (int) util::from_view(args.at("x-ss-video[0].chromaSamplingType"sv));
       config.monitor.enableIntraRefresh = (int) util::from_view(args.at("x-ss-video[0].intraRefresh"sv));
+      config.monitor.packed_ycocgr_mode = session.packed_ycocgr_mode;
 
       configuredBitrateKbps = util::from_view(args.at("x-ml-video.configuredBitrateKbps"sv));
     } catch (std::out_of_range &) {
@@ -1244,11 +1335,25 @@ namespace rtsp_stream {
       return;
     }
 
+    if (config.monitor.packed_ycocgr_mode == 1) {
+      if (config.monitor.videoFormat != 1 || !video::compute_ycocgr_a1_layout(config.monitor.width, config.monitor.height).has_value()) {
+        BOOST_LOG(warning) << "Packed YCoCg-R 4:4:4 requires HEVC and valid Layout A1 bounds"sv;
+        if (session_count() == 0) {
+          video::clear_session_packed_ycocgr_mode();
+        }
+        respond(sock, session, &option, 400, "BAD REQUEST", req->sequenceNumber, {});
+        return;
+      }
+    }
+
     // Check that any required encryption is enabled
     auto encryption_mode = net::encryption_mode_for_address(sock.remote_endpoint().address());
     if (encryption_mode == config::ENCRYPTION_MODE_MANDATORY && (config.encryptionFlagsEnabled & (SS_ENC_VIDEO | SS_ENC_AUDIO)) != (SS_ENC_VIDEO | SS_ENC_AUDIO)) {
       BOOST_LOG(error) << "Rejecting client that cannot comply with mandatory encryption requirement"sv;
 
+      if (session.packed_ycocgr_mode == 1 && session_count() == 0) {
+        video::clear_session_packed_ycocgr_mode();
+      }
       respond(sock, session, &option, 403, "Forbidden", req->sequenceNumber, {});
       return;
     }
@@ -1259,6 +1364,9 @@ namespace rtsp_stream {
     if (stream::session::start(*stream_session, sock.remote_endpoint().address().to_string())) {
       BOOST_LOG(error) << "Failed to start a streaming session"sv;
 
+      if (session.packed_ycocgr_mode == 1 && session_count() == 0) {
+        video::clear_session_packed_ycocgr_mode();
+      }
       rtsp_server->remove(stream_session);
       respond(sock, session, &option, 500, "Internal Server Error", req->sequenceNumber, {});
       return;

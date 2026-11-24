@@ -8,7 +8,9 @@
 #include <atomic>
 #include <bitset>
 #include <deque>
+#include <filesystem>
 #include <list>
+#include <mutex>
 #include <thread>
 #include <utility>
 
@@ -1511,10 +1513,183 @@ namespace video {
   static encoder_t *chosen_encoder;
   int active_hevc_mode;  ///< HEVC mode selected by the most recent encoder probe.
   int active_av1_mode;  ///< AV1 mode selected by the most recent encoder probe.
+  bool last_encoder_probe_is_vaapi = false;  ///< Whether the last probe selected VAAPI.
   bool last_encoder_probe_supported_ref_frames_invalidation = false;  ///< Whether the last probe found reference-frame invalidation support.
   std::array<bool, 3> last_encoder_probe_supported_yuv444_for_codec = {};  ///< YUV444 support discovered for each probed codec.
   std::array<bool, 3> last_encoder_probe_supported_dynamic_range_for_codec = {};  ///< 10-bit 4:2:0 support discovered for each probed codec.
   std::array<bool, 3> last_encoder_probe_supported_dynamic_range_yuv444_for_codec = {};  ///< 10-bit YUV444 support discovered for each probed codec.
+
+  namespace {
+    struct probe_snapshot_t {
+      bool valid = false;
+      std::string render_device;
+      std::string config_encoder;
+      int config_hevc_mode = 0;
+      int config_av1_mode = 0;
+      encoder_t *chosen = nullptr;
+      std::bitset<encoder_t::MAX_FLAGS> h264_caps;
+      std::bitset<encoder_t::MAX_FLAGS> hevc_caps;
+      std::bitset<encoder_t::MAX_FLAGS> av1_caps;
+      int active_hevc_mode = 0;
+      int active_av1_mode = 0;
+      bool is_vaapi = false;
+      bool ref_frames_invalidation = false;
+      std::array<bool, 3> yuv444 {};
+      std::array<bool, 3> dynamic_range {};
+      std::array<bool, 3> dynamic_range_yuv444 {};
+    };
+
+    std::mutex session_override_mutex;
+    std::optional<std::string> session_encoder_override;
+    bool session_hevc_requested = false;
+    bool session_adapter_overridden = false;
+    bool last_probe_used_override = false;
+    std::string last_probed_encoder_override = "__unprobed__";
+    bool last_probed_hevc_requested = false;
+    std::string last_probed_render_device;
+    std::string last_probed_config_encoder;
+    int last_probed_config_hevc_mode = -1;
+    int last_probed_config_av1_mode = -1;
+    probe_snapshot_t default_probe_snapshot;
+
+    void capture_default_snapshot_unlocked(const std::string &render_device) {
+      if (!chosen_encoder) {
+        return;
+      }
+      default_probe_snapshot.valid = true;
+      default_probe_snapshot.render_device = render_device;
+      default_probe_snapshot.config_encoder = config::video.encoder;
+      default_probe_snapshot.config_hevc_mode = config::video.hevc_mode;
+      default_probe_snapshot.config_av1_mode = config::video.av1_mode;
+      default_probe_snapshot.chosen = chosen_encoder;
+      default_probe_snapshot.h264_caps = chosen_encoder->h264.capabilities;
+      default_probe_snapshot.hevc_caps = chosen_encoder->hevc.capabilities;
+      default_probe_snapshot.av1_caps = chosen_encoder->av1.capabilities;
+      default_probe_snapshot.active_hevc_mode = active_hevc_mode;
+      default_probe_snapshot.active_av1_mode = active_av1_mode;
+      default_probe_snapshot.is_vaapi = last_encoder_probe_is_vaapi;
+      default_probe_snapshot.ref_frames_invalidation = last_encoder_probe_supported_ref_frames_invalidation;
+      default_probe_snapshot.yuv444 = last_encoder_probe_supported_yuv444_for_codec;
+      default_probe_snapshot.dynamic_range = last_encoder_probe_supported_dynamic_range_for_codec;
+      default_probe_snapshot.dynamic_range_yuv444 = last_encoder_probe_supported_dynamic_range_yuv444_for_codec;
+    }
+
+    void restore_default_snapshot_unlocked() {
+      if (!default_probe_snapshot.valid || !default_probe_snapshot.chosen) {
+        return;
+      }
+      chosen_encoder = default_probe_snapshot.chosen;
+      chosen_encoder->h264.capabilities = default_probe_snapshot.h264_caps;
+      chosen_encoder->hevc.capabilities = default_probe_snapshot.hevc_caps;
+      chosen_encoder->av1.capabilities = default_probe_snapshot.av1_caps;
+      active_hevc_mode = default_probe_snapshot.active_hevc_mode;
+      active_av1_mode = default_probe_snapshot.active_av1_mode;
+      last_encoder_probe_is_vaapi = default_probe_snapshot.is_vaapi;
+      last_encoder_probe_supported_ref_frames_invalidation = default_probe_snapshot.ref_frames_invalidation;
+      last_encoder_probe_supported_yuv444_for_codec = default_probe_snapshot.yuv444;
+      last_encoder_probe_supported_dynamic_range_for_codec = default_probe_snapshot.dynamic_range;
+      last_encoder_probe_supported_dynamic_range_yuv444_for_codec = default_probe_snapshot.dynamic_range_yuv444;
+      last_probe_used_override = false;
+      last_probed_encoder_override.clear();
+      last_probed_hevc_requested = false;
+      last_probed_render_device = default_probe_snapshot.render_device;
+      last_probed_config_encoder = default_probe_snapshot.config_encoder;
+      last_probed_config_hevc_mode = default_probe_snapshot.config_hevc_mode;
+      last_probed_config_av1_mode = default_probe_snapshot.config_av1_mode;
+    }
+
+    bool linux_has_nvidia_adapter() {
+#if defined(__linux__) || defined(linux) || defined(__linux) || defined(__FreeBSD__)
+      std::error_code ec;
+      if (std::filesystem::exists("/dev/nvidiactl", ec)) {
+        return true;
+      }
+      for (const auto &adapter : platf::enumerate_render_adapters()) {
+        if (adapter.vendor == "NVIDIA") {
+          return true;
+        }
+      }
+      return false;
+#else
+      return true;
+#endif
+    }
+  }  // namespace
+
+  std::vector<std::string> available_encoders() {
+    std::vector<std::string> result;
+    result.reserve(encoders.size());
+    for (const auto *enc : encoders) {
+      if (!enc) {
+        continue;
+      }
+#if defined(__linux__) || defined(linux) || defined(__linux) || defined(__FreeBSD__)
+      if (enc->name == "nvenc" && !linux_has_nvidia_adapter()) {
+        continue;
+      }
+#endif
+      if (enc->name == "software" && !avcodec_find_encoder_by_name(enc->h264.name.c_str())) {
+        continue;
+      }
+      result.emplace_back(enc->name);
+    }
+    return result;
+  }
+
+  uint32_t software_codec_mode_flags() {
+    if (!avcodec_find_encoder_by_name(software.h264.name.c_str())) {
+      return 0;
+    }
+    uint32_t flags = SCM_H264 | SCM_H264_HIGH8_444;
+    if (config::video.hevc_mode != 1 && avcodec_find_encoder_by_name(software.hevc.name.c_str())) {
+      flags |= SCM_HEVC | SCM_HEVC_REXT8_444;
+      if (config::video.hevc_mode == 3 || config::video.hevc_mode == 5) {
+        flags |= SCM_HEVC_MAIN10;
+      }
+      if (config::video.hevc_mode == 4 || config::video.hevc_mode == 5) {
+        flags |= SCM_HEVC_REXT10_444;
+      }
+    }
+    return flags;
+  }
+
+  void set_session_encoder_override(std::optional<std::string> encoder, bool hevc_requested, bool adapter_overridden) {
+    std::lock_guard lock(session_override_mutex);
+    if (encoder && (encoder->empty() || *encoder == "auto")) {
+      encoder.reset();
+    }
+    session_encoder_override = std::move(encoder);
+    session_hevc_requested = hevc_requested;
+    session_adapter_overridden = adapter_overridden;
+  }
+
+  void clear_session_encoder_override() {
+    platf::set_session_render_device_override(std::nullopt);
+    {
+      std::lock_guard lock(session_override_mutex);
+      session_encoder_override.reset();
+      session_hevc_requested = false;
+      session_adapter_overridden = false;
+      const auto current_dev = platf::resolve_render_device();
+      if (last_probe_used_override &&
+          default_probe_snapshot.valid &&
+          default_probe_snapshot.render_device == current_dev &&
+          default_probe_snapshot.config_encoder == config::video.encoder &&
+          default_probe_snapshot.config_hevc_mode == config::video.hevc_mode &&
+          default_probe_snapshot.config_av1_mode == config::video.av1_mode) {
+        restore_default_snapshot_unlocked();
+      } else if (last_probe_used_override) {
+        chosen_encoder = nullptr;
+        last_probed_encoder_override = "__unprobed__";
+      }
+    }
+    (void) platf::needs_encoder_reenumeration();
+  }
+
+  std::optional<std::string> current_session_encoder_override() {
+    std::lock_guard lock(session_override_mutex);
+    return session_encoder_override;
+  }
 
   /**
    * @brief Recreate a display capture object after a capture failure.
@@ -2058,6 +2233,36 @@ namespace video {
    * @param encode_device AVCodec encode device.
    * @return AVCodec encode session, or nullptr on failure.
    */
+  namespace {
+    int resolve_packed_ycocgr_mode(const config_t &config) {
+      if (config.packed_ycocgr_mode != 0) {
+        return config.packed_ycocgr_mode == 1 ? 1 : -1;
+      }
+      return get_session_packed_ycocgr_mode() == 1 ? 1 : 0;
+    }
+
+    std::optional<packed_ycocgr_layout_t> resolve_packed_ycocgr_layout(
+      const encoder_t &encoder,
+      const config_t &config,
+      int logical_w,
+      int logical_h
+    ) {
+      if (encoder.name != "vaapi"sv ||
+          !encoder.hevc[encoder_t::PASSED] ||
+          !encoder.hevc[encoder_t::DYNAMIC_RANGE] ||
+          config.videoFormat != 1) {
+        BOOST_LOG(error) << "Packed YCoCg-R P010 requires VAAPI HEVC 10-bit support"sv;
+        return std::nullopt;
+      }
+
+      auto layout = compute_ycocgr_a1_layout(logical_w, logical_h);
+      if (!layout) {
+        BOOST_LOG(error) << "Packed YCoCg-R P010 geometry out of bounds: "sv << logical_w << 'x' << logical_h;
+      }
+      return layout;
+    }
+  }  // namespace
+
   std::unique_ptr<avcodec_encode_session_t> make_avcodec_encode_session(
     platf::display_t *disp,
     const encoder_t &encoder,
@@ -2073,13 +2278,38 @@ namespace video {
 
     bool hardware = platform_formats->avcodec_base_dev_type != AV_HWDEVICE_TYPE_NONE;
 
+    const int packed_mode = encode_device->packed_ycocgr_mode != 0 ?
+                              encode_device->packed_ycocgr_mode :
+                              resolve_packed_ycocgr_mode(config);
+    if (packed_mode < 0) {
+      BOOST_LOG(error) << "Invalid packed YCoCg-R mode requested"sv;
+      return nullptr;
+    }
+
     auto &video_format = encoder.codec_from_config(config);
     if (!video_format[encoder_t::PASSED] || !disp->is_codec_supported(video_format.name, config)) {
       BOOST_LOG(error) << encoder.name << ": "sv << video_format.name << " mode not supported"sv;
       return nullptr;
     }
 
-    if (config.chromaSamplingType == 1) {
+    std::optional<packed_ycocgr_layout_t> packed_layout;
+    if (packed_mode == 1) {
+      if (!hardware) {
+        BOOST_LOG(error) << "Packed YCoCg-R P010 requires a hardware encode device"sv;
+        return nullptr;
+      }
+
+      const int logical_w = encode_device->packed_logical_width > 0 ? encode_device->packed_logical_width : config.width;
+      const int logical_h = encode_device->packed_logical_height > 0 ? encode_device->packed_logical_height : config.height;
+      packed_layout = resolve_packed_ycocgr_layout(encoder, config, logical_w, logical_h);
+      if (!packed_layout) {
+        return nullptr;
+      }
+
+      encode_device->packed_ycocgr_mode = 1;
+      encode_device->packed_logical_width = packed_layout->logical_w;
+      encode_device->packed_logical_height = packed_layout->logical_h;
+    } else if (config.chromaSamplingType == 1) {
       if (!video_format[encoder_t::YUV444]) {
         BOOST_LOG(error) << video_format.name << ": YUV 4:4:4 not supported"sv;
         return nullptr;
@@ -2104,8 +2334,16 @@ namespace video {
       return nullptr;
     }
 
-    auto colorspace = encode_device->colorspace;
-    auto sw_fmt = (colorspace.bit_depth == 8 && config.chromaSamplingType == 0)  ? platform_formats->avcodec_pix_fmt_8bit :
+    auto colorspace = packed_mode == 1 ?
+                        sunshine_colorspace_t {colorspace_e::rec709, true, 10} :
+                        encode_device->colorspace;
+    if (packed_mode == 1) {
+      encode_device->colorspace = colorspace;
+    }
+
+    auto sw_fmt = packed_mode == 1 ?
+                    AV_PIX_FMT_P010 :
+                  (colorspace.bit_depth == 8 && config.chromaSamplingType == 0)  ? platform_formats->avcodec_pix_fmt_8bit :
                   (colorspace.bit_depth == 8 && config.chromaSamplingType == 1)  ? platform_formats->avcodec_pix_fmt_yuv444_8bit :
                   (colorspace.bit_depth == 10 && config.chromaSamplingType == 0) ? platform_formats->avcodec_pix_fmt_10bit :
                   (colorspace.bit_depth == 10 && config.chromaSamplingType == 1) ? platform_formats->avcodec_pix_fmt_yuv444_10bit :
@@ -2119,8 +2357,8 @@ namespace video {
     avcodec_ctx_t ctx;
     for (int retries = 0; retries < 2; retries++) {
       ctx.reset(avcodec_alloc_context3(codec));
-      ctx->width = config.width;
-      ctx->height = config.height;
+      ctx->width = packed_mode == 1 ? packed_layout->enc_w : config.width;
+      ctx->height = packed_mode == 1 ? packed_layout->enc_h : config.height;
       const AVRational fps = video::framerate_to_rational(config);
       ctx->framerate = fps;
       ctx->time_base = AVRational {fps.den, fps.num};
@@ -2133,7 +2371,9 @@ namespace video {
           break;
 
         case 1:
-          if (config.chromaSamplingType == 1) {
+          if (packed_mode == 1) {
+            ctx->profile = AV_PROFILE_HEVC_MAIN_10;
+          } else if (config.chromaSamplingType == 1) {
             // HEVC uses the same RExt profile for both 8 and 10 bit YUV 4:4:4 encoding
             ctx->profile = AV_PROFILE_HEVC_REXT;
           } else {
@@ -2181,10 +2421,17 @@ namespace video {
 
       auto avcodec_colorspace = avcodec_colorspace_from_sunshine_colorspace(colorspace);
 
-      ctx->color_range = avcodec_colorspace.range;
-      ctx->color_primaries = avcodec_colorspace.primaries;
-      ctx->color_trc = avcodec_colorspace.transfer_function;
-      ctx->colorspace = avcodec_colorspace.matrix;
+      if (packed_mode == 1) {
+        ctx->color_range = AVCOL_RANGE_JPEG;
+        ctx->color_primaries = AVCOL_PRI_BT709;
+        ctx->color_trc = AVCOL_TRC_BT709;
+        ctx->colorspace = AVCOL_SPC_BT709;
+      } else {
+        ctx->color_range = avcodec_colorspace.range;
+        ctx->color_primaries = avcodec_colorspace.primaries;
+        ctx->color_trc = avcodec_colorspace.transfer_function;
+        ctx->colorspace = avcodec_colorspace.matrix;
+      }
 
       // Used by cbs::make_sps_hevc
       ctx->sw_pix_fmt = sw_fmt;
@@ -2297,12 +2544,18 @@ namespace video {
       for (auto &option : video_format.common_options) {
         handle_option(option);
       }
-      for (auto &option : (config.dynamicRange ? video_format.hdr_options : video_format.sdr_options)) {
-        handle_option(option);
-      }
-      if (config.chromaSamplingType == 1) {
-        for (auto &option : (config.dynamicRange ? video_format.hdr444_options : video_format.sdr444_options)) {
+      if (packed_mode == 1) {
+        for (auto &option : video_format.sdr_options) {
           handle_option(option);
+        }
+      } else {
+        for (auto &option : (config.dynamicRange ? video_format.hdr_options : video_format.sdr_options)) {
+          handle_option(option);
+        }
+        if (config.chromaSamplingType == 1) {
+          for (auto &option : (config.dynamicRange ? video_format.hdr444_options : video_format.sdr444_options)) {
+            handle_option(option);
+          }
         }
       }
       if (retries > 0) {
@@ -2526,6 +2779,9 @@ namespace video {
     const encoder_t &encoder,
     stream::session_t *channel_data
   ) {
+    if (config.packed_ycocgr_mode == 0) {
+      config.packed_ycocgr_mode = get_session_packed_ycocgr_mode();
+    }
     auto session = make_encode_session(disp.get(), encoder, config, disp->width, disp->height, std::move(encode_device));
     if (!session) {
       return;
@@ -2689,10 +2945,28 @@ namespace video {
   std::unique_ptr<platf::encode_device_t> make_encode_device(platf::display_t &disp, const encoder_t &encoder, const config_t &config) {
     std::unique_ptr<platf::encode_device_t> result;
 
-    auto colorspace = colorspace_from_client_config(config, disp.is_hdr());
+    const int packed_mode = resolve_packed_ycocgr_mode(config);
+    if (packed_mode < 0) {
+      BOOST_LOG(error) << "Invalid packed_ycocgr_mode: "sv << config.packed_ycocgr_mode;
+      return {};
+    }
+
+    std::optional<packed_ycocgr_layout_t> packed_layout;
+    if (packed_mode == 1) {
+      packed_layout = resolve_packed_ycocgr_layout(encoder, config, config.width, config.height);
+      if (!packed_layout) {
+        return {};
+      }
+    }
+
+    auto colorspace = packed_mode == 1 ?
+                        sunshine_colorspace_t {colorspace_e::rec709, true, 10} :
+                        colorspace_from_client_config(config, disp.is_hdr());
 
     platf::pix_fmt_e pix_fmt;
-    if (config.chromaSamplingType == 1) {
+    if (packed_mode == 1) {
+      pix_fmt = encoder.platform_formats->pix_fmt_10bit;
+    } else if (config.chromaSamplingType == 1) {
       // YUV 4:4:4
       if (!(encoder.flags & YUV444_SUPPORT)) {
         // Encoder can't support YUV 4:4:4 regardless of hardware capabilities
@@ -2716,6 +2990,10 @@ namespace video {
       BOOST_LOG(info) << "Color coding: " << colorspace_to_string(colorspace.colorspace);
       BOOST_LOG(info) << "Color depth: " << colorspace.bit_depth << "-bit";
       BOOST_LOG(info) << "Color range: " << (colorspace.full_range ? "JPEG" : "MPEG");
+      if (packed_mode == 1) {
+        BOOST_LOG(info) << "Packed YCoCg-R 4:4:4 Layout A1: logical=" << packed_layout->logical_w << 'x' << packed_layout->logical_h
+                        << ", coded=" << packed_layout->enc_w << 'x' << packed_layout->enc_h;
+      }
     }
 
     if (dynamic_cast<const encoder_platform_formats_avcodec *>(encoder.platform_formats.get())) {
@@ -2728,6 +3006,11 @@ namespace video {
 
     if (result) {
       result->colorspace = colorspace;
+      if (packed_mode == 1) {
+        result->packed_ycocgr_mode = 1;
+        result->packed_logical_width = packed_layout->logical_w;
+        result->packed_logical_height = packed_layout->logical_h;
+      }
     }
 
     return result;
@@ -3077,7 +3360,14 @@ namespace video {
     config_t config,
     stream::session_t *channel_data
   ) {
-    config = resolve_dynamic_range(*chosen_encoder, config);
+    if (config.packed_ycocgr_mode == 0) {
+      config.packed_ycocgr_mode = get_session_packed_ycocgr_mode();
+    }
+    if (config.packed_ycocgr_mode == 1) {
+      config.dynamicRange = 0;
+    } else {
+      config = resolve_dynamic_range(*chosen_encoder, config);
+    }
 
     auto idr_events = mail->event<bool>(mail::idr);
 
@@ -3183,7 +3473,12 @@ namespace video {
       BOOST_LOG(info) << "Encoder ["sv << encoder.name << "] failed"sv;
     });
 
-    auto test_hevc = active_hevc_mode >= 2 || (active_hevc_mode == 0 && !(encoder.flags & H264_ONLY));
+    bool sw_hevc_override = false;
+    {
+      std::lock_guard lock(session_override_mutex);
+      sw_hevc_override = (encoder.name == "software" && session_encoder_override == "software" && session_hevc_requested);
+    }
+    auto test_hevc = active_hevc_mode >= 2 || (active_hevc_mode == 0 && (!(encoder.flags & H264_ONLY) || sw_hevc_override));
     auto test_av1 = active_av1_mode >= 2 || (active_av1_mode == 0 && !(encoder.flags & H264_ONLY));
 
     encoder.h264.capabilities.set();
@@ -3373,6 +3668,7 @@ namespace video {
   }
 
   void reset_encoder_probe_results() {
+    last_encoder_probe_is_vaapi = false;
     last_encoder_probe_supported_ref_frames_invalidation = false;
     last_encoder_probe_supported_yuv444_for_codec = {};
     last_encoder_probe_supported_dynamic_range_for_codec = {};
@@ -3380,6 +3676,7 @@ namespace video {
   }
 
   void record_encoder_probe_results(const encoder_t &encoder) {
+    last_encoder_probe_is_vaapi = (encoder.name == "vaapi"sv);
     last_encoder_probe_supported_ref_frames_invalidation = (encoder.flags & REF_FRAMES_INVALIDATION);
     last_encoder_probe_supported_yuv444_for_codec[0] = encoder.h264[encoder_t::PASSED] &&
                                                        encoder.h264[encoder_t::YUV444];
@@ -3409,8 +3706,29 @@ namespace video {
 
     auto encoder_list = encoders;
 
+    std::string override_encoder;
+    bool hevc_requested = false;
+    bool adapter_overridden = false;
+    {
+      std::lock_guard lock(session_override_mutex);
+      override_encoder = session_encoder_override.value_or("");
+      hevc_requested = session_hevc_requested;
+      adapter_overridden = session_adapter_overridden;
+    }
+
+    const auto current_render_device = platf::resolve_render_device();
+    const bool device_changed = platf::needs_encoder_reenumeration();
+    const bool override_changed =
+      (last_probed_encoder_override == "__unprobed__") ||
+      (override_encoder != last_probed_encoder_override) ||
+      (override_encoder == "software" && hevc_requested != last_probed_hevc_requested) ||
+      (current_render_device != last_probed_render_device) ||
+      (config::video.encoder != last_probed_config_encoder) ||
+      (config::video.hevc_mode != last_probed_config_hevc_mode) ||
+      (config::video.av1_mode != last_probed_config_av1_mode);
+
     // If we already have a good encoder, check to see if another probe is required
-    if (chosen_encoder && !(chosen_encoder->flags & ALWAYS_REPROBE) && !platf::needs_encoder_reenumeration()) {
+    if (chosen_encoder && !override_changed && !(chosen_encoder->flags & ALWAYS_REPROBE) && !device_changed) {
       return 0;
     }
 
@@ -3455,14 +3773,16 @@ namespace video {
       }
     };
 
-    if (!config::video.encoder.empty()) {
+    const auto &requested_encoder = !override_encoder.empty() ? override_encoder : config::video.encoder;
+    if (!requested_encoder.empty()) {
       // If there is a specific encoder specified, use it if it passes validation
       KITTY_WHILE_LOOP(auto pos = std::begin(encoder_list), pos != std::end(encoder_list), {
         auto encoder = *pos;
 
-        if (encoder->name == config::video.encoder) {
+        if (encoder->name == requested_encoder) {
           // Remove the encoder from the list entirely if it fails validation
-          if (!validate_encoder(*encoder, previous_encoder && previous_encoder != encoder)) {
+          const bool expect_failure = override_encoder.empty() && previous_encoder && previous_encoder != encoder;
+          if (!validate_encoder(*encoder, expect_failure)) {
             pos = encoder_list.erase(pos);
             break;
           }
@@ -3479,7 +3799,11 @@ namespace video {
       });
 
       if (chosen_encoder == nullptr) {
-        BOOST_LOG(error) << "Couldn't find any working encoder matching ["sv << config::video.encoder << ']';
+        BOOST_LOG(error) << "Couldn't find any working encoder matching ["sv << requested_encoder << ']';
+        if (!override_encoder.empty()) {
+          // Do not silently fall back when the client explicitly pinned an encoder.
+          return -1;
+        }
       }
     }
 
@@ -3634,7 +3958,31 @@ namespace video {
       BOOST_LOG(debug) << "ENCODER STATUS ACTIVE_AV1_MODE: "sv << active_av1_mode;
     }
 
+    {
+      std::lock_guard lock(session_override_mutex);
+      last_probed_encoder_override = override_encoder;
+      last_probed_hevc_requested = hevc_requested;
+      last_probed_render_device = current_render_device;
+      last_probed_config_encoder = config::video.encoder;
+      last_probed_config_hevc_mode = config::video.hevc_mode;
+      last_probed_config_av1_mode = config::video.av1_mode;
+      last_probe_used_override = !override_encoder.empty() || adapter_overridden;
+      if (!last_probe_used_override) {
+        capture_default_snapshot_unlocked(current_render_device);
+      }
+    }
+
     return 0;
+  }
+
+  bool is_vaapi_encoder_active() {
+    return last_encoder_probe_is_vaapi;
+  }
+
+  bool is_vaapi_hevc_10bit_supported() {
+    return last_encoder_probe_is_vaapi &&
+           (active_hevc_mode == 3 || active_hevc_mode == 5) &&
+           last_encoder_probe_supported_dynamic_range_for_codec[1];
   }
 
   /**

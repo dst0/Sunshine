@@ -1,12 +1,5 @@
 #!/bin/sh
 
-set_sunshine_capabilities() {
-	if command -v setcap >/dev/null 2>&1; then
-		setcap cap_sys_admin,cap_sys_nice+p /usr/bin/sunshine || \
-			echo "Warning: unable to set capabilities on /usr/bin/sunshine" >&2
-	fi
-}
-
 reload_udev_rules() {
 	if command -v udevadm >/dev/null 2>&1; then
 		udevadm control --reload-rules || true
@@ -24,6 +17,5 @@ load_input_modules() {
 	fi
 }
 
-set_sunshine_capabilities
 reload_udev_rules
 load_input_modules

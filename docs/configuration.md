@@ -261,6 +261,7 @@ consent prompt for directory ACLs, so the Web UI shows setup steps for correctin
         <td>Description</td>
         <td colspan="2">
             Whether to be notified of new pre-release versions of Sunshine.
+            @note{This build makes no update checks, so this option has no effect.}
         </td>
     </tr>
     <tr>
@@ -973,6 +974,64 @@ consent prompt for directory ACLs, so the Web UI shows setup steps for correctin
     </tr>
 </table>
 
+### mic_passthrough
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            Accept microphone audio from Moonlight clients that hold the `mic` permission and play it into a
+            virtual microphone on the host while they stream. The audio arrives on UDP port base + 13 (48002
+            by default), encrypted and authenticated with the session key.
+            <br>
+            <br>
+            **Linux:** a PipeWire source named "Moonlight Microphone" (`sunshine-mic`) is created for the
+            duration of the stream; on PulseAudio-only systems a null sink and a remapped source with the same
+            name are loaded instead.
+            <br>
+            **Windows:** audio is played into a virtual audio cable whose capture side applications use as a
+            microphone (see [mic_device](#mic_device)). Sunshine does not install a driver.
+            @note{The feature is only offered to a client when a virtual microphone can be created.}
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}
+            enabled
+            @endcode</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            mic_passthrough = disabled
+            @endcode</td>
+    </tr>
+</table>
+
+### mic_device
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            The playback (render) device that feeds the virtual microphone, as a case-insensitive substring of its
+            name or its endpoint ID. When empty, Sunshine uses "CABLE Input" (VB-CABLE, www.vb-cable.com) or a
+            "Steam Streaming Microphone" playback device if present.
+            @note{This option is only supported on Windows.}
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">n/a</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            mic_device = CABLE Input
+            @endcode</td>
+    </tr>
+</table>
+
 ### adapter_name
 
 <table>
@@ -1598,6 +1657,30 @@ consent prompt for directory ACLs, so the Web UI shows setup steps for correctin
     </tr>
 </table>
 
+### mdns_advertise
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            Advertise this host on the local network with mDNS (Avahi/Bonjour) so that Moonlight clients
+            discover it automatically. When disabled, add the host in Moonlight by its IP address or host name.
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}
+            disabled
+            @endcode</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            mdns_advertise = enabled
+            @endcode</td>
+    </tr>
+</table>
+
 ### address_family
 
 <table>
@@ -1706,18 +1789,20 @@ consent prompt for directory ACLs, so the Web UI shows setup steps for correctin
         <td>Description</td>
         <td colspan="2">
             The origin of the remote endpoint address that is not denied for HTTPS Web UI.
+            With the default, reach the Web UI from another machine through an SSH tunnel
+            (for example `ssh -L 47990:127.0.0.1:47990 user@host`, then open https://localhost:47990).
         </td>
     </tr>
     <tr>
         <td>Default</td>
         <td colspan="2">@code{}
-            lan
+            pc
             @endcode</td>
     </tr>
     <tr>
         <td>Example</td>
         <td colspan="2">@code{}
-            origin_web_ui_allowed = lan
+            origin_web_ui_allowed = pc
             @endcode</td>
     </tr>
     <tr>
@@ -1798,13 +1883,13 @@ consent prompt for directory ACLs, so the Web UI shows setup steps for correctin
     <tr>
         <td>Default</td>
         <td colspan="2">@code{}
-            0
+            2
             @endcode</td>
     </tr>
     <tr>
         <td>Example</td>
         <td colspan="2">@code{}
-            lan_encryption_mode = 0
+            lan_encryption_mode = 2
             @endcode</td>
     </tr>
     <tr>
@@ -1835,13 +1920,13 @@ consent prompt for directory ACLs, so the Web UI shows setup steps for correctin
     <tr>
         <td>Default</td>
         <td colspan="2">@code{}
-            1
+            2
             @endcode</td>
     </tr>
     <tr>
         <td>Example</td>
         <td colspan="2">@code{}
-            wan_encryption_mode = 1
+            wan_encryption_mode = 2
             @endcode</td>
     </tr>
     <tr>
@@ -1965,6 +2050,353 @@ consent prompt for directory ACLs, so the Web UI shows setup steps for correctin
         <td>Example</td>
         <td colspan="2">@code{}
             dscp_tagging = disabled
+            @endcode</td>
+    </tr>
+</table>
+
+## Clipboard & Files
+
+### clipboard
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            Allow paired clients with an active stream to share the clipboard (UTF-8 text and PNG images) with this host over the paired HTTPS connection. Each client additionally needs the <code>clipboard_read</code> and/or <code>clipboard_write</code> permission. The feature is only offered when a clipboard backend is available on this host.
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}
+            enabled
+            @endcode</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            clipboard = disabled
+            @endcode</td>
+    </tr>
+</table>
+
+### file_transfer
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            Allow paired clients with an active stream to send files to the inbox and download files from the outbox. Each client additionally needs the <code>file_upload</code> and/or <code>file_download</code> permission.
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}
+            enabled
+            @endcode</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            file_transfer = disabled
+            @endcode</td>
+    </tr>
+</table>
+
+### file_clipboard
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            Allow paired clients with an active stream and matching permissions to exchange copied files natively with lazy on-demand streaming.
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}
+            disabled
+            @endcode</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            file_clipboard = enabled
+            @endcode</td>
+    </tr>
+</table>
+
+### mic_passthrough
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            Allow paired clients holding the <code>mic</code> permission to send microphone audio during a stream.
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}
+            enabled
+            @endcode</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            mic_passthrough = disabled
+            @endcode</td>
+    </tr>
+</table>
+
+### clipboard_text_max
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            Largest clipboard text accepted from or offered to a client, in UTF-8 bytes. Accepts a byte count or a binary suffix (K, M, G). Range: 1 byte to 16M.
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}
+            1M
+            @endcode</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            clipboard_text_max = 256K
+            @endcode</td>
+    </tr>
+</table>
+
+### clipboard_image_max
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            Largest clipboard PNG image accepted from or offered to a client. Accepts a byte count or a binary suffix. Range: 1 byte to 64M.
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}
+            16M
+            @endcode</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            clipboard_image_max = 8M
+            @endcode</td>
+    </tr>
+</table>
+
+### clipboard_rate
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            Clipboard requests (reads and writes) allowed per client and second. Further requests are answered with 429 and a <code>Retry-After</code> header. Range: 1 to 1000.
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}
+            10
+            @endcode</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            clipboard_rate = 5
+            @endcode</td>
+    </tr>
+</table>
+
+### file_max
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            Largest single file a client may upload. Accepts a byte count or a binary suffix.
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}
+            4G
+            @endcode</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            file_max = 1G
+            @endcode</td>
+    </tr>
+</table>
+
+### file_chunk_max
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            Largest upload chunk and download range per request. The paired HTTPS server buffers at most max(file_chunk_max, clipboard_image_max, clipboard_text_max) + 64K per request. Range: 64K to 32M.
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}
+            4M
+            @endcode</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            file_chunk_max = 1M
+            @endcode</td>
+    </tr>
+</table>
+
+### file_uploads_max_concurrent
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            Number of unfinished uploads a client may have open at the same time. Range: 1 to 16.
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}
+            2
+            @endcode</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            file_uploads_max_concurrent = 1
+            @endcode</td>
+    </tr>
+</table>
+
+### file_min_free_space
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            Uploads that would leave less free space than this on the inbox drive are refused with 507.
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}
+            1G
+            @endcode</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            file_min_free_space = 10G
+            @endcode</td>
+    </tr>
+</table>
+
+### file_upload_idle_timeout
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            Seconds after which an unfinished upload without progress is discarded together with its partial file. Range: 10 to 86400.
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}
+            120
+            @endcode</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            file_upload_idle_timeout = 300
+            @endcode</td>
+    </tr>
+</table>
+
+### file_inbox_dir
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            Absolute folder where files sent by clients are stored. Empty uses the <code>Moonlight</code> folder inside the logged-in user's download folder (Linux: <code>XDG_DOWNLOAD_DIR</code> or <code>~/Downloads</code>; Windows: the user's Downloads known folder). The folder is created with mode 0700 and must be a real directory (not a symlink or reparse point) owned by that user and not writable by others. Files never overwrite existing ones and are stored without execute permission.
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}
+            
+            @endcode</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            file_inbox_dir = /home/user/Incoming
+            @endcode</td>
+    </tr>
+</table>
+
+### file_outbox_dir
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            Absolute folder whose files are offered to clients for download. Empty uses the <code>Outbox</code> folder inside the inbox. Only regular, non-hidden files directly inside it are listed; symlinks, folders and special files are never served.
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}
+            
+            @endcode</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            file_outbox_dir = /home/user/ToMac
+            @endcode</td>
+    </tr>
+</table>
+
+### sds_default_permissions
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            Comma-separated permissions granted to newly paired clients (and to existing clients that have no stored permissions). Valid names: <code>clipboard_read</code>, <code>clipboard_write</code>, <code>file_upload</code>, <code>file_download</code>, <code>mic</code>. Unknown names are ignored. Permissions are edited per client on the Troubleshooting page.
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}
+            
+            @endcode</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            sds_default_permissions = clipboard_read,clipboard_write
             @endcode</td>
     </tr>
 </table>
@@ -2302,7 +2734,7 @@ consent prompt for directory ACLs, so the Web UI shows setup steps for correctin
             @endcode</td>
     </tr>
     <tr>
-        <td rowspan="8">Choices</td>
+        <td rowspan="9">Choices</td>
         <td>nvfbc</td>
         <td>Use NVIDIA Frame Buffer Capture to capture direct to GPU memory. This is usually the fastest method for
             NVIDIA cards. NvFBC does not have native Wayland support and does not work with XWayland.
@@ -2319,7 +2751,8 @@ consent prompt for directory ACLs, so the Web UI shows setup steps for correctin
     </tr>
     <tr>
         <td>kms</td>
-        <td>DRM/KMS screen capture from the kernel. This requires that Sunshine has `cap_sys_admin` capability.
+        <td>DRM/KMS screen capture from the kernel. This requires that Sunshine has `cap_sys_admin` capability,
+            which the packages do not grant (see [Hardening](hardening.md#no-file-capabilities)).
             @note{Applies to Linux only.}</td>
     </tr>
     <tr>
@@ -2332,6 +2765,13 @@ consent prompt for directory ACLs, so the Web UI shows setup steps for correctin
         <td>portal</td>
         <td>Capture via XDG Desktop Portal.
             @note{Applies to Linux only.}</td>
+    </tr>
+    <tr>
+        <td>portal-virtual</td>
+        <td>Request one new virtual display from the Linux XDG Desktop Portal. The portal must support virtual displays
+            and authorize the session. Sunshine uses a separate restore token for this mode and will fail rather than
+            stream an existing display if the virtual source is unavailable. The portal owns the display for the
+            lifetime of its session.</td>
     </tr>
     <tr>
         <td>x11</td>

@@ -23,6 +23,7 @@
   #include "platform/linux/misc.h"
 
   #include <sys/auxv.h>
+
 #endif
 
 // lib includes
@@ -42,9 +43,14 @@
 #include "nvhttp.h"
 #include "platform/permissions.h"
 #include "process.h"
+#include "sds/sds.h"
 #include "system_tray.h"
 #include "upnp.h"
 #include "video.h"
+
+#ifdef SUNSHINE_BUILD_PRIVATE_X11_INPUT
+  #include <X11/Xlib.h>
+#endif
 
 using namespace std::literals;
 
@@ -179,6 +185,10 @@ void mainThreadLoop(const std::shared_ptr<safe::event_t<bool>> &shutdown_event) 
  * @return Process or platform callback exit code.
  */
 int main(int argc, char *argv[]) {
+#ifdef SUNSHINE_BUILD_PRIVATE_X11_INPUT
+  // Xlib can be used concurrently by capture, clipboard and private input.
+  XInitThreads();
+#endif
 #ifdef __linux__
   const bool privileged_execution = getauxval(AT_SECURE) != 0 || platf::has_elevated_privileges(true);
   if (privileged_execution && !platf::sanitize_process_environment()) {
@@ -282,6 +292,11 @@ int main(int argc, char *argv[]) {
     }
 
     return fn->second(argv[0], config::sunshine.cmd.argc, config::sunshine.cmd.argv);
+  }
+
+  // There is no unauthenticated first-run setup: refuse to start until Web UI credentials exist.
+  if (http::require_user_creds(config::sunshine.credentials_file)) {
+    return 1;
   }
 
 #ifdef _WIN32
@@ -438,6 +453,9 @@ int main(int argc, char *argv[]) {
   // If any of the following fail, we log an error and continue event though sunshine will not function correctly.
   // This allows access to the UI to fix configuration problems or view the logs.
 
+  // The clipboard backend must exist before platf::init() so portal capture sessions request clipboard access.
+  sds::prepare_clipboard_backend();
+
   auto platf_deinit_guard = platf::init();
   if (!platf_deinit_guard) {
     BOOST_LOG(error) << "Platform failed to initialize"sv;
@@ -479,7 +497,7 @@ int main(int argc, char *argv[]) {
 
   std::unique_ptr<platf::deinit_t> mDNS;
   auto sync_mDNS = std::async(std::launch::async, [&mDNS]() {
-    mDNS = platf::publish::start();
+    mDNS = start_mdns_publisher(config::sunshine.mdns_advertise);
   });
 
   std::unique_ptr<platf::deinit_t> upnp_unmap;

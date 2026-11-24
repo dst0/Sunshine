@@ -4,6 +4,7 @@
  */
 // standard includes
 #include <array>
+#include <cmath>
 #include <fcntl.h>
 #include <future>
 #include <stdexcept>
@@ -15,6 +16,7 @@
 #include "src/file_handler.h"
 #include "src/logging.h"
 #include "src/video.h"
+#include "src/video_packed444.h"
 
 // platform includes
 #if !defined(__FreeBSD__)
@@ -1097,6 +1099,10 @@ namespace egl {
   }
 
   void sws_t::apply_colorspace(const video::sunshine_colorspace_t &colorspace, bool is_yuv444) {
+    if (packed_ycocgr) {
+      return;
+    }
+
     auto color_p = video::color_vectors_from_colorspace(colorspace, true);
 
     std::array<std::string_view, 5> members {
@@ -1370,6 +1376,10 @@ namespace egl {
   }
 
   int sws_t::blank(gl::frame_buf_t &fb, int offsetX_, int offsetY_, int width, int height, bool is_yuv444) {
+    if (packed_ycocgr) {
+      return convert_ycocgr_p010(fb);
+    }
+
     auto f = [this, &offsetX_, &offsetY_, &width, &height]() {
       std::swap(offsetX_, this->offsetX);
       std::swap(offsetY_, this->offsetY);
@@ -1383,6 +1393,136 @@ namespace egl {
       return convert_yuv444(fb);
     }
     return convert_nv12(fb);
+  }
+
+  std::optional<sws_t> sws_t::make_ycocgr_p010(
+    int in_width,
+    int in_height,
+    int logical_width,
+    int logical_height,
+    int enc_width,
+    int enc_height
+  ) {
+    if (in_width <= 0 || in_height <= 0) {
+      BOOST_LOG(error) << "Invalid input dimensions for packed YCoCg-R: "sv << in_width << 'x' << in_height;
+      return std::nullopt;
+    }
+
+    const auto layout = video::compute_ycocgr_a1_layout(logical_width, logical_height);
+    if (!layout || layout->enc_w != enc_width || layout->enc_h != enc_height) {
+      BOOST_LOG(error)
+        << "Invalid Layout A1 dimensions for packed YCoCg-R: logical="sv << logical_width << 'x' << logical_height
+        << ", coded="sv << enc_width << 'x' << enc_height;
+      return std::nullopt;
+    }
+
+    sws_t sws;
+    sws.serial = std::numeric_limits<std::uint64_t>::max();
+    sws.in_width = in_width;
+    sws.in_height = in_height;
+    sws.logical_width = logical_width;
+    sws.logical_height = logical_height;
+    sws.out_width = enc_width;
+    sws.out_height = enc_height;
+    sws.offsetX = 0;
+    sws.offsetY = 0;
+    sws.packed_ycocgr = true;
+
+    const auto scalar = std::fminf(logical_width / static_cast<float>(in_width), logical_height / static_cast<float>(in_height));
+    const int content_w = std::max(1, static_cast<int>(std::lround(in_width * scalar)));
+    const int content_h = std::max(1, static_cast<int>(std::lround(in_height * scalar)));
+    const int content_x = (logical_width - content_w) / 2;
+    const int content_y = (logical_height - content_h) / 2;
+
+    {
+      constexpr std::array<const char *, 4> sources {{
+        SUNSHINE_SHADERS_DIR "/Scene.vert",
+        SUNSHINE_SHADERS_DIR "/ConvertYCoCgRPackY.frag",
+        SUNSHINE_SHADERS_DIR "/ConvertYCoCgRPackUV.frag",
+        SUNSHINE_SHADERS_DIR "/Scene.frag",
+      }};
+
+      constexpr std::array<GLenum, 4> shader_type {{
+        GL_VERTEX_SHADER,
+        GL_FRAGMENT_SHADER,
+        GL_FRAGMENT_SHADER,
+        GL_FRAGMENT_SHADER,
+      }};
+
+      constexpr auto count = sources.size();
+      std::array<util::Either<gl::shader_t, std::string>, count> compiled_sources;
+
+      bool error_flag = false;
+      for (std::size_t x = 0; x < count; ++x) {
+        auto &compiled_source = compiled_sources[x];
+        compiled_source = gl::shader_t::compile(file_handler::read_file(sources[x]), shader_type[x]);
+        gl_drain_errors;
+
+        if (compiled_source.has_right()) {
+          BOOST_LOG(error) << sources[x] << ": "sv << compiled_source.right();
+          error_flag = true;
+        }
+      }
+
+      if (error_flag) {
+        return std::nullopt;
+      }
+
+      auto link_program = [&](std::size_t frag_idx, std::size_t dst_idx, std::string_view label) -> bool {
+        auto program = gl::program_t::link(compiled_sources[0].left(), compiled_sources[frag_idx].left());
+        if (program.has_right()) {
+          BOOST_LOG(error) << "GL linker ("sv << label << "): "sv << program.right();
+          return false;
+        }
+        sws.program[dst_idx] = std::move(program.left());
+        return true;
+      };
+
+      if (!link_program(3, 2, "cursor") ||
+          !link_program(2, 1, "ycocgr UV") ||
+          !link_program(1, 0, "ycocgr Y")) {
+        return std::nullopt;
+      }
+    }
+
+    const GLuint y_prog = sws.program[0].handle();
+    gl::ctx.UseProgram(y_prog);
+
+    const GLint loc_image = gl::ctx.GetUniformLocation(y_prog, "image");
+    const GLint loc_in_size = gl::ctx.GetUniformLocation(y_prog, "u_in_size");
+    const GLint loc_logical_size = gl::ctx.GetUniformLocation(y_prog, "u_logical_size");
+    const GLint loc_layout = gl::ctx.GetUniformLocation(y_prog, "u_layout");
+    const GLint loc_content = gl::ctx.GetUniformLocation(y_prog, "u_content");
+
+    if (loc_in_size < 0 || loc_logical_size < 0 || loc_layout < 0 || loc_content < 0) {
+      BOOST_LOG(error) << "Couldn't find required uniforms in ConvertYCoCgRPackY.frag"sv;
+      gl::ctx.UseProgram(0);
+      return std::nullopt;
+    }
+
+    if (loc_image >= 0) {
+      gl::ctx.Uniform1i(loc_image, 0);
+    }
+    gl::ctx.Uniform2i(loc_in_size, in_width, in_height);
+    gl::ctx.Uniform2i(loc_logical_size, logical_width, logical_height);
+    gl::ctx.Uniform4i(loc_layout, layout->tile_w, layout->split_x, layout->tile_h, 0);
+    gl::ctx.Uniform4i(loc_content, content_x, content_y, content_w, content_h);
+    gl::ctx.UseProgram(0);
+
+    auto tex = gl::tex_t::make(2);
+    gl::ctx.BindTexture(GL_TEXTURE_2D, tex[0]);
+    gl::ctx.TexStorage2D(GL_TEXTURE_2D, 1, GL_RGBA8, in_width, in_height);
+    gl::ctx.BindTexture(GL_TEXTURE_2D, 0);
+
+    sws.tex = std::move(tex);
+    sws.cursor_framebuffer = gl::frame_buf_t::make(1);
+    sws.cursor_framebuffer.bind(&sws.tex[0], &sws.tex[1]);
+    gl::ctx.BindTexture(GL_TEXTURE_2D, 0);
+    gl::ctx.BindFramebuffer(GL_FRAMEBUFFER, 0);
+    gl::ctx.BlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+
+    gl_drain_errors;
+    return sws;
   }
 
   std::optional<sws_t> sws_t::make(int in_width, int in_height, int out_width, int out_height, AVPixelFormat format, bool is_yuv444) {
@@ -1530,6 +1670,32 @@ namespace egl {
 
     gl::ctx.BindTexture(GL_TEXTURE_2D, 0);
 
+    gl::ctx.Flush();
+
+    return 0;
+  }
+
+  int sws_t::convert_ycocgr_p010(gl::frame_buf_t &fb) {
+    if (!packed_ycocgr) {
+      return -1;
+    }
+
+    gl::ctx.ActiveTexture(GL_TEXTURE0);
+    gl::ctx.BindTexture(GL_TEXTURE_2D, loaded_texture);
+
+    std::array<GLenum, 2> attachments {
+      GL_COLOR_ATTACHMENT0,
+      GL_COLOR_ATTACHMENT1
+    };
+
+    if (draw_programs_to_buffers(attachments.data(), fb, static_cast<int>(attachments.size()), false) < 0) {
+      gl::ctx.BindTexture(GL_TEXTURE_2D, 0);
+      gl::ctx.BindFramebuffer(GL_FRAMEBUFFER, 0);
+      return -1;
+    }
+
+    gl::ctx.BindTexture(GL_TEXTURE_2D, 0);
+    gl::ctx.BindFramebuffer(GL_FRAMEBUFFER, 0);
     gl::ctx.Flush();
 
     return 0;

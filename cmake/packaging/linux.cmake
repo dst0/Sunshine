@@ -81,9 +81,7 @@ if(FREEBSD)
     list(APPEND CPACK_POST_BUILD_SCRIPTS "${CMAKE_MODULE_PATH}/packaging/freebsd_custom_cpack.cmake")
 endif()
 
-# Apply setcap for RPM
-# https://github.com/coreos/rpm-ostree/discussions/5036#discussioncomment-10291071
-set(CPACK_RPM_USER_FILELIST "%caps(cap_sys_admin,cap_sys_nice+p) ${SUNSHINE_EXECUTABLE_PATH}")
+# No file capabilities are granted to the binary (see docs/hardening.md).
 
 # Dependencies
 set(CPACK_DEB_COMPONENT_INSTALL ON)
@@ -91,7 +89,6 @@ set(CPACK_DEBIAN_PACKAGE_DEPENDS "\
             ${CPACK_DEB_PLATFORM_PACKAGE_DEPENDS} \
             debianutils, \
             libcap2, \
-            libcurl4, \
             libdrm2, \
             libgbm1, \
             libevdev2, \
@@ -102,18 +99,19 @@ set(CPACK_DEBIAN_PACKAGE_DEPENDS "\
             libva-drm2, \
             libwayland-client0, \
             libx11-6, \
+            libxfixes3, \
             miniupnpc, \
             openssl | libssl3")
 set(CPACK_RPM_PACKAGE_REQUIRES "\
             ${CPACK_RPM_PLATFORM_PACKAGE_REQUIRES} \
             libcap >= 2.22, \
-            libcurl >= 7.0, \
             libdrm >= 2.4.97, \
             libevdev >= 1.5.6, \
             libopusenc >= 0.2.1, \
             libva >= 2.14.0, \
             libwayland-client >= 1.20.0, \
             libX11 >= 1.7.3.1, \
+            libXfixes >= 5.0, \
             mesa-libgbm >= 25.0.7, \
             miniupnpc >= 2.2.4, \
             numactl-libs >= 2.0.14, \
@@ -122,13 +120,13 @@ set(CPACK_RPM_PACKAGE_REQUIRES "\
             which >= 2.21")
 list(APPEND CPACK_FREEBSD_PACKAGE_DEPS
         audio/opus
-        ftp/curl
         devel/libevdev
         multimedia/pipewire
         net/avahi
         net/miniupnpc
         security/openssl
         x11/libX11
+        x11/libXfixes
 )
 
 if(NOT BOOST_USE_STATIC)

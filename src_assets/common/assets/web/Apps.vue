@@ -311,10 +311,6 @@
                   @click="browseFor('file', 'file_browser.select_file', editForm['image-path'], v => editForm['image-path'] = v, ['.png'])">
                   <folder-open :size="18" class="icon"></folder-open>
                 </button>
-                <button class="btn btn-secondary" type="button" @click="showCoverFinder">
-                  <search :size="18" class="icon"></search>
-                  {{ $t('apps.find_cover') }}
-                </button>
               </div>
               <div id="appImagePathHelp" class="form-text">{{ $t('apps.image_desc') }}</div>
             </div>
@@ -396,71 +392,6 @@
             <button class="btn btn-primary" @click="save">
               <save :size="18" class="icon"></save>
               {{ $t('_common.save') }}
-            </button>
-          </div>
-        </div>
-      </div>
-    </div>
-
-    <!-- Cover Finder modal -->
-    <div class="modal fade" id="coverFinderModal" tabindex="-1" aria-labelledby="coverFinderModalLabel" aria-hidden="true" ref="coverFinderModal">
-      <div class="modal-dialog modal-xl modal-dialog-scrollable modal-fullscreen-md-down">
-        <div class="modal-content">
-          <div class="modal-header">
-            <h5 class="modal-title" id="coverFinderModalLabel">
-              <span v-if="coverSearching">{{ $t('apps.searching_covers') }}</span>
-              <span v-else-if="coverCandidates.length > 0">{{ $t('apps.covers_found') }} ({{ coverCandidates.length }})</span>
-              <span v-else>{{ $t('apps.no_covers_found') }}</span>
-            </h5>
-            <button type="button" class="btn-close" data-bs-dismiss="modal" :aria-label="$t('_common.close')"></button>
-          </div>
-          <div class="modal-body">
-            <div class="mb-3">
-              <div class="input-group">
-                <label for="cover-search-query" class="visually-hidden">{{ $t('_common.search') }}</label>
-                <input
-                  id="cover-search-query"
-                  type="text"
-                  class="form-control"
-                  v-model="coverSearchQuery"
-                  :placeholder="editForm?.name"
-                  @keyup.enter="performCoverSearch"
-                />
-                <button class="btn btn-primary" type="button" @click="performCoverSearch">
-                  <search :size="18" class="icon"></search>
-                  {{ $t('_common.search') }}
-                </button>
-              </div>
-              <div class="form-text mt-2">
-                <b>{{ $t('_common.note') }}</b> {{ $t('apps.cover_search_hint') }}
-                <a href="https://www.igdb.com/" target="_blank" rel="noopener noreferrer">IGDB</a>
-              </div>
-            </div>
-            <div class="cover-results" :class="{ busy: coverFinderBusy }">
-              <div class="row">
-                <div v-if="coverSearching" class="col-12 col-sm-6 col-lg-4 mb-3">
-                  <div class="cover-container">
-                    <output class="spinner-border">
-                      <span class="visually-hidden">{{ $t('apps.loading') }}</span>
-                    </output>
-                  </div>
-                </div>
-                <button type="button" v-for="cover in coverCandidates" :key="cover.url" class="cover-choice col-12 col-sm-6 col-lg-3 mb-3"
-                  @click="useCover(cover)">
-                  <div class="cover-container result">
-                    <img class="rounded" :src="cover.url" :alt="cover.name" />
-                  </div>
-                  <span class="d-block text-nowrap text-center text-truncate">
-                    {{cover.name}}
-                  </span>
-                </button>
-              </div>
-            </div>
-          </div>
-          <div class="modal-footer">
-            <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">
-              <x :size="18" class="icon"></x>
-              {{ $t('_common.cancel') }}
             </button>
           </div>
         </div>
@@ -571,7 +502,6 @@
   import Navbar from './Navbar.vue'
   import Checkbox from './Checkbox.vue'
   import { apiFetch } from './fetch_utils'
-  import SunshineVersion from './sunshine_version'
   import { Modal } from 'bootstrap/dist/js/bootstrap'
   import {
     ArrowDown,
@@ -596,63 +526,6 @@
     Trash2,
     X,
   } from '@lucide/vue'
-
-  /**
-   * Return the GameDB bucket for an application name.
-   *
-   * @param {string} name Application name to categorize.
-   * @returns {string} The normalized GameDB bucket name.
-   */
-  function getSearchBucket(name) {
-    const bucket = name.substring(0, Math.min(name.length, 2)).toLowerCase().replaceAll(/[^a-z\d]/g, '');
-    return bucket || '@';
-  }
-
-  /**
-   * Search GameDB for cover candidates matching an application name.
-   *
-   * @param {string} name Application name to search for.
-   * @returns {Promise<object[]>} Matching cover candidates.
-   */
-  function searchCovers(name) {
-    if (!name) {
-      return Promise.resolve([]);
-    }
-    let searchName = name.replaceAll(/\s+/g, '.').toLowerCase();
-
-    // Use raw.githubusercontent.com to avoid CORS issues as we migrate the CNAME
-    let dbUrl = "https://raw.githubusercontent.com/LizardByte/GameDB/gh-pages";
-    let bucket = getSearchBucket(name);
-    return fetch(`${dbUrl}/buckets/${bucket}.json`).then(function (r) {
-      if (!r.ok) throw new Error("Failed to search covers");
-      return r.json();
-    }).then(maps => Promise.all(Object.keys(maps).map(id => {
-      let item = maps[id];
-      if (item.name.replaceAll(/\s+/g, '.').toLowerCase().startsWith(searchName)) {
-        return fetch(`${dbUrl}/games/${id}.json`).then(function (r) {
-          return r.json();
-        }).catch(() => null);
-      }
-      return null;
-    }).filter(Boolean)))
-      .then(results => results
-        .filter(item => item && item.cover && item.cover.url)
-        .map(game => {
-          const thumb = game.cover.url;
-          const dotIndex = thumb.lastIndexOf('.');
-          const slashIndex = thumb.lastIndexOf('/');
-          if (dotIndex < 0 || slashIndex < 0) {
-            return null;
-          }
-          const slug = thumb.substring(slashIndex + 1, dotIndex);
-          return {
-            name: game.name,
-            key: `igdb_${game.id}`,
-            url: `https://images.igdb.com/igdb/image/upload/t_cover_big/${slug}.jpg`,
-            saveUrl: `https://images.igdb.com/igdb/image/upload/t_cover_big_2x/${slug}.png`,
-          }
-        }).filter(Boolean));
-  }
 
   export default {
     components: {
@@ -686,10 +559,6 @@
         editForm: null,
         editFormError: "",
         detachedCmd: "",
-        coverSearching: false,
-        coverFinderBusy: false,
-        coverCandidates: [],
-        coverSearchQuery: "",
         platform: "",
         fileBrowserType: "any",
         fileBrowserTitle: "",
@@ -705,20 +574,11 @@
         searchQuery: "",
         sortMode: "default",
         deleteTarget: null,
-        version: null,
-        githubVersion: null,
       };
     },
     computed: {
-      installedVersionNotStable() {
-        if (!this.githubVersion || !this.version) {
-          return false;
-        }
-        return this.version.isGreater(this.githubVersion);
-      },
       documentationBaseUrl() {
-        const docsVersion = this.installedVersionNotStable ? 'master' : 'latest'
-        return `https://docs.lizardbyte.dev/projects/sunshine/${docsVersion}`
+        return 'https://docs.lizardbyte.dev/projects/sunshine/latest'
       },
       displayedApps() {
         let list = this.apps.map((app, index) => ({ app, index }));
@@ -782,13 +642,7 @@
         .then(r => r.json())
         .then(r => {
           this.platform = r.platform;
-          this.version = new SunshineVersion(null, r.version);
         });
-
-      fetch("https://api.github.com/repos/SunshineStream/Sunshine/releases/latest")
-        .then((r) => r.json())
-        .then((r) => this.githubVersion = new SunshineVersion(r, null))
-        .catch((e) => console.error(e));
     },
     methods: {
       newApp() {
@@ -880,54 +734,6 @@
       },
       addDetached() {
         this.editForm.detached.push("");
-      },
-      showCoverFinder() {
-        // Reset search state
-        this.coverCandidates = [];
-        this.coverSearchQuery = "";
-
-        this.showStacked(this.$refs.coverFinderModal);
-
-        // Perform initial search with app name
-        this.performCoverSearch();
-      },
-      performCoverSearch() {
-        this.coverSearching = true;
-        this.coverCandidates = [];
-
-        // Use search query if provided, otherwise fall back to app name
-        const searchTerm = this.coverSearchQuery.trim() || this.editForm["name"].toString();
-
-        searchCovers(searchTerm)
-          .then(list => this.coverCandidates = list)
-          .finally(() => this.coverSearching = false);
-      },
-      useCover(cover) {
-        this.coverFinderBusy = true;
-        apiFetch("./api/covers/upload", {
-          method: "POST",
-          headers: {
-            'Content-Type': 'application/json'
-          },
-          body: JSON.stringify({
-            key: cover.key,
-            url: cover.saveUrl,
-          })
-        }).then(r => {
-          if (!r.ok) throw new Error("Failed to download covers");
-          return r.json();
-        }).then(body => {
-          this.editForm["image-path"] = body.path;
-          // Close the modal
-          const modalEl = this.$refs.coverFinderModal;
-          if (modalEl) {
-            const modal = Modal.getInstance(modalEl);
-            if (modal) {
-              modal.hide();
-            }
-          }
-        })
-          .finally(() => this.coverFinderBusy = false);
       },
       browseFor(type, titleKey, startPath, callback, acceptedExtensions = null) {
         this.fileBrowserType = type;
@@ -1081,7 +887,7 @@
         if (modal) modal.hide();
       },
       // We need to update the z-index since bootstrap gives all modals the same z-index
-      // Fixes the stacking issue of modals (cover finder / file browser)
+      // Fixes the stacking issue of modals (file browser over the edit modal)
       showStacked(modalEl) {
         modalEl.addEventListener('show.bs.modal', () => {
           const openCount = document.querySelectorAll('.modal.show').length;

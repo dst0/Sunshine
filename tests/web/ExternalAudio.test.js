@@ -36,7 +36,8 @@ afterEach(() => {
 describe('externally managed audio configuration', () => {
   it('renders after the existing Windows audio controls and preserves its saved value', async () => {
     const { wrapper, config } = mountAudioVideo('windows')
-    expect(wrapper.findAll('input').map(input => input.attributes('id'))).toEqual([
+    const inputIds = wrapper.findAll('input').map(input => input.attributes('id'))
+    expect(inputIds.slice(0, inputIds.indexOf('external_audio') + 1)).toEqual([
       'audio_sink',
       'virtual_sink',
       'install_steam_audio_drivers',

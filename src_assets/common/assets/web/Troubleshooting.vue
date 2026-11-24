@@ -450,21 +450,39 @@
           {{ $t('troubleshooting.unpair_all_error') }}
         </div>
       </div>
+      <div class="alert alert-danger mx-3" v-if="clientPermissionsError">
+        <alert-circle :size="18" class="icon"></alert-circle>
+        {{ $t('troubleshooting.sds_permissions_error') }}
+      </div>
       <ul class="list-group list-group-flush" v-if="clients && clients.length > 0">
-        <li v-for="client in clients" :key="client.uuid" class="list-group-item d-flex align-items-center">
-          <div class="flex-grow-1">
-            {{ client.name !== "" ? client.name : $t('troubleshooting.unpair_single_unknown') }}
+        <li v-for="client in clients" :key="client.uuid" class="list-group-item">
+          <div class="d-flex align-items-center">
+            <div class="flex-grow-1">
+              {{ client.name !== "" ? client.name : $t('troubleshooting.unpair_single_unknown') }}
+            </div>
+            <div class="form-check form-switch ms-2 mb-0">
+              <input class="form-check-input" type="checkbox" role="switch"
+                     :id="'toggle-' + client.uuid"
+                     :checked="client.enabled"
+                     :aria-checked="client.enabled.toString()"
+                     @change="toggleClient(client.uuid, !client.enabled)">
+            </div>
+            <button class="btn btn-danger btn-sm ms-2" @click="unpairSingle(client.uuid)">
+              <trash-2 :size="18" class="icon"></trash-2>
+            </button>
           </div>
-          <div class="form-check form-switch ms-2 mb-0">
-            <input class="form-check-input" type="checkbox" role="switch"
-                   :id="'toggle-' + client.uuid"
-                   :checked="client.enabled"
-                   :aria-checked="client.enabled.toString()"
-                   @change="toggleClient(client.uuid, !client.enabled)">
+          <div class="d-flex flex-wrap align-items-center gap-3 mt-2 small client-permissions" :id="'permissions-' + client.uuid">
+            <span class="text-muted">{{ $t('troubleshooting.sds_permissions') }}</span>
+            <div class="form-check form-switch mb-0" v-for="permission in sdsPermissions" :key="permission">
+              <input class="form-check-input" type="checkbox" role="switch"
+                     :id="'permission-' + permission + '-' + client.uuid"
+                     :checked="hasClientPermission(client, permission)"
+                     @change="setClientPermission(client, permission, $event.target.checked)">
+              <label class="form-check-label" :for="'permission-' + permission + '-' + client.uuid">
+                {{ $t('troubleshooting.sds_permission_' + permission) }}
+              </label>
+            </div>
           </div>
-          <button class="btn btn-danger btn-sm ms-2" @click="unpairSingle(client.uuid)">
-            <trash-2 :size="18" class="icon"></trash-2>
-          </button>
         </li>
       </ul>
       <ul v-else class="list-group list-group-flush">
@@ -577,6 +595,8 @@
       data() {
         return {
           clients: [],
+          clientPermissionsError: false,
+          sdsPermissions: ['clipboard_read', 'clipboard_write', 'file_upload', 'file_download', 'mic'],
           closeAppPressed: false,
           closeAppStatus: null,
           ddResetPressed: false,
@@ -917,7 +937,7 @@
           });
         },
         toggleClient(uuid, enabled) {
-          fetch("./api/clients/update", {
+          apiFetch("./api/clients/update", {
             method: "POST",
             headers: {
               'Content-Type': 'application/json'
@@ -926,6 +946,37 @@
           }).then(() => {
             this.refreshClients();
           });
+        },
+        hasClientPermission(client, permission) {
+          return Array.isArray(client.permissions) && client.permissions.includes(permission);
+        },
+        setClientPermission(client, permission, granted) {
+          const current = new Set(Array.isArray(client.permissions) ? client.permissions : []);
+          if (granted) {
+            current.add(permission);
+          } else {
+            current.delete(permission);
+          }
+          const permissions = this.sdsPermissions.filter((name) => current.has(name));
+          this.clientPermissionsError = false;
+          return apiFetch("./api/clients/permissions", {
+            method: "POST",
+            headers: {
+              'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({ uuid: client.uuid, permissions })
+          })
+            .then((r) => r.json())
+            .then((r) => {
+              if (r.status !== true) {
+                this.clientPermissionsError = true;
+              }
+              this.refreshClients();
+            })
+            .catch(() => {
+              this.clientPermissionsError = true;
+              this.refreshClients();
+            });
         },
         refreshClients() {
           fetch("./api/clients/list")
@@ -1019,69 +1070,14 @@
             });
         },
         /**
-         * @brief Refresh the installed backend details and latest stable Virtual HID Broker release.
+         * @brief Refresh the installed backend details.
+         *
+         * The latest-release lookup was removed: the Web UI makes no requests to external
+         * services. The release column therefore reports the release as unavailable and the
+         * download button links to the releases page.
          */
         refreshDriverInformation() {
           this.refreshVirtualInputStatus();
-          this.refreshDriverReleases();
-        },
-        /**
-         * @brief Refresh the latest stable release metadata for Virtual HID Broker.
-         */
-        refreshDriverReleases() {
-          if (this.showVirtualhid) {
-            this.updateLatestRelease(
-              'virtualhidRelease',
-              'LizardByte/libvirtualhid',
-              'https://github.com/LizardByte/libvirtualhid/releases/latest',
-            );
-          }
-        },
-        /**
-         * @brief Fetch one repository's latest non-prerelease release from GitHub.
-         *
-         * @param {string} property Component data property that stores the release metadata.
-         * @param {string} repository GitHub repository in owner/name form.
-         * @param {string} fallbackUrl Releases page used if the API request fails.
-         */
-        updateLatestRelease(property, repository, fallbackUrl) {
-          this[property] = {
-            ...this[property],
-            loading: true,
-            error: false,
-          };
-
-          fetch(`https://api.github.com/repos/${repository}/releases/latest`, {
-            headers: {
-              Accept: 'application/vnd.github+json',
-            },
-          })
-            .then((response) => {
-              if (!response.ok) {
-                throw new Error(`GitHub returned ${response.status}`);
-              }
-              return response.json();
-            })
-            .then((release) => {
-              if (!release.tag_name || release.draft || release.prerelease) {
-                throw new Error('GitHub did not return a stable release');
-              }
-              this[property] = {
-                loading: false,
-                version: release.tag_name,
-                url: release.html_url || fallbackUrl,
-                error: false,
-              };
-            })
-            .catch((error) => {
-              console.error(`Failed to fetch the latest ${repository} release:`, error);
-              this[property] = {
-                loading: false,
-                version: '',
-                url: fallbackUrl,
-                error: true,
-              };
-            });
         },
         refreshVirtualInputStatus() {
           fetch("/api/virtual-input/status")

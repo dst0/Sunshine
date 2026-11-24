@@ -3,26 +3,29 @@
 ## General
 
 ### Forgotten Credentials
-If you forgot your credentials to the web UI, try this.
+If you forgot your credentials to the web UI, set new ones. Sunshine prompts for the password
+without echoing it (or reads one line from standard input when it is not a terminal), then
+restart Sunshine.
 
 @tabs_grouped{linux-package|:|
   @tab{General |:| ```bash
-    sunshine --creds {new-username} {new-password}
+    sunshine --creds {new-username}
     ```
   }
   @tab{AppImage |:| ```bash
-    ./sunshine.AppImage --creds {new-username} {new-password}
+    ./sunshine.AppImage --creds {new-username}
     ```
   }
   @tab{Flatpak |:| ```bash
-    flatpak run --command=sunshine dev.lizardbyte.app.Sunshine --creds {new-username} {new-password}
+    flatpak run --command=sunshine dev.lizardbyte.app.Sunshine --creds {new-username}
     ```
   }
 }
 
 > [!TIP]
-> Remember to replace `{new-username}` and `{new-password}` with your new credentials.
-> Do not include the curly braces.
+> Remember to replace `{new-username}` with your new username. Do not include the curly braces.
+> The older form `--creds {new-username} {new-password}` still works, but exposes the password in
+> the process list and shell history.
 
 ### Unusual Mouse Behavior
 If you experience unusual mouse behavior, try attaching a physical mouse to the Sunshine host.

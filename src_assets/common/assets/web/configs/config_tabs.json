@@ -43,6 +43,8 @@
       "stream_audio": "enabled",
       "install_steam_audio_drivers": "enabled",
       "external_audio": "disabled",
+      "mic_passthrough": "enabled",
+      "mic_device": "",
       "adapter_name": "",
       "output_name": "",
       "dd_configuration_option": "disabled",
@@ -69,17 +71,39 @@
     "nameKey": "config.category_network",
     "options": {
       "upnp": "disabled",
+      "mdns_advertise": "disabled",
       "address_family": "ipv4",
       "bind_address": "",
       "port": 47989,
-      "origin_web_ui_allowed": "lan",
+      "origin_web_ui_allowed": "pc",
       "csrf_allowed_origins": "",
       "external_ip": "",
-      "lan_encryption_mode": 0,
-      "wan_encryption_mode": 1,
+      "lan_encryption_mode": 2,
+      "wan_encryption_mode": 2,
       "ping_timeout": 10000,
       "packetsize": 0,
       "dscp_tagging": "enabled"
+    }
+  },
+  {
+    "id": "sds",
+    "nameKey": "config.category_clipboard_files",
+    "options": {
+      "clipboard": "enabled",
+      "file_transfer": "enabled",
+      "file_clipboard": "disabled",
+      "mic_passthrough": "enabled",
+      "clipboard_text_max": "1M",
+      "clipboard_image_max": "16M",
+      "clipboard_rate": 10,
+      "file_max": "4G",
+      "file_chunk_max": "4M",
+      "file_uploads_max_concurrent": 2,
+      "file_min_free_space": "1G",
+      "file_upload_idle_timeout": 120,
+      "file_inbox_dir": "",
+      "file_outbox_dir": "",
+      "sds_default_permissions": ""
     }
   },
   {

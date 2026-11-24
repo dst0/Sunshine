@@ -468,7 +468,14 @@ namespace va {
         return -1;
       }
 
-      auto sws_opt = egl::sws_t::make(width, height, new_frame->width, new_frame->height, hw_frames_ctx->sw_format, false);
+      std::optional<egl::sws_t> sws_opt;
+      if (packed_ycocgr_mode == 1) {
+        const int logical_w = packed_logical_width > 0 ? packed_logical_width : width;
+        const int logical_h = packed_logical_height > 0 ? packed_logical_height : height;
+        sws_opt = egl::sws_t::make_ycocgr_p010(width, height, logical_w, logical_h, new_frame->width, new_frame->height);
+      } else {
+        sws_opt = egl::sws_t::make(width, height, new_frame->width, new_frame->height, hw_frames_ctx->sw_format, false);
+      }
       if (!sws_opt) {
         return -1;
       }
@@ -483,6 +490,9 @@ namespace va {
      * @brief Apply the configured colorspace metadata to the active frame.
      */
     void apply_colorspace() override {
+      if (packed_ycocgr_mode == 1) {
+        return;
+      }
       sws.apply_colorspace(colorspace, false);
     }
 
@@ -518,8 +528,7 @@ namespace va {
     int convert(platf::img_t &img) override {
       sws.load_ram(img);
 
-      sws.convert_nv12(nv12->buf);
-      return 0;
+      return packed_ycocgr_mode == 1 ? sws.convert_ycocgr_p010(nv12->buf) : sws.convert_nv12(nv12->buf);
     }
   };
 
@@ -556,8 +565,7 @@ namespace va {
 
       sws.load_vram(descriptor, offset_x, offset_y, rgb->tex[0], false);
 
-      sws.convert_nv12(nv12->buf);
-      return 0;
+      return packed_ycocgr_mode == 1 ? sws.convert_ycocgr_p010(nv12->buf) : sws.convert_nv12(nv12->buf);
     }
 
     /**

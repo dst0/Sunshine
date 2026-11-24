@@ -5,7 +5,7 @@
 # This ensures a user-provided OPENSSL_ROOT_DIR is honored consistently.
 find_package(OpenSSL REQUIRED)
 
-# boost, this should be before Simple-Web-Server as it also depends on boost
+# boost
 include(dependencies/Boost_Sunshine)
 
 # submodules
@@ -13,8 +13,8 @@ include(dependencies/Boost_Sunshine)
 set(ENET_NO_INSTALL ON CACHE BOOL "Don't install any libraries built for enet")
 add_subdirectory("${CMAKE_SOURCE_DIR}/third-party/moonlight-common-c/enet")
 
-# web server
-add_subdirectory("${CMAKE_SOURCE_DIR}/third-party/Simple-Web-Server")
+# memory-safe Rust HTTP / PQ-TLS 1.3 layer (exposes simple-web-server compatibility target)
+add_subdirectory("${CMAKE_SOURCE_DIR}/third-party/sds-http-rs")
 
 # lizardbyte common helpers
 set(LIZARDBYTE_COMMON_BUILD_TEST_SUPPORT ${BUILD_TESTS}
@@ -90,7 +90,6 @@ include("${CMAKE_MODULE_PATH}/dependencies/nv_codec_headers.cmake")
 include("${CMAKE_MODULE_PATH}/dependencies/nlohmann_json.cmake")
 find_package(PkgConfig REQUIRED)
 find_package(Threads REQUIRED)
-pkg_check_modules(CURL REQUIRED libcurl)
 
 # miniupnp
 pkg_check_modules(MINIUPNP miniupnpc REQUIRED)

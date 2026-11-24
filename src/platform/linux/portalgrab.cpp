@@ -5,18 +5,28 @@
 // standard includes
 #include <algorithm>
 #include <cctype>
+#include <cerrno>
 #include <cstdlib>
+#include <fcntl.h>
+#include <memory>
+#include <mutex>
+#include <sys/stat.h>
+#include <unistd.h>
+#include <utility>
 
 // lib includes
 #include <lizardbyte/common/env.h>
 
 // local includes
 #include "pipewire.cpp"
+#include "portal_session.h"
+#include "src/config.h"
 #include "src/globals.h"
 
 namespace {
   // Portal configuration constants
   constexpr uint32_t SOURCE_TYPE_MONITOR = 1;
+  constexpr uint32_t SOURCE_TYPE_VIRTUAL = 4;
   constexpr uint32_t CURSOR_MODE_EMBEDDED = 2;
 
   constexpr uint32_t PERSIST_FORGET = 0;
@@ -33,9 +43,15 @@ namespace {
   constexpr const char *REMOTE_DESKTOP_IFACE = "org.freedesktop.portal.RemoteDesktop";
   constexpr const char *SCREENCAST_IFACE = "org.freedesktop.portal.ScreenCast";
   constexpr const char *REQUEST_IFACE = "org.freedesktop.portal.Request";
+  constexpr const char *CLIPBOARD_IFACE = "org.freedesktop.portal.Clipboard";
 
   constexpr const char REQUEST_PREFIX[] = "/org/freedesktop/portal/desktop/request/";
   constexpr const char SESSION_PREFIX[] = "/org/freedesktop/portal/desktop/session/";
+
+  /** @brief Whether the user explicitly selected a virtual output from the portal. */
+  bool portal_virtual_display() {
+    return config::video.capture == "portal-virtual";
+  }
 }  // namespace
 
 using namespace std::literals;
@@ -80,6 +96,7 @@ namespace portal {
      * @brief Load persisted state from its backing store.
      */
     static void load() {
+      token_->clear();
       std::ifstream file(active_file_path());
       if (file.is_open()) {
         std::getline(file, *token_);
@@ -109,25 +126,53 @@ namespace portal {
     }
 
     /**
-     * @brief Save current state to its backing store.
+     * @brief Save current state to its backing store with owner-only permissions.
      */
     static void save() {
       if (token_->empty()) {
         return;
       }
-      std::ofstream file(active_file_path());
-      if (file.is_open()) {
-        file << *token_;
-        BOOST_LOG(info) << "[portalgrab] Saved portal restore token to disk"sv;
-      } else {
+      const auto path = active_file_path();
+      const int fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW | O_CLOEXEC, S_IRUSR | S_IWUSR);
+      if (fd < 0) {
         BOOST_LOG(warning) << "[portalgrab] Failed to save portal restore token"sv;
+        return;
       }
+
+      if (::fchmod(fd, S_IRUSR | S_IWUSR) != 0) {
+        BOOST_LOG(warning) << "[portalgrab] Failed to restrict portal restore token permissions"sv;
+        ::close(fd);
+        return;
+      }
+
+      const char *data = token_->data();
+      std::size_t remaining = token_->size();
+      while (remaining > 0) {
+        const auto written = ::write(fd, data, remaining);
+        if (written < 0) {
+          if (errno == EINTR) {
+            continue;
+          }
+          BOOST_LOG(warning) << "[portalgrab] Failed to write portal restore token"sv;
+          ::close(fd);
+          return;
+        }
+        data += written;
+        remaining -= static_cast<std::size_t>(written);
+      }
+
+      if (::close(fd) != 0) {
+        BOOST_LOG(warning) << "[portalgrab] Failed to close portal restore token"sv;
+        return;
+      }
+      BOOST_LOG(info) << "[portalgrab] Saved portal restore token to disk"sv;
     }
 
     /**
      * @brief Get file path of the XDG Portal restore token.
      *
      * The token filename is suffixed with the XDG session desktop when set in the environment.
+     * Virtual sources have a separate token to keep monitor grants out of virtual sessions.
      *
      * @param directory Directory containing saved tokens; defaults to the application data directory.
      * @param desktop Session desktop; defaults to the XDG_SESSION_DESKTOP environment variable.
@@ -149,6 +194,10 @@ namespace portal {
           !is_safe) {
         BOOST_LOG(warning) << "[portalgrab] XDG session desktop type cannot be determined. Using .unknown suffix for Portal restore token."sv;
         suffix = "unknown";
+      }
+
+      if (portal_virtual_display()) {
+        return directory / ("portal_token." + suffix + ".virtual");
       }
 
       const std::filesystem::path suffixed_path = directory / ("portal_token." + suffix);
@@ -325,6 +374,7 @@ namespace portal {
     int height = 0;  ///< Stream height in pixels.
     int pos_x = 0;  ///< Output X position reported by the portal.
     int pos_y = 0;  ///< Output Y position reported by the portal.
+    bool virtual_display = false;  ///< True when this stream creates a virtual display.
     std::string monitor_name;  ///< Monitor name.
 
     /**
@@ -333,6 +383,9 @@ namespace portal {
      * @return Value converted to display name.
      */
     std::string to_display_name() {
+      if (virtual_display) {
+        return "portal-virtual";
+      }
       if (!monitor_name.empty()) {
         return monitor_name;
       }
@@ -464,6 +517,7 @@ namespace portal {
       for (int attempt = 0; attempt < 2; ++attempt) {
         const bool used_restore_token = !restore_token_t::empty();
         pipewire_streams.clear();
+        clipboard_enabled = false;
 
         g_autofree gchar *session_path = nullptr;
         g_autofree gchar *session_token = nullptr;
@@ -515,6 +569,7 @@ namespace portal {
 
       if (select_remote_desktop_devices(loop, *session_path) < 0) {
         BOOST_LOG(warning) << "[portalgrab] RemoteDesktop.SelectDevices failed, falling back to ScreenCast-only mode"sv;
+        close_session();
         g_free(*session_path);
         *session_path = nullptr;
         return false;
@@ -522,9 +577,16 @@ namespace portal {
 
       if (select_screencast_sources(loop, *session_path, false) < 0) {
         BOOST_LOG(warning) << "[portalgrab] ScreenCast.SelectSources failed with RemoteDesktop session, trying ScreenCast-only mode"sv;
+        close_session();
         g_free(*session_path);
         *session_path = nullptr;
         return false;
+      }
+
+      // Clipboard access must be requested after the session is created and before Start.
+      // A portal without the Clipboard interface only costs the clipboard, never capture.
+      if (request_clipboard) {
+        request_clipboard_access(*session_path);
       }
 
       return true;
@@ -545,6 +607,7 @@ namespace portal {
         return -1;
       }
       if (select_screencast_sources(loop, *session_path, true) < 0) {
+        close_session();
         g_free(*session_path);
         *session_path = nullptr;
         return -1;
@@ -584,8 +647,41 @@ namespace portal {
       return false;
     }
 
+    /**
+     * @brief Open another PipeWire remote for the current session.
+     *
+     * @param fd Receives the new file descriptor, owned by the caller.
+     * @return 0 on success; -1 when there is no session or the portal call fails.
+     */
+    int open_pipewire_remote_fd(int &fd) {
+      if (session_handle.empty()) {
+        return -1;
+      }
+      return open_pipewire_remote(session_handle.c_str(), fd);
+    }
+
+    /**
+     * @brief D-Bus connection used for portal calls.
+     *
+     * @return Borrowed connection, or nullptr before init().
+     */
+    GDBusConnection *connection() const {
+      return conn;
+    }
+
+    /**
+     * @brief Object path of the current portal session.
+     *
+     * @return Session handle, empty when no session is open.
+     */
+    const std::string &session() const {
+      return session_handle;
+    }
+
     std::vector<pipewire_streaminfo_t> pipewire_streams;  ///< Pipewire streams.
     int pipewire_fd = -1;  ///< Pipewire fd.
+    bool request_clipboard = false;  ///< Call Clipboard.RequestClipboard before starting RemoteDesktop sessions.
+    bool clipboard_enabled = false;  ///< Start reported `clipboard_enabled` for the current session.
 
   private:
     GDBusConnection *conn = nullptr;
@@ -622,6 +718,35 @@ namespace portal {
         BOOST_LOG(debug) << "[portalgrab] Explicitly closed portal session: "sv << session_handle;
       }
       session_handle.clear();
+    }
+
+    /**
+     * @brief Ask the portal to integrate the clipboard with a RemoteDesktop session.
+     *
+     * Failures are logged and otherwise ignored: the session then starts without clipboard.
+     *
+     * @param session_path Session that has not been started yet.
+     */
+    void request_clipboard_access(const gchar *session_path) {
+      g_autoptr(GError) err = nullptr;
+      g_autoptr(GVariant) reply = g_dbus_connection_call_sync(
+        conn,
+        PORTAL_NAME,
+        PORTAL_PATH,
+        CLIPBOARD_IFACE,
+        "RequestClipboard",
+        g_variant_new("(oa{sv})", session_path, nullptr),
+        nullptr,
+        G_DBUS_CALL_FLAGS_NONE,
+        dbus_timeout * 1000,
+        nullptr,
+        &err
+      );
+      if (err) {
+        BOOST_LOG(warning) << "[portalgrab] Clipboard.RequestClipboard failed; the session starts without clipboard access: "sv << err->message;
+      } else {
+        BOOST_LOG(debug) << "[portalgrab] Requested clipboard access for "sv << session_path;
+      }
     }
 
     int create_portal_session(GMainLoop *loop, gchar **session_path_out, const gchar *session_token, bool use_screencast) {
@@ -742,9 +867,10 @@ namespace portal {
       g_variant_builder_add(&builder, "o", session_path);
       g_variant_builder_open(&builder, G_VARIANT_TYPE("a{sv}"));
       g_variant_builder_add(&builder, "{sv}", "handle_token", g_variant_new_string(request_token));
-      g_variant_builder_add(&builder, "{sv}", "types", g_variant_new_uint32(SOURCE_TYPE_MONITOR));
+      const bool virtual_display = portal_virtual_display();
+      g_variant_builder_add(&builder, "{sv}", "types", g_variant_new_uint32(virtual_display ? SOURCE_TYPE_VIRTUAL : SOURCE_TYPE_MONITOR));
       g_variant_builder_add(&builder, "{sv}", "cursor_mode", g_variant_new_uint32(CURSOR_MODE_EMBEDDED));
-      g_variant_builder_add(&builder, "{sv}", "multiple", g_variant_new_boolean(TRUE));
+      g_variant_builder_add(&builder, "{sv}", "multiple", g_variant_new_boolean(!virtual_display));
       if (persist) {
         g_variant_builder_add(&builder, "{sv}", "persist_mode", g_variant_new_uint32(PERSIST_UNTIL_REVOKED));
         if (!restore_token_t::empty()) {
@@ -825,10 +951,31 @@ namespace portal {
         return portal_start_e::failure;
       }
 
+      if (gboolean enabled = FALSE; !use_screencast && g_variant_lookup(dict, "clipboard_enabled", "b", &enabled)) {
+        clipboard_enabled = enabled;
+        if (request_clipboard && !enabled) {
+          BOOST_LOG(warning) << "[portalgrab] The portal did not enable the clipboard for this session. If a restore token "
+                                "was saved before the clipboard feature was enabled, remove it and accept the consent "
+                                "dialog again with the clipboard switch on."sv;
+        }
+      }
+
       streams = g_variant_lookup_value(dict, "streams", G_VARIANT_TYPE("a(ua{sv})"));
       if (!streams || g_variant_n_children(streams) == 0) {
         BOOST_LOG(error) << "[portalgrab] " << session_type << " Start: no streams in response"sv;
         return portal_start_e::no_streams;
+      }
+
+      const bool virtual_display = portal_virtual_display();
+      if (virtual_display) {
+        guint32 source_type = 0;
+        g_autoptr(GVariant) stream = g_variant_get_child_value(streams, 0);
+        g_autoptr(GVariant) properties = g_variant_get_child_value(stream, 1);
+        if (g_variant_n_children(streams) != 1 || !g_variant_lookup(properties, "source_type", "u", &source_type) || source_type != SOURCE_TYPE_VIRTUAL) {
+          BOOST_LOG(error) << "[portalgrab] The portal did not return exactly one virtual display"sv;
+          close_session();
+          return portal_start_e::failure;
+        }
       }
 
       if (const gchar *new_token = nullptr; g_variant_lookup(dict, "restore_token", "s", &new_token) && new_token && new_token[0] != '\0' && restore_token_t::get() != new_token) {
@@ -842,10 +989,10 @@ namespace portal {
       g_autoptr(GVariant) value = nullptr;
       g_variant_iter_init(&iter, streams);
       while (g_variant_iter_next(&iter, "(u@a{sv})", &out_pipewire_node, &value)) {
-        int out_width;
-        int out_height;
+        int out_width = 0;
+        int out_height = 0;
         bool result = g_variant_lookup(value, "size", "(ii)", &out_width, &out_height, nullptr);
-        if (!result) {
+        if (!result && !virtual_display) {
           BOOST_LOG(warning) << "[portalgrab] Ignoring stream without proper resolution on pipewire node "sv << out_pipewire_node;
           continue;
         }
@@ -854,7 +1001,9 @@ namespace portal {
         int out_pos_y;
         result = g_variant_lookup(value, "position", "(ii)", &out_pos_x, &out_pos_y, nullptr);
         if (!result) {
-          BOOST_LOG(warning) << "[portalgrab] Falling back to position 0x0 for stream with resolution "sv << out_width << "x"sv << out_height << "on pipewire node "sv << out_pipewire_node;
+          if (!virtual_display) {
+            BOOST_LOG(warning) << "[portalgrab] Falling back to position 0x0 for stream with resolution "sv << out_width << "x"sv << out_height << "on pipewire node "sv << out_pipewire_node;
+          }
           out_pos_x = 0;
           out_pos_y = 0;
         }
@@ -873,10 +1022,14 @@ namespace portal {
           .height = out_height,
           .pos_x = out_pos_x,
           .pos_y = out_pos_y,
+          .virtual_display = virtual_display,
         };
 
         // Try to match the stream to a monitor_name by position/resolution and update stream info
         for (const auto &monitor : wl_monitors) {
+          if (virtual_display) {
+            break;
+          }
           if (monitor->viewport.offset_x == out_pos_x && monitor->viewport.offset_y == out_pos_y && monitor->viewport.logical_width == out_width && monitor->viewport.logical_height == out_height) {
             stream.monitor_name = monitor->name;
             break;
@@ -1117,26 +1270,199 @@ namespace portal {
     }
   };
 
+  namespace {
+    std::atomic<bool> clipboard_requested_flag {false};
+    std::atomic<bool> capture_active_flag {false};
+  }  // namespace
+
+  void set_clipboard_requested(bool requested) {
+    clipboard_requested_flag.store(requested);
+  }
+
+  bool clipboard_requested() {
+    return clipboard_requested_flag.load();
+  }
+
+  void set_capture_active(bool active) {
+    capture_active_flag.store(active);
+  }
+
+  bool capture_active() {
+    return capture_active_flag.load();
+  }
+
+  /**
+   * @brief The process-wide RemoteDesktop session leased by displays and the clipboard backend.
+   *
+   * Destroying the last lease closes the portal session (through ~dbus_t).
+   */
+  class shared_session_t final: public session_t {
+  public:
+    GDBusConnection *connection() const override {
+      return dbus.connection();
+    }
+
+    const std::string &handle() const override {
+      return handle_;
+    }
+
+    bool clipboard_enabled() const override {
+      return dbus.clipboard_enabled;
+    }
+
+    bool is_closed() const override {
+      return dbus.is_session_closed();
+    }
+
+    /**
+     * @brief Hand out the remote opened while starting the session, then open new ones.
+     *
+     * Every display needs its own remote because PipeWire takes ownership of the fd.
+     *
+     * @return File descriptor owned by the caller, or -1.
+     */
+    int open_pipewire_remote() override {
+      std::lock_guard lock(fd_mutex_);
+      if (dbus.pipewire_fd >= 0) {
+        return std::exchange(dbus.pipewire_fd, -1);
+      }
+      int fd = -1;
+      if (dbus.open_pipewire_remote_fd(fd) < 0) {
+        return -1;
+      }
+      return fd;
+    }
+
+    /**
+     * @brief Connect to the portal and start the session.
+     *
+     * @param allow_start_timeout True if Start may time out.
+     * @return 0 on success.
+     */
+    int start(bool allow_start_timeout) {
+      dbus.request_clipboard = clipboard_requested();
+      if (dbus.init() < 0 || dbus.connect_to_portal(allow_start_timeout) < 0) {
+        return -1;
+      }
+      handle_ = dbus.session();
+      return 0;
+    }
+
+    dbus_t dbus;  ///< Portal connection and session; streams are read-only once started.
+
+  private:
+    std::string handle_;
+    std::mutex fd_mutex_;
+  };
+
+  namespace {
+    constexpr auto shared_session_create_wait = std::chrono::seconds(15);  ///< Bound on waiting for a concurrent creator.
+    std::timed_mutex shared_session_create_mutex;  ///< Serializes creation of the shared session.
+    std::mutex shared_session_mutex;  ///< Guards shared_session_wp.
+    std::weak_ptr<shared_session_t> shared_session_wp;  ///< The open shared session, if any.
+
+    /**
+     * @brief Lease the shared session if it exists and the portal still has it open.
+     *
+     * @return Lease, or nullptr.
+     */
+    std::shared_ptr<shared_session_t> live_shared_session() {
+      std::shared_ptr<shared_session_t> session;
+      {
+        std::lock_guard lock(shared_session_mutex);
+        session = shared_session_wp.lock();
+      }
+      if (session && session->is_closed()) {
+        BOOST_LOG(info) << "[portalgrab] Shared portal session was closed by the portal"sv;
+        return nullptr;
+      }
+      return session;
+    }
+
+    /**
+     * @brief Lease the shared session, creating it when needed.
+     *
+     * @param allow_start_timeout True to bound the wait for Start (and for a concurrent creator).
+     * @return Lease, or nullptr.
+     */
+    std::shared_ptr<shared_session_t> acquire_shared(bool allow_start_timeout) {
+      std::unique_lock create_lock(shared_session_create_mutex, std::defer_lock);
+      if (allow_start_timeout) {
+        if (!create_lock.try_lock_for(shared_session_create_wait)) {
+          BOOST_LOG(warning) << "[portalgrab] Timed out waiting for another caller to create the shared portal session"sv;
+          return nullptr;
+        }
+      } else {
+        create_lock.lock();
+      }
+
+      if (auto session = live_shared_session()) {
+        return session;
+      }
+
+      auto session = std::make_shared<shared_session_t>();
+      if (session->start(allow_start_timeout) < 0) {
+        BOOST_LOG(error) << "[portalgrab] Failed to start the shared portal session"sv;
+        return nullptr;
+      }
+      BOOST_LOG(info) << "[portalgrab] Started shared portal session "sv << session->handle() << (session->clipboard_enabled() ? " with clipboard access"sv : ""sv);
+      std::lock_guard lock(shared_session_mutex);
+      shared_session_wp = session;
+      return session;
+    }
+  }  // namespace
+
+  std::shared_ptr<session_t> acquire_shared_session(bool allow_start_timeout) {
+    return acquire_shared(allow_start_timeout);
+  }
+
+  std::shared_ptr<session_t> current_shared_session() {
+    return live_shared_session();
+  }
+
   /**
    * @brief Portal screencast backend that negotiates PipeWire streams over DBus.
    */
   class portal_t: public pipewire::pipewire_display_t {
   public:
+    /**
+     * @brief Construct a portal display with initial dimensions for virtual sources without geometry.
+     * @param width Width requested by the stream configuration.
+     * @param height Height requested by the stream configuration.
+     */
+    explicit portal_t(int width = 1920, int height = 1080):
+        preferred_virtual_width {std::clamp(width, 1, 8192)},
+        preferred_virtual_height {std::clamp(height, 1, 4096)} {}
+
     int configure_stream(const std::string &display_name, int &out_pipewire_fd, uint32_t &out_pipewire_node, uint64_t &out_pipewire_object_serial [[maybe_unused]]) override {
-      // Connect DBus portal session
-      if (dbus.init() < 0) {
-        BOOST_LOG(error) << "[portalgrab] Failed to connect to dbus. portal_t setup failed.";
-        return -1;
-      }
-      if (dbus.connect_to_portal(false) < 0) {
-        BOOST_LOG(error) << "[portalgrab] Failed to connect to portal. portal_t setup failed.";
-        return -1;
+      const std::vector<pipewire_streaminfo_t> *portal_streams = nullptr;
+      int stream_fd = -1;
+      if (clipboard_requested()) {
+        // Lease the process-wide session so it survives this display while the clipboard uses it
+        shared = acquire_shared(false);
+        if (!shared) {
+          BOOST_LOG(error) << "[portalgrab] Failed to acquire the shared portal session. portal_t setup failed.";
+          return -1;
+        }
+        portal_streams = &shared->dbus.pipewire_streams;
+      } else {
+        // Connect DBus portal session
+        if (dbus.init() < 0) {
+          BOOST_LOG(error) << "[portalgrab] Failed to connect to dbus. portal_t setup failed.";
+          return -1;
+        }
+        if (dbus.connect_to_portal(false) < 0) {
+          BOOST_LOG(error) << "[portalgrab] Failed to connect to portal. portal_t setup failed.";
+          return -1;
+        }
+        portal_streams = &dbus.pipewire_streams;
+        stream_fd = dbus.pipewire_fd;
       }
 
       // Match display_name to a stream from the pipewire_streams vector
       bool use_fallback = true;
       pipewire_streaminfo_t stream;
-      auto streams = dbus.pipewire_streams;
+      auto streams = *portal_streams;
       if (streams.empty()) {
         BOOST_LOG(error) << "[portalgrab] No streams found on portal. portal_t setup failed.";
         return -1;
@@ -1151,22 +1477,31 @@ namespace portal {
       // Fall back to first stream if we cannot match the given display_name to a stream in currently available streams.
       if (use_fallback) {
         BOOST_LOG(info) << "[portalgrab] Using first available stream as no matching stream was found for: '"sv << display_name << "'";
-        stream = dbus.pipewire_streams.at(0);
+        stream = streams.at(0);
+      }
+
+      if (shared) {
+        stream_fd = shared->open_pipewire_remote();
+        if (stream_fd < 0) {
+          BOOST_LOG(error) << "[portalgrab] Could not open a PipeWire remote on the shared portal session. portal_t setup failed.";
+          return -1;
+        }
       }
 
       // Restore global maxframerate negotiation state
       pipewire.set_negotiate_maxframerate(negotiate_maxframerate.load());
 
       // Return values for pipewire init
-      out_pipewire_fd = dbus.pipewire_fd;
+      out_pipewire_fd = stream_fd;
       out_pipewire_node = stream.pipewire_node;
       out_pipewire_object_serial = stream.pipewire_object_serial;
       // Set/update basic stream parameters on display_t
       this->output_name = stream.monitor_name;
       this->offset_x = stream.pos_x;
       this->offset_y = stream.pos_y;
-      this->width = stream.width;
-      this->height = stream.height;
+      // Mutter creates the virtual monitor only after the PipeWire consumer negotiates its format.
+      this->width = stream.virtual_display && stream.width <= 0 ? preferred_virtual_width : stream.width;
+      this->height = stream.virtual_display && stream.height <= 0 ? preferred_virtual_height : stream.height;
       this->logical_width = 0;  // Explicitly mark for pipewire_display_t to try to figure this out.
       this->logical_height = 0;  // Explicitly Mark for pipewire_display_t to try to figure this out.
       // Flag successful setup
@@ -1181,7 +1516,7 @@ namespace portal {
      */
     bool check_stream_dead(platf::capture_e &out_status) override {
       // If the pipewire stream stopped due to closed portal session stop the capture with an error
-      if (dbus.is_session_closed()) {
+      if (shared ? shared->is_closed() : dbus.is_session_closed()) {
         BOOST_LOG(warning) << "[portalgrab] PipeWire stream stopped by closed portal session."sv;
         pipewire.frame_cv().notify_all();
         out_status = platf::capture_e::capture_error;
@@ -1198,8 +1533,12 @@ namespace portal {
       return false;  // Return to default stream dead handling
     }
 
+    const int preferred_virtual_width;  ///< Requested width before PipeWire reports the actual virtual width.
+    const int preferred_virtual_height;  ///< Requested height before PipeWire reports the actual virtual height.
+
     // DBus portal connection
-    dbus_t dbus;  ///< DBus connection used for portal screencast requests.
+    dbus_t dbus;  ///< DBus connection used for portal screencast requests when the session is not shared.
+    std::shared_ptr<shared_session_t> shared;  ///< Lease on the shared session when the clipboard feature is enabled.
 
     // Class variable to store runtime state of maxFramerate negotiation
     static inline std::atomic negotiate_maxframerate {true};  ///< Whether portal negotiation should request the maximum frame rate.
@@ -1258,7 +1597,7 @@ namespace platf {
       return nullptr;
     }
 
-    auto portal = std::make_shared<portal::portal_t>();
+    auto portal = std::make_shared<portal::portal_t>(config.width, config.height);
     if (portal->init(hwdevice_type, display_name, config)) {
       return nullptr;
     }
@@ -1274,7 +1613,20 @@ namespace platf {
    */
   std::vector<std::string> portal_display_names(bool allow_start_timeout) {
     std::vector<std::string> display_names;
+
+    // Reuse an open shared session instead of starting another one next to it
+    if (portal::clipboard_requested()) {
+      if (const auto shared = portal::live_shared_session()) {
+        for (auto stream_ : shared->dbus.pipewire_streams) {
+          display_names.emplace_back(stream_.to_display_name());
+        }
+        return display_names;
+      }
+    }
+
     auto dbus = std::make_shared<portal::dbus_t>();
+    // Token negotiation happens here (xdg_worker), so the consent must cover the clipboard too
+    dbus->request_clipboard = portal::clipboard_requested();
 
     if (dbus->init() < 0) {
       BOOST_LOG(warning) << "[portalgrab] Failed to connect to dbus. Cannot enumerate displays, returning empty list.";

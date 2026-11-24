@@ -50,7 +50,7 @@ endif()
 #WebUI build
 find_program(NPM npm REQUIRED)
 
-if(WIN32)
+if(CMAKE_HOST_WIN32)
     get_filename_component(NPM_DIRECTORY "${NPM}" DIRECTORY)
     find_program(NPM_NODE_EXECUTABLE NAMES node node.exe HINTS "${NPM_DIRECTORY}" NO_DEFAULT_PATH NO_CACHE REQUIRED)
     string(CONCAT NPM_NODE_GNU_BINDING_CHECK

@@ -8,6 +8,7 @@
 #include "../tests_log_checker.h"
 
 // standard includes
+#include <cstdlib>
 #include <filesystem>
 #include <format>
 #include <fstream>
@@ -53,6 +54,30 @@ namespace {
     return {std::istreambuf_iterator<char> {input}, std::istreambuf_iterator<char> {}};
   }
 }  // namespace
+
+#if GTEST_HAS_DEATH_TEST
+/** @brief Lets GoogleTest own stderr while the test process re-executes. */
+class LoggingDeathTest: public BaseTest {
+protected:
+  [[nodiscard]] bool isOutputSuppressed() const override {
+    return false;
+  }
+};
+
+TEST_F(LoggingDeathTest, ReexecutedChildLeavesTheParentLogInPlace) {
+  GTEST_FLAG_SET(death_test_style, "threadsafe");
+  constexpr auto before = "parent log before the death test";
+  constexpr auto after = "parent log after the death test";
+  BOOST_LOG(info) << before;
+  EXPECT_TRUE(log_checker::line_contains(log_file, before));
+
+  ASSERT_EXIT(std::_Exit(0), testing::ExitedWithCode(0), "");
+
+  BOOST_LOG(info) << after;
+  EXPECT_TRUE(log_checker::line_contains(log_file, before));
+  EXPECT_TRUE(log_checker::line_contains(log_file, after));
+}
+#endif
 
 /**
  * @brief Test fixture for startup log rotation.

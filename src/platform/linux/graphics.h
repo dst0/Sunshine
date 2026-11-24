@@ -691,6 +691,26 @@ namespace egl {
      */
     static std::optional<sws_t> make(int in_width, int in_height, int out_width, int out_height, AVPixelFormat format, bool is_yuv444);
 
+    /**
+     * @brief Create a pipeline that packs 8-bit RGB into Layout A1 YCoCg-R P010.
+     *
+     * @param in_width Source captured frame width in pixels.
+     * @param in_height Source captured frame height in pixels.
+     * @param logical_width Logical desktop width in pixels.
+     * @param logical_height Logical desktop height in pixels.
+     * @param enc_width Coded Layout A1 frame width in pixels.
+     * @param enc_height Coded Layout A1 frame height in pixels.
+     * @return Constructed packed YCoCg-R pipeline, or std::nullopt on failure.
+     */
+    static std::optional<sws_t> make_ycocgr_p010(
+      int in_width,
+      int in_height,
+      int logical_width,
+      int logical_height,
+      int enc_width,
+      int enc_height
+    );
+
     // Convert the loaded image into the first two framebuffers
     /**
      * @brief Convert the loaded source image into NV12 output planes.
@@ -699,6 +719,14 @@ namespace egl {
      * @return Conversion status.
      */
     int convert_nv12(gl::frame_buf_t &fb);
+
+    /**
+     * @brief Convert and pack the loaded source image into Layout A1 YCoCg-R P010 planes.
+     *
+     * @param fb Framebuffer object to bind or update.
+     * @return Conversion status.
+     */
+    int convert_ycocgr_p010(gl::frame_buf_t &fb);
 
     // Convert the loaded image into the first three framebuffers
     /**
@@ -779,6 +807,9 @@ namespace egl {
     int in_height;  ///< In height.
     int offsetX;  ///< Offset x.
     int offsetY;  ///< Offset y.
+    bool packed_ycocgr {false};  ///< Whether this pipeline packs RGB into Layout A1 YCoCg-R P010.
+    int logical_width {0};  ///< Logical desktop width for packed YCoCg-R mode.
+    int logical_height {0};  ///< Logical desktop height for packed YCoCg-R mode.
 
     // Pointer to the texture to be converted to nv12
     int loaded_texture;  ///< Loaded texture.

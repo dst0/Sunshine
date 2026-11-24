@@ -27,7 +27,7 @@
 	branch = master
 [submodule "third-party/moonlight-common-c"]
 	path = third-party/moonlight-common-c
-	url = https://github.com/moonlight-stream/moonlight-common-c.git
+	url = https://github.com/dst0/moonlight-common-c.git
 	branch = master
 [submodule "third-party/nvapi"]
 	path = third-party/nvapi
@@ -36,10 +36,6 @@
 [submodule "third-party/plasma-wayland-protocols"]
 	path = third-party/plasma-wayland-protocols
 	url = https://github.com/KDE/plasma-wayland-protocols.git
-	branch = master
-[submodule "third-party/Simple-Web-Server"]
-	path = third-party/Simple-Web-Server
-	url = https://github.com/LizardByte-infrastructure/Simple-Web-Server.git
 	branch = master
 [submodule "third-party/TPCircularBuffer"]
 	path = third-party/TPCircularBuffer

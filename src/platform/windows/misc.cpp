@@ -1907,4 +1907,24 @@ namespace platf {
   std::string resolve_render_device() {
     return {};
   }
+
+  std::vector<render_adapter_t> enumerate_render_adapters() {
+    return {};
+  }
+
+  void set_session_render_device_override(std::optional<std::string>) {}
+
+  std::optional<std::string> validate_render_adapter_id(std::string_view) {
+    return std::nullopt;
+  }
+
+  void set_session_capture_adapter_override(std::optional<std::string>) {}
+
+  bool is_session_capture_adapter_overridden() {
+    return false;
+  }
+
+  std::optional<render_adapter_t> resolve_capture_adapter() {
+    return std::nullopt;
+  }
 }  // namespace platf

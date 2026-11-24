@@ -7,6 +7,7 @@
 // standard includes
 #include <bitset>
 #include <chrono>
+#include <cstdint>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -403,6 +404,7 @@ namespace config {
     std::string log_file;  ///< Path to the configured log file.
     bool notify_pre_releases;  ///< Notify users about pre-release updates.
     bool system_tray;  ///< Enable the system tray integration.
+    bool mdns_advertise;  ///< Advertise the host on the local network with mDNS.
     std::vector<prep_cmd_t> prep_cmds;  ///< Preparation commands executed around application launch.
 
     // List of allowed origins for CSRF protection (e.g., "https://example.com,https://app.example.com")
@@ -410,12 +412,45 @@ namespace config {
     std::vector<std::string> csrf_allowed_origins;  ///< Additional origins allowed by CSRF validation.
   };
 
+  /**
+   * @brief Secure-desktop-stream clipboard, file-transfer and microphone settings (DESIGN 4.3).
+   */
+  struct sds_t {
+    bool clipboard;  ///< Global switch for the shared clipboard.
+    bool file_transfer;  ///< Global switch for file transfer.
+    bool file_clipboard;  ///< Global switch for native file clipboard sync.
+    bool mic_passthrough;  ///< Global switch for microphone passthrough.
+    std::size_t clipboard_text_max;  ///< Maximum clipboard text in UTF-8 bytes.
+    std::size_t clipboard_image_max;  ///< Maximum clipboard PNG in bytes.
+    int clipboard_rate;  ///< Clipboard requests per second per client, both directions.
+    std::uint64_t file_max;  ///< Maximum size of one transferred file.
+    std::size_t file_chunk_max;  ///< Maximum upload chunk and download range in bytes.
+    int file_uploads_max_concurrent;  ///< Open upload sessions per client.
+    std::uint64_t file_min_free_space;  ///< Uploads must leave at least this many free bytes.
+    std::chrono::seconds file_upload_idle_timeout;  ///< Idle upload sessions are discarded after this.
+    std::string file_inbox_dir;  ///< Inbox directory; empty means the user's Downloads/Moonlight.
+    std::string file_outbox_dir;  ///< Outbox directory; empty means the inbox's Outbox subdirectory.
+    std::vector<std::string> default_permissions;  ///< Permissions granted to newly paired clients.
+    std::string mic_device;  ///< Windows render endpoint feeding the virtual microphone.
+  };
+
+  /**
+   * @brief Parse a byte size such as `4194304`, `4M`, `4MiB` or `1 GiB`.
+   *
+   * Suffixes are binary (K, M, G, T with optional `iB`/`B`), case-insensitive.
+   *
+   * @param text Configuration value.
+   * @return Byte count, or no value when malformed or overflowing.
+   */
+  std::optional<std::uint64_t> parse_byte_size(std::string_view text);
+
   extern video_t video;
   extern audio_t audio;
   extern stream_t stream;
   extern nvhttp_t nvhttp;
   extern input_t input;
   extern sunshine_t sunshine;
+  extern sds_t sds;
 
 #ifdef SUNSHINE_TESTS
   /**

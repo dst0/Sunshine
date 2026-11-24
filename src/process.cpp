@@ -212,9 +212,38 @@ namespace proc {
     return true;
   }
 
+  void apply_capture_gpu_env(boost::process::v1::environment &env, const std::optional<platf::render_adapter_t> &adapter) {
+    if (!adapter || adapter->id.empty()) {
+      return;
+    }
+    env["SUNSHINE_CAPTURE_ADAPTER"] = adapter->id;
+    if (adapter->pci_slot.empty()) {
+      return;
+    }
+    env["SUNSHINE_CAPTURE_PCI"] = adapter->pci_slot;
+    if (adapter->vendor_id == "10de") {
+      env["__NV_PRIME_RENDER_OFFLOAD"] = "1";
+      env["__GLX_VENDOR_LIBRARY_NAME"] = "nvidia";
+      env["__VK_LAYER_NV_optimus"] = "NVIDIA_only";
+      return;
+    }
+
+    std::string dri_prime = "pci-" + adapter->pci_slot;
+    std::replace(dri_prime.begin(), dri_prime.end(), ':', '_');
+    std::replace(dri_prime.begin(), dri_prime.end(), '.', '_');
+    env["DRI_PRIME"] = std::move(dri_prime);
+
+    if (!adapter->vendor_id.empty() && !adapter->device_id.empty()) {
+      const std::string vk_sel = adapter->vendor_id + ':' + adapter->device_id + '!';
+      env["MESA_VK_DEVICE_SELECT"] = vk_sel;
+      env["SUNSHINE_CAPTURE_VK_DEVICE"] = vk_sel;
+    }
+  }
+
   int proc_t::execute(int app_id, std::shared_ptr<rtsp_stream::launch_session_t> launch_session) {
     // Ensure starting from a clean slate
     terminate();
+    _env = _base_env;
 
     auto iter = std::find_if(_apps.begin(), _apps.end(), [&app_id](const auto app) {
       return app.id == std::to_string(app_id);
@@ -254,6 +283,9 @@ namespace proc {
         break;
     }
     _env["SUNSHINE_CLIENT_AUDIO_SURROUND_PARAMS"] = launch_session->surround_params;
+    if (platf::is_session_capture_adapter_overridden()) {
+      apply_capture_gpu_env(_env, platf::resolve_capture_adapter());
+    }
 
     if (!_app.output.empty() && _app.output != "null"sv) {
 #ifdef _WIN32
@@ -445,11 +477,19 @@ namespace proc {
   }
 
   void proc_t::update_apps_and_env(proc_t &&other) {
+    _base_env = other._base_env;
     if (_app_id > 0 || placebo) {
       // Preserve session-specific environment variables for the running app
       for (const auto &var : _env) {
         std::string name = var.get_name();
-        if (name.find("SUNSHINE_APP_") == 0 || name.find("SUNSHINE_CLIENT_") == 0) {
+        if (name.find("SUNSHINE_APP_") == 0 ||
+            name.find("SUNSHINE_CLIENT_") == 0 ||
+            name.find("SUNSHINE_CAPTURE_") == 0 ||
+            name == "DRI_PRIME" ||
+            name == "MESA_VK_DEVICE_SELECT" ||
+            name == "__NV_PRIME_RENDER_OFFLOAD" ||
+            name == "__GLX_VENDOR_LIBRARY_NAME" ||
+            name == "__VK_LAYER_NV_optimus") {
           other._env[name] = var.to_string();
         }
       }

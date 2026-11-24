@@ -88,26 +88,66 @@ namespace nvhttp {
   void setup(const std::string &pkey, const std::string &cert);
 
   /**
+   * @brief Maximum request size accepted by the plain HTTP GameStream server.
+   * @details The plain HTTP server only serves small GET requests (`/serverinfo`, `/pair`), so
+   *          anything larger is rejected before it is buffered.
+   */
+  constexpr std::size_t HTTP_MAX_REQUEST_SIZE = 64 * 1024;
+
+  /**
+   * @brief Largest request body a single HTTPS request is expected to carry (file chunk size).
+   */
+  constexpr std::size_t HTTPS_MAX_CHUNK_SIZE = 4 * 1024 * 1024;
+
+  /**
+   * @brief Maximum request size accepted by the HTTPS GameStream server.
+   * @details Shared limit for request headers and body (`file_chunk_max + 64 KiB`). Larger requests
+   *          are rejected before their body is buffered.
+   */
+  constexpr std::size_t HTTPS_MAX_REQUEST_SIZE = HTTPS_MAX_CHUNK_SIZE + 64 * 1024;
+
+  /**
+   * @brief Paired client identity verified during the TLS handshake of one HTTPS connection.
+   */
+  struct verified_client_t {
+    std::string cert;  ///< PEM certificate presented by the client.
+    std::string name;  ///< Friendly name stored when the client was paired.
+  };
+
+  /**
    * @brief Simple-Web-Server HTTPS backend configured for Sunshine certificate handling.
+   *
+   * Each connection remembers the paired client verified during its own TLS handshake, so that
+   * requests can be attributed to the certificate of the connection they arrived on.
    */
   class SunshineHTTPS: public SimpleWeb::HTTPS {
   public:
-    /**
-     * @brief Construct an HTTPS connection using Sunshine's TLS context.
-     *
-     * @param io_context Boost.Asio context used for network operations.
-     * @param ctx TLS context configured with Sunshine's certificate and key.
-     */
-    SunshineHTTPS(boost::asio::io_context &io_context, boost::asio::ssl::context &ctx):
-        SimpleWeb::HTTPS(io_context, ctx) {
-    }
-
-    virtual ~SunshineHTTPS() {
-      // Gracefully shutdown the TLS connection
-      SimpleWeb::error_code ec;
-      shutdown(ec);
-    }
+    SunshineHTTPS() = default;
+    SunshineHTTPS(const SunshineHTTPS &) = delete;
+    SunshineHTTPS &operator=(const SunshineHTTPS &) = delete;
+    ~SunshineHTTPS() = default;
   };
+
+  /**
+   * @brief Shared HTTPS request object received by GameStream handlers.
+   */
+  using req_https_t = std::shared_ptr<typename SimpleWeb::ServerBase<SunshineHTTPS>::Request>;
+
+  /**
+   * @brief Look up the paired client verified on the connection that carried a request.
+   *
+   * @param request HTTPS request received by the GameStream server.
+   * @return Verified client identity, or no value when the connection was not verified or is gone.
+   */
+  std::optional<verified_client_t> verified_client(const req_https_t &request);
+
+  /**
+   * @brief Look up the PEM certificate verified on the connection that carried a request.
+   *
+   * @param request HTTPS request received by the GameStream server.
+   * @return PEM certificate, or no value when the connection was not verified or is gone.
+   */
+  std::optional<std::string> verified_client_cert(const req_https_t &request);
 
   /**
    * @brief Enumerates supported pAIR PHASE options.
@@ -373,6 +413,41 @@ namespace nvhttp {
   nlohmann::json get_all_clients();
 
   /**
+   * @brief Snapshot the PEM certificates of all paired clients.
+   *
+   * @return Vector of stored client certificates.
+   */
+  std::vector<std::string> get_all_client_certs();
+
+  /**
+   * @brief Paired-client identity used by the secure-desktop-stream endpoints.
+   */
+  struct client_info_t {
+    std::string uuid;  ///< Persistent client UUID.
+    std::string name;  ///< Friendly client name.
+    std::vector<std::string> permissions;  ///< Granted permissions (canonical names).
+  };
+
+  /**
+   * @brief Find the single enabled paired client with exactly this canonical certificate.
+   *
+   * @param cert_pem Canonical PEM certificate.
+   * @return Client, or no value when unknown, disabled or ambiguous.
+   */
+  std::optional<client_info_t> find_enabled_client(std::string_view cert_pem);
+
+  /**
+   * @brief Replace a client's secure-desktop-stream permissions and persist them.
+   *
+   * Unknown names are dropped; the list is stored in canonical order.
+   *
+   * @param uuid Client UUID.
+   * @param permissions Permission names.
+   * @return `true` when the client exists.
+   */
+  bool set_client_permissions(std::string_view uuid, const std::vector<std::string> &permissions);
+
+  /**
    * @brief Remove all paired clients.
    * @examples
    * nvhttp::erase_all_clients();
@@ -398,13 +473,124 @@ namespace nvhttp {
      * @param certificate_file Path to the server certificate PEM file.
      * @param private_key_file Path to the matching private key PEM file.
      * @param handler_scope Receives the scope runner that prevents destruction during callbacks.
+     * @param verify_paired_clients Install the production paired-client certificate verification.
      * @return HTTPS server ready for test endpoint configuration.
      */
     std::unique_ptr<SimpleWeb::ServerBase<SunshineHTTPS>> make_https_server(
       const std::string &certificate_file,
       const std::string &private_key_file,
+      std::shared_ptr<SimpleWeb::ScopeRunner> &handler_scope,
+      bool verify_paired_clients = false
+    );
+
+    /**
+     * @brief Create the production HTTPS server with paired-client certificate verification enabled.
+     *
+     * The verify callback applies the same acceptance rule as the one installed by start().
+     *
+     * @param certificate_file Path to the server certificate PEM file.
+     * @param private_key_file Path to the matching private key PEM file.
+     * @param handler_scope Receives the scope runner that prevents destruction during callbacks.
+     * @return HTTPS server ready for test endpoint configuration.
+     */
+    std::unique_ptr<SimpleWeb::ServerBase<SunshineHTTPS>> make_verifying_https_server(
+      const std::string &certificate_file,
+      const std::string &private_key_file,
       std::shared_ptr<SimpleWeb::ScopeRunner> &handler_scope
     );
+
+    /**
+     * @brief Dispatch an HTTPS server-info request through the production handler.
+     *
+     * @param response HTTPS response object to populate.
+     * @param request HTTPS request data from the test client.
+     */
+    void serverinfo_https(
+      std::shared_ptr<typename SimpleWeb::ServerBase<SunshineHTTPS>::Response> response,
+      std::shared_ptr<typename SimpleWeb::ServerBase<SunshineHTTPS>::Request> request
+    );
+
+    /**
+     * @brief Dispatch an HTTPS application-list request through the production handler.
+     *
+     * @param response HTTPS response object to populate.
+     * @param request HTTPS request data from the test client.
+     */
+    void applist_https(
+      std::shared_ptr<typename SimpleWeb::ServerBase<SunshineHTTPS>::Response> response,
+      std::shared_ptr<typename SimpleWeb::ServerBase<SunshineHTTPS>::Request> request
+    );
+
+    /**
+     * @brief Dispatch an HTTPS application-asset request through the production handler.
+     *
+     * @param response HTTPS response object to populate.
+     * @param request HTTPS request data from the test client.
+     */
+    void appasset_https(
+      std::shared_ptr<typename SimpleWeb::ServerBase<SunshineHTTPS>::Response> response,
+      std::shared_ptr<typename SimpleWeb::ServerBase<SunshineHTTPS>::Request> request
+    );
+
+    /**
+     * @brief Dispatch an HTTPS cancel request through the production handler.
+     *
+     * @param response HTTPS response object to populate.
+     * @param request HTTPS request data from the test client.
+     */
+    void cancel_https(
+      std::shared_ptr<typename SimpleWeb::ServerBase<SunshineHTTPS>::Response> response,
+      std::shared_ptr<typename SimpleWeb::ServerBase<SunshineHTTPS>::Request> request
+    );
+
+    /**
+     * @brief Dispatch an HTTPS pairing request through the production handler.
+     *
+     * @param response HTTPS response object to populate.
+     * @param request HTTPS request data from the test client.
+     */
+    void pair_https(
+      std::shared_ptr<typename SimpleWeb::ServerBase<SunshineHTTPS>::Response> response,
+      std::shared_ptr<typename SimpleWeb::ServerBase<SunshineHTTPS>::Request> request
+    );
+
+    /**
+     * @brief Query whether a certificate belongs to an enabled paired client.
+     *
+     * @param cert_pem PEM-encoded client certificate.
+     * @return Pair of (enabled, friendly name).
+     */
+    std::pair<bool, std::string> get_client_status(std::string_view cert_pem);
+
+    /**
+     * @brief Validate a GameStream `surroundParams` query parameter.
+     *
+     * @param params Candidate parameter value.
+     * @return `true` when `params` matches `^[0-9]{1,16}$`.
+     */
+    bool is_valid_surround_params(std::string_view params);
+
+    /**
+     * @brief Sanitize a `surroundParams` value as @ref make_launch_session does.
+     *
+     * @param params Candidate parameter value.
+     * @return Validated value, or empty string when invalid.
+     */
+    std::string sanitize_surround_params(std::string_view params);
+
+    /**
+     * @brief Create the production plain HTTP server.
+     *
+     * @return HTTP server ready for test endpoint configuration.
+     */
+    std::unique_ptr<SimpleWeb::ServerBase<SimpleWeb::HTTP>> make_http_server();
+
+    /**
+     * @brief Count the live connections that currently have a verified client identity.
+     *
+     * @return Number of registry entries.
+     */
+    std::size_t verified_connection_count();
 
     /**
      * @brief Dispatch a plain-HTTP pairing request through the production handler.

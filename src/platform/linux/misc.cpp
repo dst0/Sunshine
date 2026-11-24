@@ -13,12 +13,16 @@
 #endif
 
 // standard includes
+#include <algorithm>
 #include <array>
+#include <cctype>
 #include <cerrno>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <mutex>
 #include <sstream>
 #include <utility>
 
@@ -59,6 +63,10 @@
 // local includes
 #include "graphics.h"
 #include "misc.h"
+#include "portal_session.h"
+#ifdef SUNSHINE_BUILD_X11
+  #include "x11_display_mode.h"
+#endif
 #include "src/compat/boost_process.h"
 #include "src/config.h"
 #include "src/entry_handler.h"
@@ -1286,8 +1294,12 @@ namespace platf {
         platf::restart();
         return false;
       case no_token:
-        BOOST_LOG(fatal) << "Portal capture is awaiting user permission. "sv
-                         << "The current session will attempt to use a fallback capture method."sv;
+        if (config::video.capture == "portal-virtual") {
+          BOOST_LOG(info) << "Portal virtual display is awaiting user permission."sv;
+        } else {
+          BOOST_LOG(fatal) << "Portal capture is awaiting user permission. "sv
+                           << "The current session will attempt to use a fallback capture method."sv;
+        }
         std::call_once(portal::xdg_worker_flag, []() {
           portal::xdg_worker = std::jthread([]() {
             try {
@@ -1471,9 +1483,9 @@ namespace platf {
     // When Portal is explicitly selected, probe it first so other capture methods can be considered for fallback capture.
 #ifdef SUNSHINE_BUILD_PORTAL
     bool portal_available = false;
-    if (selected_capture == "portal") {
+    if (selected_capture == "portal" || selected_capture == "portal-virtual") {
       portal_available = verify_portal();
-      if (!portal_available) {
+      if (!portal_available && selected_capture == "portal") {
         // Continue probing for fallback capture methods.
         selected_capture.clear();
       }
@@ -1510,18 +1522,9 @@ namespace platf {
     if (portal_available || (config::video.capture.empty() && sources.none() && verify_portal())) {
       sources[source::PORTAL] = true;
     }
+    // The clipboard backend factory uses this to choose the portal clipboard.
+    portal::set_capture_active(sources[source::PORTAL]);
 #endif
-
-    if (sources.none()) {
-      BOOST_LOG(error) << "Unable to initialize capture method"sv;
-      log_missing_graphical_session_hint();
-      return nullptr;
-    }
-
-    if (!gladLoaderLoadEGL(NULL)) {
-      BOOST_LOG(error) << "Failed to load EGL library symbols"sv;
-      return nullptr;
-    }
 
 #ifdef SUNSHINE_BUILD_PORTAL
     class deinit_t: public platf::deinit_t {
@@ -1543,7 +1546,23 @@ namespace platf {
         }
       }
     };
+
+    if (selected_capture == "portal-virtual" && sources.none() && portal::xdg_worker.joinable()) {
+      // Keep the permission worker tied to Sunshine's lifetime even without a fallback capture backend.
+      return std::make_unique<deinit_t>();
+    }
 #endif
+
+    if (sources.none()) {
+      BOOST_LOG(error) << "Unable to initialize capture method"sv;
+      log_missing_graphical_session_hint();
+      return nullptr;
+    }
+
+    if (!gladLoaderLoadEGL(NULL)) {
+      BOOST_LOG(error) << "Failed to load EGL library symbols"sv;
+      return nullptr;
+    }
 
     return std::make_unique<deinit_t>();
   }
@@ -1619,12 +1638,440 @@ namespace platf {
 #endif
   }
 
-  std::string resolve_render_device() {
-    if (!config::video.adapter_name.empty()) {
-      return config::video.adapter_name;
+  namespace {
+    std::mutex session_render_device_mutex;
+    std::optional<std::string> session_render_device_override;
+    std::mutex session_capture_adapter_mutex;
+    std::optional<std::string> session_capture_adapter_override;
+
+    std::string trim_ascii(std::string_view sv) {
+      while (!sv.empty() && std::isspace(static_cast<unsigned char>(sv.front()))) {
+        sv.remove_prefix(1);
+      }
+      while (!sv.empty() && std::isspace(static_cast<unsigned char>(sv.back()))) {
+        sv.remove_suffix(1);
+      }
+      return std::string {sv};
     }
-    auto detected = find_render_node_with_display();
-    return detected.empty() ? "/dev/dri/renderD128" : detected;
+
+    std::string lowercase_ascii(std::string_view sv) {
+      std::string out(sv);
+      std::transform(out.begin(), out.end(), out.begin(), [](unsigned char ch) {
+        return static_cast<char>(std::tolower(ch));
+      });
+      return out;
+    }
+
+    std::string normalize_hex_id(std::string_view sv) {
+      auto trimmed = lowercase_ascii(trim_ascii(sv));
+      if (trimmed.rfind("0x", 0) == 0) {
+        trimmed.erase(0, 2);
+      }
+      return trimmed;
+    }
+
+    std::string read_sysfs_line(const std::filesystem::path &path) {
+      std::ifstream file(path);
+      if (!file.is_open()) {
+        return {};
+      }
+      std::string line;
+      std::getline(file, line);
+      return trim_ascii(line);
+    }
+
+    std::string read_pci_slot_from_uevent(const std::filesystem::path &uevent_path) {
+      std::ifstream file(uevent_path);
+      if (!file.is_open()) {
+        return {};
+      }
+      std::string line;
+      while (std::getline(file, line)) {
+        constexpr std::string_view prefix = "PCI_SLOT_NAME=";
+        if (line.rfind(prefix, 0) == 0) {
+          return lowercase_ascii(trim_ascii(std::string_view {line}.substr(prefix.size())));
+        }
+      }
+      return {};
+    }
+
+    std::string read_connector_pci_slot(const std::filesystem::path &conn_dir) {
+      if (auto pci = read_pci_slot_from_uevent(conn_dir / "device" / "device" / "uevent"); !pci.empty()) {
+        return pci;
+      }
+      return read_pci_slot_from_uevent(conn_dir / "device" / "uevent");
+    }
+
+    std::string drm_connected_card_pci_slot() {
+      std::error_code ec;
+      const std::filesystem::path drm_dir {"/sys/class/drm"};
+      if (!std::filesystem::is_directory(drm_dir, ec)) {
+        return {};
+      }
+      std::vector<std::filesystem::path> connectors;
+      for (const auto &entry : std::filesystem::directory_iterator(drm_dir, ec)) {
+        if (ec) {
+          break;
+        }
+        const auto name = entry.path().filename().string();
+        if (name.starts_with("card") && name.find('-') != std::string::npos) {
+          connectors.push_back(entry.path());
+        }
+      }
+      std::sort(connectors.begin(), connectors.end());
+      for (const auto &conn : connectors) {
+        if (read_sysfs_line(conn / "status") == "connected") {
+          const auto pci = read_connector_pci_slot(conn);
+          if (!pci.empty()) {
+            return pci;
+          }
+        }
+      }
+      return {};
+    }
+
+    std::string host_default_capture_pci() {
+#ifdef SUNSHINE_BUILD_X11
+      if (auto x11_pci = platf::x11_mode::detect_active_display_pci(); !x11_pci.empty()) {
+        return x11_pci;
+      }
+#endif
+      return drm_connected_card_pci_slot();
+    }
+
+    std::string short_pci_slot(std::string_view full_slot) {
+      // Turn "0000:01:00.0" into "01:00.0" when a domain prefix is present.
+      if (auto first_colon = full_slot.find(':'); first_colon != std::string_view::npos) {
+        auto rest = full_slot.substr(first_colon + 1);
+        if (rest.find(':') != std::string_view::npos) {
+          return std::string {rest};
+        }
+      }
+      return std::string {full_slot};
+    }
+
+    std::string short_vendor_label(std::string_view vendor_hex, std::string_view pci_ids_vendor_name) {
+      if (vendor_hex == "1002") {
+        return "AMD";
+      }
+      if (vendor_hex == "8086") {
+        return "Intel";
+      }
+      if (vendor_hex == "10de") {
+        return "NVIDIA";
+      }
+      if (vendor_hex == "1af4") {
+        return "VirtIO";
+      }
+      if (!pci_ids_vendor_name.empty()) {
+        return std::string {pci_ids_vendor_name};
+      }
+      return vendor_hex.empty() ? "GPU" : "0x" + std::string {vendor_hex};
+    }
+
+    struct pci_lookup_result_t {
+      std::string vendor_name;
+      std::string device_name;
+    };
+
+    pci_lookup_result_t lookup_pci_names(std::string_view vendor_hex, std::string_view device_hex) {
+      if (vendor_hex.empty() || device_hex.empty()) {
+        return {};
+      }
+      static constexpr std::array<const char *, 2> pci_ids_paths {
+        "/usr/share/misc/pci.ids",
+        "/usr/share/hwdata/pci.ids",
+      };
+      std::ifstream file;
+      for (const char *candidate : pci_ids_paths) {
+        file.open(candidate);
+        if (file.is_open()) {
+          break;
+        }
+        file.clear();
+      }
+      if (!file.is_open()) {
+        return {};
+      }
+
+      pci_lookup_result_t result;
+      bool in_vendor = false;
+      std::string line;
+      while (std::getline(file, line)) {
+        if (line.empty() || line[0] == '#') {
+          continue;
+        }
+        if (line[0] != '\t') {
+          if (in_vendor) {
+            break;  // Left the matching vendor section.
+          }
+          if (line.size() > 6 && std::isxdigit(static_cast<unsigned char>(line[0]))) {
+            auto sep = line.find("  ");
+            if (sep != std::string::npos && normalize_hex_id(std::string_view {line}.substr(0, sep)) == vendor_hex) {
+              result.vendor_name = trim_ascii(std::string_view {line}.substr(sep + 2));
+              in_vendor = true;
+            }
+          }
+          continue;
+        }
+        if (!in_vendor || (line.size() > 1 && line[1] == '\t')) {
+          continue;  // Skip lines outside our vendor or subsystem lines ("\t\t").
+        }
+        std::string_view dev_line = std::string_view {line}.substr(1);
+        auto sep = dev_line.find("  ");
+        if (sep != std::string_view::npos && normalize_hex_id(dev_line.substr(0, sep)) == device_hex) {
+          auto raw_dev = trim_ascii(dev_line.substr(sep + 2));
+          // Prefer friendly marketing name in brackets, e.g. "GPU Series [Example GPU Model]".
+          auto lbr = raw_dev.find('[');
+          auto rbr = (lbr != std::string::npos) ? raw_dev.find(']', lbr + 1) : std::string::npos;
+          if (lbr != std::string::npos && rbr != std::string::npos && rbr > lbr + 1) {
+            result.device_name = trim_ascii(std::string_view {raw_dev}.substr(lbr + 1, rbr - lbr - 1));
+          } else {
+            result.device_name = raw_dev;
+          }
+          break;
+        }
+      }
+      return result;
+    }
+
+    std::filesystem::path canonical_or_self(const std::filesystem::path &path) {
+      std::error_code ec;
+      auto canon = std::filesystem::weakly_canonical(path, ec);
+      return ec ? path : canon;
+    }
+
+    std::string host_default_render_device() {
+      if (!config::video.adapter_name.empty()) {
+        return config::video.adapter_name;
+      }
+      auto detected = find_render_node_with_display();
+      return detected.empty() ? "/dev/dri/renderD128" : detected;
+    }
+  }  // namespace
+
+  std::string resolve_render_device() {
+    {
+      std::lock_guard lock(session_render_device_mutex);
+      if (session_render_device_override && !session_render_device_override->empty()) {
+        return *session_render_device_override;
+      }
+    }
+    return host_default_render_device();
+  }
+
+  void set_session_render_device_override(std::optional<std::string> device) {
+    std::lock_guard lock(session_render_device_mutex);
+    if (device && !device->empty()) {
+      session_render_device_override = std::move(device);
+    } else {
+      session_render_device_override.reset();
+    }
+  }
+
+  std::vector<render_adapter_t> enumerate_render_adapters() {
+    std::vector<std::filesystem::path> candidate_paths;
+    std::error_code ec;
+
+    const std::filesystem::path by_path_dir {"/dev/dri/by-path"};
+    if (std::filesystem::is_directory(by_path_dir, ec)) {
+      for (const auto &entry : std::filesystem::directory_iterator(by_path_dir, ec)) {
+        if (ec) {
+          break;
+        }
+        const auto name = entry.path().filename().string();
+        if (name.starts_with("pci-") && name.ends_with("-render")) {
+          candidate_paths.push_back(entry.path());
+        }
+      }
+    }
+
+    if (candidate_paths.empty()) {
+      const std::filesystem::path dri_dir {"/dev/dri"};
+      if (std::filesystem::is_directory(dri_dir, ec)) {
+        for (const auto &entry : std::filesystem::directory_iterator(dri_dir, ec)) {
+          if (ec) {
+            break;
+          }
+          const auto name = entry.path().filename().string();
+          if (name.starts_with("renderD")) {
+            candidate_paths.push_back(entry.path());
+          }
+        }
+      }
+    }
+
+    std::sort(candidate_paths.begin(), candidate_paths.end(), [](const auto &a, const auto &b) {
+      return a.string() < b.string();
+    });
+
+    const auto default_canon = canonical_or_self(host_default_render_device());
+    const auto active_capture_pci = host_default_capture_pci();
+    std::vector<render_adapter_t> adapters;
+    adapters.reserve(candidate_paths.size());
+    bool marked_default = false;
+    bool marked_capture_default = false;
+
+    for (const auto &path : candidate_paths) {
+      const auto canon_node = canonical_or_self(path);
+      const auto node_name = canon_node.filename().string();
+      if (!node_name.starts_with("renderD")) {
+        continue;
+      }
+
+      const auto sys_device_dir = std::filesystem::path {"/sys/class/drm"} / node_name / "device";
+      const auto vendor_hex = normalize_hex_id(read_sysfs_line(sys_device_dir / "vendor"));
+      const auto device_hex = normalize_hex_id(read_sysfs_line(sys_device_dir / "device"));
+      const auto full_slot = read_pci_slot_from_uevent(sys_device_dir / "uevent");
+      const auto slot = short_pci_slot(full_slot);
+
+      const auto pci_names = lookup_pci_names(vendor_hex, device_hex);
+      const auto vendor = short_vendor_label(vendor_hex, pci_names.vendor_name);
+
+      std::string display_name = vendor;
+      if (!pci_names.device_name.empty()) {
+        display_name += ' ';
+        display_name += pci_names.device_name;
+      } else if (!vendor_hex.empty() && !device_hex.empty()) {
+        display_name += " GPU [" + vendor_hex + ':' + device_hex + ']';
+      } else {
+        display_name += " (" + node_name + ')';
+      }
+      if (!slot.empty()) {
+        display_name += " (" + slot + ')';
+      }
+
+      const bool is_default = !marked_default && (canon_node == default_canon);
+      if (is_default) {
+        marked_default = true;
+      }
+      const bool is_capture_default = !marked_capture_default && !full_slot.empty() && (full_slot == active_capture_pci);
+      if (is_capture_default) {
+        marked_capture_default = true;
+      }
+
+      adapters.push_back(render_adapter_t {
+        .id = path.string(),
+        .name = std::move(display_name),
+        .vendor = vendor,
+        .is_default = is_default,
+        .pci_slot = full_slot,
+        .vendor_id = vendor_hex,
+        .device_id = device_hex,
+        .is_capture_default = is_capture_default,
+      });
+    }
+
+    return adapters;
+  }
+
+  std::optional<std::string> validate_render_adapter_id(std::string_view adapter_id) {
+    if (adapter_id.empty()) {
+      return std::nullopt;
+    }
+    for (const auto &adapter : enumerate_render_adapters()) {
+      if (adapter.id == adapter_id) {
+        return adapter.id;
+      }
+    }
+    return std::nullopt;
+  }
+
+  std::string drm_node_pci_slot(std::string_view drm_node_name) {
+    if (
+      drm_node_name.empty() ||
+      drm_node_name == "." ||
+      drm_node_name == ".." ||
+      drm_node_name.find('/') != std::string_view::npos ||
+      drm_node_name.find('\\') != std::string_view::npos ||
+      drm_node_name.find('\0') != std::string_view::npos
+    ) {
+      return {};
+    }
+    return read_pci_slot_from_uevent(std::filesystem::path {"/sys/class/drm"} / drm_node_name / "device" / "uevent");
+  }
+
+  std::string drm_connector_id_pci_slot(unsigned long connector_id) {
+    if (connector_id == 0) {
+      return {};
+    }
+    std::error_code ec;
+    const std::filesystem::path drm_dir {"/sys/class/drm"};
+    if (!std::filesystem::is_directory(drm_dir, ec)) {
+      return {};
+    }
+    const std::string target_id = std::to_string(connector_id);
+    for (const auto &entry : std::filesystem::directory_iterator(drm_dir, ec)) {
+      if (ec) {
+        break;
+      }
+      const auto name = entry.path().filename().string();
+      if (!name.starts_with("card") || name.find('-') == std::string::npos) {
+        continue;
+      }
+      if (read_sysfs_line(entry.path() / "connector_id") == target_id) {
+        return read_connector_pci_slot(entry.path());
+      }
+    }
+    return {};
+  }
+
+  void set_session_capture_adapter_override(std::optional<std::string> device) {
+    std::lock_guard lock(session_capture_adapter_mutex);
+    if (device && !device->empty()) {
+      session_capture_adapter_override = std::move(device);
+    } else {
+      session_capture_adapter_override.reset();
+    }
+  }
+
+  bool is_session_capture_adapter_overridden() {
+    std::lock_guard lock(session_capture_adapter_mutex);
+    return session_capture_adapter_override && !session_capture_adapter_override->empty();
+  }
+
+  std::optional<render_adapter_t> resolve_capture_adapter() {
+    std::optional<std::string> override_id;
+    {
+      std::lock_guard lock(session_capture_adapter_mutex);
+      override_id = session_capture_adapter_override;
+    }
+
+    const auto adapters = enumerate_render_adapters();
+    if (override_id && !override_id->empty()) {
+      const auto target_canon = canonical_or_self(*override_id);
+      for (const auto &adapter : adapters) {
+        if (adapter.id == *override_id || canonical_or_self(adapter.id) == target_canon) {
+          return adapter;
+        }
+      }
+      // Fallback metadata when explicit path is injected in synthetic/test environments.
+      const auto canon_node = canonical_or_self(*override_id);
+      const auto node_name = canon_node.filename().string();
+      render_adapter_t synthetic;
+      synthetic.id = *override_id;
+      if (node_name.starts_with("renderD")) {
+        const auto sys_device_dir = std::filesystem::path {"/sys/class/drm"} / node_name / "device";
+        synthetic.pci_slot = read_pci_slot_from_uevent(sys_device_dir / "uevent");
+        synthetic.vendor_id = normalize_hex_id(read_sysfs_line(sys_device_dir / "vendor"));
+        synthetic.device_id = normalize_hex_id(read_sysfs_line(sys_device_dir / "device"));
+      }
+      if (synthetic.pci_slot.empty()) {
+        // Parse "/dev/dri/by-path/pci-0000:01:00.0-render" when sysfs node is absent.
+        const auto fname = canon_node.filename().string();
+        if (fname.starts_with("pci-") && fname.ends_with("-render") && fname.size() == 23) {
+          synthetic.pci_slot = lowercase_ascii(std::string_view {fname}.substr(4, 12));
+        }
+      }
+      return synthetic;
+    }
+
+    for (const auto &adapter : adapters) {
+      if (adapter.is_capture_default) {
+        return adapter;
+      }
+    }
+    return std::nullopt;
   }
 
 #if !defined(__FreeBSD__)

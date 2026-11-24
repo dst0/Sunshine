@@ -6,8 +6,10 @@
 
 // standard includes
 #include <array>
+#include <utility>
 
 // lib includes
+#include <openssl/crypto.h>
 #include <openssl/evp.h>
 #include <openssl/rand.h>
 #include <openssl/sha.h>
@@ -223,12 +225,68 @@ namespace crypto {
      */
     class cipher_t {
     public:
+      cipher_t() = default;
+
+      /**
+       * @brief Construct a cipher context pair with key material and padding mode.
+       *
+       * @param decrypt Decryption context.
+       * @param encrypt Encryption context.
+       * @param key_material AES key bytes.
+       * @param use_padding Whether block padding is enabled.
+       */
+      cipher_t(cipher_ctx_t decrypt, cipher_ctx_t encrypt, aes_t key_material, bool use_padding):
+          decrypt_ctx {std::move(decrypt)},
+          encrypt_ctx {std::move(encrypt)},
+          key {std::move(key_material)},
+          padding {use_padding} {
+      }
+
+      /**
+       * @brief Move-construct a cipher context pair.
+       */
+      cipher_t(cipher_t &&) noexcept = default;
+
+      /**
+       * @brief Move-assign a cipher context pair after cleansing any previous key material.
+       *
+       * @param other Source cipher state.
+       * @return This cipher.
+       */
+      cipher_t &operator=(cipher_t &&other) noexcept {
+        if (this != &other) {
+          cleanse_key();
+          decrypt_ctx = std::move(other.decrypt_ctx);
+          encrypt_ctx = std::move(other.encrypt_ctx);
+          key = std::move(other.key);
+          padding = other.padding;
+        }
+        return *this;
+      }
+
+      /**
+       * @brief Cleanse any retained AES key material on destruction.
+       */
+      ~cipher_t() {
+        cleanse_key();
+      }
+
+      /**
+       * @brief Zero and clear any retained AES key material.
+       */
+      void cleanse_key() noexcept {
+        if (!key.empty()) {
+          OPENSSL_cleanse(key.data(), key.size());
+          key.clear();
+        }
+      }
+
       cipher_ctx_t decrypt_ctx;  ///< Decrypt ctx.
       cipher_ctx_t encrypt_ctx;  ///< Encrypt ctx.
 
       aes_t key;  ///< AES key used by the cipher context.
 
-      bool padding;  ///< Enables block padding for the cipher.
+      bool padding {};  ///< Enables block padding for the cipher.
     };
 
     /**
@@ -328,6 +386,27 @@ namespace crypto {
        * @return Number of bytes written, signature bytes, or an error status depending on the overload.
        */
       int decrypt(const std::string_view &cipher, std::vector<std::uint8_t> &plaintext, aes_t *iv);
+
+      /**
+       * @brief Encrypt with additional authenticated data (AAD) that is authenticated but not encrypted.
+       * @param plaintext The plaintext data to be encrypted.
+       * @param tag The buffer where the 16-byte GCM tag will be written.
+       * @param ciphertext The buffer where the ciphertext (same length as the plaintext) will be written.
+       * @param iv The initialization vector to be used for the encryption.
+       * @param aad Additional authenticated data.
+       * @return The ciphertext length, or -1 in case of an error.
+       */
+      int encrypt(const std::string_view &plaintext, std::uint8_t *tag, std::uint8_t *ciphertext, aes_t *iv, const std::string_view &aad);
+
+      /**
+       * @brief Authenticate and decrypt `[tag][ciphertext]` with additional authenticated data (AAD).
+       * @param tagged_cipher GCM tag followed by the ciphertext; must be at least `tag_size` bytes.
+       * @param plaintext Receives the plaintext.
+       * @param iv The initialization vector used for the encryption.
+       * @param aad Additional authenticated data.
+       * @return 0 on success, or -1 when the input is too short or authentication fails.
+       */
+      int decrypt(const std::string_view &tagged_cipher, std::vector<std::uint8_t> &plaintext, aes_t *iv, const std::string_view &aad);
     };
 
     /**

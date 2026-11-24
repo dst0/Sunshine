@@ -1,8 +1,10 @@
+import { fileURLToPath } from 'node:url'
 import vue from '@vitejs/plugin-vue'
 import { defineConfig } from 'vitest/config'
 
 export default defineConfig({
   plugins: [vue()],
+  publicDir: fileURLToPath(new URL('./src_assets/common/assets/web/public', import.meta.url)),
   resolve: {
     alias: {
       vue: 'vue/dist/vue.esm-bundler.js',
