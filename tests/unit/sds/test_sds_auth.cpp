@@ -433,3 +433,24 @@ TEST_F(SdsAuthorizeTest, LazyOfferAndDropRequireMatchingPermissionsAndLimits) {
   EXPECT_TRUE(check(clipboard_offer_entry_read, 0, "", context.chunk_max).ok());
   EXPECT_EQ(check(clipboard_offer_entry_read, 0, "", context.chunk_max + 1).status, 413);
 }
+
+TEST_F(SdsAuthorizeTest, TileRefinementRequiresCertFeatureAndActiveStream) {
+  // Missing feature -> 404 even with active stream and all permissions
+  EXPECT_EQ(check(sds::op_e::tile_refinement).status, 404);
+
+  // Feature present, paired cert, active stream, zero permissions -> authorized (steps 1-4 only)
+  features.insert(sds::feature_e::tile_refinement);
+  clients[PAIRED].permissions.reset();
+  EXPECT_TRUE(check(sds::op_e::tile_refinement).ok());
+
+  // Inactive stream -> 409 no_active_stream
+  streaming.clear();
+  const auto inactive = check(sds::op_e::tile_refinement);
+  EXPECT_EQ(inactive.status, 409);
+  EXPECT_EQ(inactive.error, "no_active_stream");
+
+  // Unknown certificate -> 401 unauthorized
+  sds::request_view_t bad_req;
+  bad_req.cert_pem = "unpaired";
+  EXPECT_EQ(sds::authorize(context, bad_req, sds::op_e::tile_refinement).status, 401);
+}

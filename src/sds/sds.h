@@ -39,6 +39,7 @@ namespace sds {
     bool file_transfer = true;  ///< `file_transfer` switch.
     bool file_clipboard = false;  ///< Explicit opt-in for the isolated X11 desktop.
     bool mic_passthrough = true;  ///< `mic_passthrough` switch.
+    bool tile_refinement = true;  ///< Adaptive dirty-tile lossless refinement switch.
     std::size_t clipboard_text_max = 1024 * 1024;  ///< `clipboard_text_max`.
     std::size_t clipboard_image_max = 16 * 1024 * 1024;  ///< `clipboard_image_max`.
     double clipboard_rate = 10;  ///< `clipboard_rate` per second.
@@ -66,6 +67,8 @@ namespace sds {
    */
   struct dependencies_t {
     std::function<bool(std::string_view cert)> stream_active;  ///< Default: rtsp_stream::has_running_session.
+    std::function<bool(std::string_view cert)> tile_refinement_active;  ///< Default: rtsp_stream::has_tile_refinement_session.
+    std::function<bool()> any_tile_refinement_active;  ///< Default: rtsp_stream::any_tile_refinement_session.
     std::function<std::optional<client_t>(std::string_view cert)> find_client;  ///< Default: nvhttp paired-client store.
     std::function<std::unique_ptr<clipboard::backend_t>()> make_clipboard_backend;  ///< Default: clipboard::make_backend.
     std::function<std::shared_ptr<const file_clipboard::stage_t>(std::string_view body, const std::function<bool()> &allowed)> stage_file_clipboard;  ///< Default: file_clipboard::stage.
@@ -185,6 +188,28 @@ namespace sds {
    * @param available Availability.
    */
   void set_mic_available(bool available);
+
+  /**
+   * @brief Refresh tile refiner active state from running session flags. Never blocks.
+   *
+   * @param stopped_cert Optional client certificate whose tile-refinement stream just stopped.
+   */
+  void on_tile_refinement_sessions_changed(std::string_view stopped_cert = {});
+
+  /**
+   * @brief Lock-free check whether any active stream wants BGRA frames for tile refinement.
+   */
+  bool tile_refinement_wanted();
+
+  /**
+   * @brief Non-blocking single-slot BGRA submission from video capture/encode.
+   *
+   * @param bgra Top-left 32-bit BGRA/BGRX pixel pointer.
+   * @param stride Row stride in bytes (`>= width * 4`).
+   * @param width Frame width in pixels.
+   * @param height Frame height in pixels.
+   */
+  void submit_bgra_frame(const std::uint8_t *bgra, int stride, int width, int height);
 
   /**
    * @brief Block until both worker threads have run every job queued so far (tests).

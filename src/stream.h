@@ -98,6 +98,13 @@ namespace stream {
      * @return PEM certificate associated with the session's client.
      */
     const std::string &client_cert(session_t &session);
+    /**
+     * @brief Return whether adaptive dirty-tile refinement is active for this session.
+     *
+     * @param session Active streaming session.
+     * @return `true` when negotiated via `sdsTileRefinement=1`.
+     */
+    bool tile_refinement_enabled(session_t &session);
 
 #ifdef SUNSHINE_TESTS
     namespace test_support {

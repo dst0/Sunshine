@@ -31,6 +31,7 @@
   #include "src/platform/linux/xdnd_x11.h"
 #endif
 #include "src/rtsp.h"
+#include "tile_refiner.h"
 #include "worker.h"
 
 using namespace std::literals;
@@ -38,6 +39,7 @@ using namespace std::literals;
 namespace sds {
   namespace {
     std::atomic_bool mic_available {false};  ///< Set by the microphone module.
+    std::atomic_bool tile_refinement_enabled_atomic {false};  ///< Fast-path flag for active tile refinement capture tap.
 
     /**
      * @brief Mutex protecting the prepared clipboard backend.
@@ -471,6 +473,12 @@ namespace sds {
         if (!deps_.stream_active) {
           deps_.stream_active = rtsp_stream::has_running_session;
         }
+        if (!deps_.tile_refinement_active) {
+          deps_.tile_refinement_active = rtsp_stream::has_tile_refinement_session;
+        }
+        if (!deps_.any_tile_refinement_active) {
+          deps_.any_tile_refinement_active = rtsp_stream::any_tile_refinement_session;
+        }
         if (!deps_.find_client) {
           deps_.find_client = find_paired_client;
         }
@@ -491,6 +499,21 @@ namespace sds {
 
         control_ = std::make_unique<worker_t>("sds");
         io_ = std::make_unique<worker_t>("sds-io");
+        if (options_.tile_refinement) {
+          tile_refiner_ = std::make_unique<tile_refiner_t>(
+            true,
+            [this](tile_refiner_t::clock::time_point when) {
+              if (!shut_down_.load(std::memory_order_acquire) && control_) {
+                control_->post_at(when, [this]() {
+                  if (!shut_down_.load(std::memory_order_acquire) && tile_refiner_) {
+                    tile_refiner_->flush_waiting(tile_refiner_t::clock::now());
+                  }
+                });
+              }
+            }
+          );
+        }
+        refresh_tile_refinement_active();
 
         clipboard::hooks_t hooks;
         hooks.publish = [this](const std::string &client, nlohmann::json event) {
@@ -558,6 +581,10 @@ namespace sds {
         if (shut_down_.exchange(true)) {
           return;
         }
+        tile_refinement_enabled_atomic.store(false, std::memory_order_release);
+        if (tile_refiner_) {
+          tile_refiner_->shutdown();
+        }
         events_.shutdown();
         control_->post([this]() {
           reset_file_clipboard();
@@ -570,6 +597,9 @@ namespace sds {
         });
         control_->stop();
         io_->stop();
+        if (tile_refiner_) {
+          tile_refiner_->shutdown();
+        }
         retire_all_lazy_offers();
         clear_all_drops();
         clipboard_->shutdown();
@@ -602,6 +632,8 @@ namespace sds {
             return file_clipboard_backend_ && options_.clipboard && options_.file_transfer;
           case feature_e::mic:
             return options_.mic_passthrough && mic_available.load();
+          case feature_e::tile_refinement:
+            return options_.tile_refinement && tile_refiner_ != nullptr;
         }
         return false;
       }
@@ -676,6 +708,9 @@ namespace sds {
             return;
           case op_e::events:
             poll_events(client, request, std::move(respond));
+            return;
+          case op_e::tile_refinement:
+            poll_tile_refinement(client, request, std::move(respond));
             return;
           case op_e::clipboard_get:
             clipboard_get(client, request, authority, std::move(respond));
@@ -1088,6 +1123,69 @@ namespace sds {
       }
 
       /**
+       * @brief `GET /sds/v1/tile-refinement`.
+       *
+       * @param client Caller.
+       * @param request Request.
+       * @param respond Completion callback.
+       */
+      void poll_tile_refinement(const client_t &client, const request_t &request, reply_fn respond) {
+        if (!tile_refiner_) {
+          respond(reply_t::failure(404, "not_found", "feature not available"));
+          return;
+        }
+        if (!deps_.tile_refinement_active || !deps_.tile_refinement_active(client.cert)) {
+          respond(reply_t::failure(409, "no_active_stream", "no active tile refinement stream for this client"));
+          return;
+        }
+        auto timeout = std::min(options_.poll_default, std::chrono::milliseconds {25000});
+        if (const auto value = query_value(request, "timeout"); value) {
+          const auto seconds = parse_u64(*value);
+          if (!seconds) {
+            respond(reply_t::failure(400, "bad_request", "invalid timeout"));
+            return;
+          }
+          timeout = std::chrono::milliseconds {std::min<std::uint64_t>(*seconds, 25) * 1000};
+        }
+        timeout = std::min(timeout, options_.poll_max);
+
+        const auto now = tile_refiner_t::clock::now();
+        std::optional<tile_refiner_t::clock::time_point> deadline;
+        if (timeout.count() > 0) {
+          deadline = now + timeout;
+        }
+        auto responder = [respond](int status, std::string body) {
+          reply_t reply;
+          if (status == 200) {
+            reply.status = 200;
+            reply.content_type = "application/octet-stream";
+            reply.body = std::move(body);
+          } else if (status == 409) {
+            reply = reply_t::failure(409, "no_active_stream", "no active tile refinement stream for this client");
+          } else if (status == 503) {
+            reply = reply_t::failure(503, "internal", "service shutting down");
+          } else {
+            reply.status = status;
+          }
+          respond(std::move(reply));
+        };
+        if (!tile_refiner_->poll_at(client.cert, deadline, now, std::move(responder))) {
+          return;
+        }
+        if (!control_->post_at(*deadline, [this]() {
+              if (!shut_down_.load(std::memory_order_acquire) && tile_refiner_) {
+                tile_refiner_->expire(tile_refiner_t::clock::now());
+              }
+            })) {
+          tile_refiner_->end_stream(client.cert);
+          return;
+        }
+        if (!deps_.stream_active(client.cert) || !deps_.tile_refinement_active(client.cert)) {
+          tile_refiner_->end_stream(client.cert);
+        }
+      }
+
+      /**
        * @brief `GET /sds/v1/clipboard`.
        *
        * @param client Caller.
@@ -1459,9 +1557,11 @@ namespace sds {
             // Several sessions may share this certificate. Only the first
             // active notification should announce the current clipboard.
             if (!active_.insert(cert).second) {
+              refresh_tile_refinement_active();
               return;
             }
           }
+          refresh_tile_refinement_active();
           reset_file_clipboard();
           refresh_clipboard_watching();
           const auto client = deps_.find_client(cert);
@@ -1482,6 +1582,10 @@ namespace sds {
         }
         reset_file_clipboard();
         events_.end_stream(cert);
+        if (tile_refiner_) {
+          tile_refiner_->end_stream(cert);
+        }
+        refresh_tile_refinement_active();
         clipboard_rate_.forget(cert);
         clipboard_->forget_client(cert);
         refresh_clipboard_watching();
@@ -2489,6 +2593,42 @@ namespace sds {
       std::atomic_bool shut_down_ {false};  ///< Set by shutdown().
       std::unique_ptr<worker_t> control_;  ///< Clipboard, events and lifecycle jobs.
       std::unique_ptr<worker_t> io_;  ///< Disk I/O and hashing jobs.
+      std::unique_ptr<tile_refiner_t> tile_refiner_;  ///< Adaptive dirty-tile refiner.
+
+    public:
+      void refresh_tile_refinement_active() {
+        const bool active = !shut_down_.load(std::memory_order_acquire) &&
+                            options_.tile_refinement &&
+                            tile_refiner_ != nullptr &&
+                            deps_.any_tile_refinement_active &&
+                            deps_.any_tile_refinement_active();
+        if (tile_refiner_) {
+          tile_refiner_->set_active(active);
+        }
+        tile_refinement_enabled_atomic.store(active, std::memory_order_release);
+      }
+
+      void post_refresh_tile_refinement(std::string stopped_cert) {
+        if (shut_down_.load(std::memory_order_acquire) || !control_) {
+          return;
+        }
+        control_->post([this, stopped_cert = std::move(stopped_cert)]() {
+          if (shut_down_.load(std::memory_order_acquire)) {
+            return;
+          }
+          if (!stopped_cert.empty() && tile_refiner_ &&
+              (!deps_.tile_refinement_active || !deps_.tile_refinement_active(stopped_cert))) {
+            tile_refiner_->end_stream(stopped_cert);
+          }
+          refresh_tile_refinement_active();
+        });
+      }
+
+      void submit_bgra(const std::uint8_t *bgra, int stride, int width, int height) {
+        if (!shut_down_.load(std::memory_order_acquire) && tile_refiner_) {
+          tile_refiner_->submit_bgra_frame(bgra, stride, width, height);
+        }
+      }
     };
 
     std::mutex runtime_mutex;  ///< Protects current_runtime.
@@ -2561,6 +2701,7 @@ namespace sds {
   }
 
   void stop() {
+    tile_refinement_enabled_atomic.store(false, std::memory_order_release);
     std::shared_ptr<runtime_t> runtime;
     {
       std::lock_guard lock {runtime_mutex};
@@ -2619,6 +2760,27 @@ namespace sds {
 
   void set_mic_available(bool available) {
     mic_available = available;
+  }
+
+  void on_tile_refinement_sessions_changed(std::string_view stopped_cert) {
+    if (const auto runtime = current(); runtime) {
+      runtime->post_refresh_tile_refinement(std::string {stopped_cert});
+    } else {
+      tile_refinement_enabled_atomic.store(false, std::memory_order_release);
+    }
+  }
+
+  bool tile_refinement_wanted() {
+    return tile_refinement_enabled_atomic.load(std::memory_order_acquire);
+  }
+
+  void submit_bgra_frame(const std::uint8_t *bgra, int stride, int width, int height) {
+    if (!tile_refinement_enabled_atomic.load(std::memory_order_acquire)) {
+      return;
+    }
+    if (const auto runtime = current(); runtime) {
+      runtime->submit_bgra(bgra, stride, width, height);
+    }
   }
 
   void drain_for_test() {

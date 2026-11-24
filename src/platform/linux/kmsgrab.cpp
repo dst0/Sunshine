@@ -2066,6 +2066,7 @@ namespace platf {
         img->height = height;
         img->serial = std::numeric_limits<decltype(img->serial)>::max();
         img->data = nullptr;
+        img->is_vram_only = true;
         img->pixel_pitch = 4;
 
         img->sequence = 0;

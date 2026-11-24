@@ -545,6 +545,7 @@ namespace platf {
     std::int32_t height {};  ///< Image height in pixels.
     std::int32_t pixel_pitch {};  ///< Bytes per pixel in the image buffer.
     std::int32_t row_pitch {};  ///< Bytes between consecutive image rows.
+    bool is_vram_only {false};  ///< True when the underlying pixel buffer lives in GPU VRAM only (never read on CPU).
 
     std::optional<std::chrono::steady_clock::time_point> frame_timestamp;  ///< Capture timestamp associated with the frame.
 

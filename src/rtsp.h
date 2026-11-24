@@ -113,6 +113,9 @@ namespace rtsp_stream {
 
     // Packed YCoCg-R P010 4:4:4 mode negotiated on /launch or /resume (0 = off, 1 = Layout A1)
     int packed_ycocgr_mode = 0;  ///< Packed YCoCg-R mode requested for this launch session.
+
+    // Adaptive dirty-tile lossless refinement negotiated on /launch or /resume
+    bool tile_refinement = false;  ///< Adaptive dirty-tile refinement enabled for this launch session.
   };
 
   /**
@@ -154,6 +157,19 @@ namespace rtsp_stream {
    * @return `true` when a session for the certificate is in the RUNNING state.
    */
   bool has_running_session(std::string_view cert_pem);
+
+  /**
+   * @brief Check whether a running session of this client certificate has tile refinement enabled.
+   *
+   * @param cert_pem Canonical PEM certificate of the client.
+   * @return `true` when an active RUNNING session for `cert_pem` uses adaptive tile refinement.
+   */
+  bool has_tile_refinement_session(std::string_view cert_pem);
+
+  /**
+   * @brief Check whether any running session uses adaptive tile refinement.
+   */
+  bool any_tile_refinement_session();
 
   /**
    * @brief Observer notified when a streaming session starts running or begins to stop.

@@ -1451,6 +1451,29 @@ namespace nvhttp {
       return value.empty() || value == "0" || value == "1";
     }
 
+    bool validate_tile_refinement_request(
+      std::string_view sds_tile_refinement,
+      const rtsp_stream::launch_session_t &launch_session,
+      std::string_view sds_chroma_mode,
+      bool &tile_refinement_out,
+      std::string_view &error_msg
+    ) {
+      tile_refinement_out = false;
+      if (sds_tile_refinement.empty()) {
+        return true;
+      }
+      if (!is_binary_flag_or_empty(sds_tile_refinement)) {
+        error_msg = "Invalid sdsTileRefinement parameter";
+        return false;
+      }
+      tile_refinement_out = (sds_tile_refinement == "1");
+      if (tile_refinement_out && (launch_session.enable_hdr || !sds_chroma_mode.empty())) {
+        error_msg = "sdsTileRefinement cannot be combined with HDR or sdsChromaMode";
+        return false;
+      }
+      return true;
+    }
+
     std::string build_paired_sds_features() {
       std::string features = sds::server_features();
       const auto has_token = [&features](std::string_view token) {
@@ -1492,6 +1515,7 @@ namespace nvhttp {
       append_token("host_encoder"sv);
       append_token("host_capture_adapter"sv);
       append_token("host_resolution"sv);
+      append_token("adaptive_tile_refinement"sv);
       return features;
     }
 
@@ -1870,6 +1894,7 @@ namespace nvhttp {
       tree.put("root.<xmlattr>.status_message", "Invalid sdsChromaMode parameter");
       return;
     }
+    const auto sds_tile_refinement = get_arg(args, "sdsTileRefinement", "");
 
     auto appid = util::from_view(get_arg(args, "appid"));
 
@@ -1887,6 +1912,18 @@ namespace nvhttp {
 
     std::string_view chroma_error;
     if (!validate_pre_probe_packed_chroma(sds_chroma_mode, *launch_session, chroma_error)) {
+      tree.put("root.gamesession", 0);
+      tree.put("root.<xmlattr>.status_code", 400);
+      tree.put("root.<xmlattr>.status_message", chroma_error);
+      return;
+    }
+    if (!validate_tile_refinement_request(
+          sds_tile_refinement,
+          *launch_session,
+          sds_chroma_mode,
+          launch_session->tile_refinement,
+          chroma_error
+        )) {
       tree.put("root.gamesession", 0);
       tree.put("root.<xmlattr>.status_code", 400);
       tree.put("root.<xmlattr>.status_message", chroma_error);
@@ -2047,6 +2084,7 @@ namespace nvhttp {
       tree.put("root.<xmlattr>.status_message", "Invalid sdsChromaMode parameter");
       return;
     }
+    const auto sds_tile_refinement = get_arg(args, "sdsTileRefinement", "");
 
     // Newer Moonlight clients send localAudioPlayMode on /resume too,
     // so we should use it if it's present in the args and there are
@@ -2059,6 +2097,18 @@ namespace nvhttp {
 
     std::string_view chroma_error;
     if (!validate_pre_probe_packed_chroma(sds_chroma_mode, *launch_session, chroma_error)) {
+      tree.put("root.resume", 0);
+      tree.put("root.<xmlattr>.status_code", 400);
+      tree.put("root.<xmlattr>.status_message", chroma_error);
+      return;
+    }
+    if (!validate_tile_refinement_request(
+          sds_tile_refinement,
+          *launch_session,
+          sds_chroma_mode,
+          launch_session->tile_refinement,
+          chroma_error
+        )) {
       tree.put("root.resume", 0);
       tree.put("root.<xmlattr>.status_code", 400);
       tree.put("root.<xmlattr>.status_message", chroma_error);

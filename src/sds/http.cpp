@@ -139,6 +139,7 @@ namespace sds::http {
         std::vector<route_t> list;
         list.push_back({"GET", std::regex {"^/sds/v1/capabilities$"}, op_e::capabilities});
         list.push_back({"GET", std::regex {"^/sds/v1/events$"}, op_e::events});
+        list.push_back({"GET", std::regex {"^/sds/v1/tile-refinement$"}, op_e::tile_refinement});
         list.push_back({"GET", std::regex {"^/sds/v1/clipboard$"}, op_e::clipboard_get});
         list.push_back({"PUT", std::regex {"^/sds/v1/clipboard$"}, op_e::clipboard_put});
         list.push_back({"GET", std::regex {"^/sds/v1/file-clipboard$"}, op_e::file_clipboard_get});

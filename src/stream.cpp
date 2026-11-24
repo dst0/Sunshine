@@ -37,6 +37,7 @@
 #include "process.h"
 #include "rtsp.h"
 #include "sds/mic.h"
+#include "sds/sds.h"
 #include "stream.h"
 #include "sync.h"
 #include "system_tray.h"
@@ -596,6 +597,7 @@ namespace stream {
     std::mutex mic_mutex;  ///< Serializes optional microphone activation with stream teardown.
     sds::mic::session_handle_t mic;  ///< Running microphone passthrough, stopped with the stream.
     std::string input_session_id;  ///< Stable client identity used to retain input devices across resume.
+    bool tile_refinement = false;  ///< Adaptive dirty-tile lossless refinement negotiated on launch/resume.
 
     safe::mail_raw_t::event_t<bool> shutdown_event;  ///< Event raised when the stream should shut down.
     safe::signal_t controlEnd;  ///< Signal raised when the control channel exits.
@@ -2322,6 +2324,9 @@ namespace stream {
       // Observers must only enqueue work; they must not reenter lifecycle transitions or RTSP.
       // The false transition is delivered before a reconnect can publish its new true state.
       rtsp_stream::notify_session_state(session.client_cert, any_running);
+      if (session.tile_refinement) {
+        sds::on_tile_refinement_sessions_changed(running ? std::string_view {} : std::string_view {session.client_cert});
+      }
       return true;
     }
 
@@ -2339,6 +2344,10 @@ namespace stream {
      */
     const std::string &client_cert(session_t &session) {
       return session.client_cert;
+    }
+
+    bool tile_refinement_enabled(session_t &session) {
+      return session.tile_refinement;
     }
 
     /**
@@ -2499,6 +2508,7 @@ namespace stream {
       session->launch_session_id = launch_session.id;
       session->client_cert = launch_session.client_cert;
       session->input_session_id = launch_session.client_cert.empty() ? launch_session.unique_id : launch_session.client_cert;
+      session->tile_refinement = launch_session.tile_refinement;
 
       session->config = config;
 

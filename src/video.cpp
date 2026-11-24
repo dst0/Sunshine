@@ -36,6 +36,7 @@ extern "C" {
 #include "logging.h"
 #include "nvenc/nvenc_encoder.h"
 #include "platform/common.h"
+#include "sds/sds.h"
 #include "sync.h"
 #include "video.h"
 
@@ -2756,6 +2757,24 @@ namespace video {
   }
 
   /**
+   * @brief Safely tap a CPU-mapped BGRA capture image into the SDS tile refiner.
+   *
+   * Skips VRAM-only frames (`is_vram_only` / `data == nullptr`) and non-BGRA images without blocking.
+   */
+  void tap_tile_refinement_frame(const platf::img_t &img, const platf::display_t *disp) {
+    if (!sds::tile_refinement_wanted()) {
+      return;
+    }
+    if (img.is_vram_only || !img.data || img.pixel_pitch != 4 || img.width <= 0 || img.height <= 0 || img.row_pitch < img.width * 4) {
+      return;
+    }
+    if (disp && (img.width != disp->width || img.height != disp->height)) {
+      return;
+    }
+    sds::submit_bgra_frame(img.data, img.row_pitch, img.width, img.height);
+  }
+
+  /**
    * @brief Run one encode loop for a display capture stream.
    *
    * @param frame_nr Frame counter updated as frames are encoded.
@@ -2849,6 +2868,7 @@ namespace video {
       if (!requested_idr_frame || images->peek()) {
         if (auto img = images->pop(max_frametime)) {
           frame_timestamp = img->frame_timestamp;
+          tap_tile_refinement_frame(*img, disp.get());
           if (session->convert(*img)) {
             BOOST_LOG(error) << "Could not convert image"sv;
             return;
@@ -3148,6 +3168,10 @@ namespace video {
           }
 
           synced_sessions.emplace_back(std::move(*encode_session));
+        }
+
+        if (frame_captured && captured_image) {
+          tap_tile_refinement_frame(*captured_image, disp.get());
         }
 
         KITTY_WHILE_LOOP(auto pos = std::begin(synced_sessions), pos != std::end(synced_sessions), {

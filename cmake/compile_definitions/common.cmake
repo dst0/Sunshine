@@ -155,6 +155,10 @@ set(SDS_SOURCES
         "${CMAKE_SOURCE_DIR}/src/sds/sds.h"
         "${CMAKE_SOURCE_DIR}/src/sds/text.cpp"
         "${CMAKE_SOURCE_DIR}/src/sds/text.h"
+        "${CMAKE_SOURCE_DIR}/src/sds/tile_qoi.cpp"
+        "${CMAKE_SOURCE_DIR}/src/sds/tile_qoi.h"
+        "${CMAKE_SOURCE_DIR}/src/sds/tile_refiner.cpp"
+        "${CMAKE_SOURCE_DIR}/src/sds/tile_refiner.h"
         "${CMAKE_SOURCE_DIR}/src/sds/worker.cpp"
         "${CMAKE_SOURCE_DIR}/src/sds/worker.h")
 if(WIN32)

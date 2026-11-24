@@ -1930,6 +1930,7 @@ namespace platf::dxgi {
     img->height = height_before_rotation;
     img->id = next_image_id++;
     img->blank = true;
+    img->is_vram_only = true;
 
     return img;
   }

@@ -817,6 +817,7 @@ namespace wl {
       img->sequence = 0;
       img->serial = std::numeric_limits<decltype(img->serial)>::max();
       img->data = nullptr;
+      img->is_vram_only = true;
 
       // File descriptors aren't open
       img->sd.fds.fill(-1);

@@ -654,6 +654,29 @@ namespace rtsp_stream {
       return false;
     }
 
+    bool has_tile_refinement_session(std::string_view cert) {
+      auto lg = _session_slots.lock();
+      for (const auto &slot : *_session_slots) {
+        if (stream::session::client_cert(*slot) == cert &&
+            stream::session::state(*slot) == stream::session::state_e::RUNNING &&
+            stream::session::tile_refinement_enabled(*slot)) {
+          return true;
+        }
+      }
+      return false;
+    }
+
+    bool any_tile_refinement_session() {
+      auto lg = _session_slots.lock();
+      for (const auto &slot : *_session_slots) {
+        if (stream::session::state(*slot) == stream::session::state_e::RUNNING &&
+            stream::session::tile_refinement_enabled(*slot)) {
+          return true;
+        }
+      }
+      return false;
+    }
+
     /**
      * @brief Removes the provided session from the set of sessions.
      * @param session The session to remove.
@@ -745,6 +768,17 @@ namespace rtsp_stream {
       return false;
     }
     return server.has_running_session(cert_pem);
+  }
+
+  bool has_tile_refinement_session(std::string_view cert_pem) {
+    if (cert_pem.empty()) {
+      return false;
+    }
+    return server.has_tile_refinement_session(cert_pem);
+  }
+
+  bool any_tile_refinement_session() {
+    return server.any_tile_refinement_session();
   }
 
   namespace {

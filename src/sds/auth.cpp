@@ -23,6 +23,7 @@ namespace sds {
       clipboard,  ///< Clipboard.
       files,  ///< File transfer.
       file_clipboard,  ///< The explicitly enabled native file clipboard.
+      tile_refinement,  ///< Adaptive dirty-tile refinement.
     };
 
     /**
@@ -67,6 +68,8 @@ namespace sds {
           return {feature_rule_e::any_feature, std::nullopt, limit_rule_e::none, size_rule_e::small};
         case op_e::events:
           return {feature_rule_e::any_data_feature, std::nullopt, limit_rule_e::none, size_rule_e::small};
+        case op_e::tile_refinement:
+          return {feature_rule_e::tile_refinement, std::nullopt, limit_rule_e::none, size_rule_e::small};
         case op_e::clipboard_get:
           return {feature_rule_e::clipboard, permission_e::clipboard_read, limit_rule_e::clipboard_rate, size_rule_e::small};
         case op_e::clipboard_put:
@@ -146,6 +149,8 @@ namespace sds {
           return available(feature_e::files);
         case feature_rule_e::file_clipboard:
           return available(feature_e::clipboard) && available(feature_e::files) && available(feature_e::file_clipboard);
+        case feature_rule_e::tile_refinement:
+          return available(feature_e::tile_refinement);
       }
       return false;
     }
