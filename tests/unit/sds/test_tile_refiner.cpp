@@ -33,6 +33,7 @@ namespace {
     std::uint16_t y = 0;
     std::uint16_t w = 0;
     std::uint16_t h = 0;
+    bool is_clear = false;
     std::vector<std::uint8_t> rgb;
   };
 
@@ -94,7 +95,9 @@ namespace {
           off + len > bin.size()) {
         return false;
       }
-      if (!sds::tile_qoi::qoi_decode_rgb24(p + off, len, tile.w, tile.h, tile.rgb)) {
+      if (len == 0) {
+        tile.is_clear = true;
+      } else if (!sds::tile_qoi::qoi_decode_rgb24(p + off, len, tile.w, tile.h, tile.rgb)) {
         return false;
       }
       off += len;
@@ -375,11 +378,11 @@ TEST(TileRefinerTest, ResetsGridAndEmitsResetAllOnResolutionChange) {
   EXPECT_TRUE(batch.tiles.empty());
 }
 
-TEST(TileRefinerTest, CoalescesAndCapsReadyQueueAt256) {
+TEST(TileRefinerTest, CoalescesAndPreservesAllSettledTilesWithoutEviction) {
   sds::tile_refiner_t refiner(false);
   const auto t0 = sds::tile_refiner_t::clock::now();
 
-  // 20 x 16 = 320 tiles (> MAX_READY_QUEUE 256)
+  // 20 x 16 = 320 tiles (well above old 256 cap; all must fit without dropping)
   constexpr int w = 1280;
   constexpr int h = 1024;
   std::vector<std::uint8_t> frame;
@@ -392,16 +395,16 @@ TEST(TileRefinerTest, CoalescesAndCapsReadyQueueAt256) {
   for (int i = 0; i < 3; ++i) {
     refiner.process_frame_at(frame.data(), w * 4, w, h, t0 + i * 16ms);
   }
-  EXPECT_EQ(refiner.ready_queue_size(), sds::tile_wire::MAX_READY_QUEUE);
+  EXPECT_EQ(refiner.ready_queue_size(), 320u);
 
-  // Repeated motion/re-settle cycles without polling must erase stale order entries rather than evicting unrelated live tiles
+  // Repeated motion/re-settle cycles without polling must coalesce cleanly on tile (0,0)
   for (int cycle = 0; cycle < 400; ++cycle) {
     set_pixel_bgra(frame, w, 0, 0, static_cast<std::uint8_t>((cycle * 13 + 1) & 0xFF), 240, 20);
     for (int f = 0; f < 3; ++f) {
       refiner.process_frame_at(frame.data(), w * 4, w, h, t0 + (3 + cycle * 3 + f) * 16ms);
     }
   }
-  EXPECT_EQ(refiner.ready_queue_size(), sds::tile_wire::MAX_READY_QUEUE);
+  EXPECT_EQ(refiner.ready_queue_size(), 320u);
 }
 
 TEST(TileRefinerTest, EnforcesBatchCapsAndBandwidthTokenBucket) {
@@ -535,4 +538,132 @@ TEST(TileRefinerTest, WorkerWakesParkedPollAndHandlesLifecycleResponses) {
   ASSERT_TRUE(refiner.poll_at("client-503", now + 5s, now, [&](int s, std::string) { status_503 = s; }));
   refiner.shutdown();
   EXPECT_EQ(status_503, 503);
+}
+
+TEST(TileRefinerTest, EmitsPerTileInvalidationOnMotionAndLowChromaSettle) {
+  sds::tile_refiner_t refiner(false);
+  const auto t0 = sds::tile_refiner_t::clock::now();
+  std::vector<std::uint8_t> frame;
+  fill_bgra(frame, 128, 128, 28, 30, 34);
+  draw_colored_text_glyph(frame, 128, 0, 0);
+
+  for (int i = 0; i < 3; ++i) {
+    refiner.process_frame_at(frame.data(), 128 * 4, 128, 128, t0 + i * 16ms);
+  }
+
+  // Drain initial reset + refined tile (0,0) so client_active becomes true
+  int st = 0;
+  std::string body;
+  refiner.poll_at("c1", std::nullopt, t0 + 32ms, [&](int s, std::string b) {
+    st = s;
+    body = std::move(b);
+  });
+  ASSERT_EQ(st, 200);
+  decoded_batch_t initial;
+  ASSERT_TRUE(parse_batch(body, initial));
+  ASSERT_EQ(initial.tiles.size(), 1u);
+  EXPECT_FALSE(initial.tiles[0].is_clear);
+  EXPECT_EQ(initial.tiles[0].x, 0);
+  EXPECT_EQ(initial.tiles[0].y, 0);
+
+  // Change tile (0,0) to flat gray -> immediate invalidation record (len == 0)
+  fill_bgra(frame, 128, 128, 80, 80, 80);
+  refiner.process_frame_at(frame.data(), 128 * 4, 128, 128, t0 + 48ms);
+  EXPECT_EQ(refiner.pending_invalidation_count(), 1u);
+
+  refiner.poll_at("c1", std::nullopt, t0 + 48ms, [&](int s, std::string b) {
+    st = s;
+    body = std::move(b);
+  });
+  ASSERT_EQ(st, 200);
+  decoded_batch_t inv;
+  ASSERT_TRUE(parse_batch(body, inv));
+  EXPECT_EQ(inv.flags & sds::tile_wire::FLAG_RESET_ALL, 0);
+  ASSERT_EQ(inv.tiles.size(), 1u);
+  EXPECT_TRUE(inv.tiles[0].is_clear);
+  EXPECT_EQ(inv.tiles[0].x, 0);
+  EXPECT_EQ(inv.tiles[0].y, 0);
+
+  // Re-settling into low-chroma gray must NOT re-emit another clear or data tile
+  refiner.process_frame_at(frame.data(), 128 * 4, 128, 128, t0 + 64ms);
+  refiner.process_frame_at(frame.data(), 128 * 4, 128, 128, t0 + 80ms);
+  EXPECT_EQ(refiner.pending_invalidation_count(), 0u);
+  EXPECT_EQ(refiner.ready_queue_size(), 0u);
+}
+
+TEST(TileRefinerTest, BulkInvalidationCollapsesToResetAllAndExcludesCursorTiles) {
+  sds::tile_refiner_t refiner(false);
+  const auto t0 = sds::tile_refiner_t::clock::now();
+  // 16 x 10 = 160 tiles (> MAX_PER_TILE_INVALIDATIONS 128)
+  constexpr int w = 1024;
+  constexpr int h = 640;
+  std::vector<std::uint8_t> frame;
+  fill_bgra(frame, w, h, 24, 24, 28);
+  for (int ty = 0; ty < 10; ++ty) {
+    for (int tx = 0; tx < 16; ++tx) {
+      draw_colored_text_glyph(frame, w, tx * 64, ty * 64);
+    }
+  }
+
+  for (int i = 0; i < 3; ++i) {
+    refiner.process_frame_at(frame.data(), w * 4, w, h, t0 + i * 16ms);
+  }
+
+  // Drain all 160 active tiles over multiple polls
+  int sent_count = 0;
+  for (int p = 0; p < 16; ++p) {
+    int st = 0;
+    std::string body;
+    refiner.poll_at("c1", std::nullopt, t0 + (32 + p * 50) * 1ms, [&](int s, std::string b) {
+      st = s;
+      body = std::move(b);
+    });
+    if (st == 204) {
+      break;
+    }
+    ASSERT_EQ(st, 200);
+    decoded_batch_t b;
+    ASSERT_TRUE(parse_batch(body, b));
+    sent_count += static_cast<int>(b.tiles.size());
+  }
+  ASSERT_EQ(sent_count, 160);
+
+  // Cursor touching tile (0,0) invalidates it while keeping other tiles intact
+  refiner.process_frame_at(frame.data(), w * 4, w, h, t0 + 1000ms, sds::cursor_rect_t {8, 8, 16, 16});
+  EXPECT_EQ(refiner.pending_invalidation_count(), 1u);
+  {
+    int st = 0;
+    std::string body;
+    refiner.poll_at("c1", std::nullopt, t0 + 1000ms, [&](int s, std::string b) {
+      st = s;
+      body = std::move(b);
+    });
+    ASSERT_EQ(st, 200);
+    decoded_batch_t b;
+    ASSERT_TRUE(parse_batch(body, b));
+    ASSERT_EQ(b.tiles.size(), 1u);
+    EXPECT_TRUE(b.tiles[0].is_clear);
+    EXPECT_EQ(b.tiles[0].x, 0);
+    EXPECT_EQ(b.tiles[0].y, 0);
+  }
+
+  // Now dirty 150 tiles (> 128) -> must collapse into FLAG_RESET_ALL
+  for (int ty = 0; ty < 10; ++ty) {
+    for (int tx = 0; tx < 15; ++tx) {
+      set_pixel_bgra(frame, w, tx * 64 + 1, ty * 64 + 1, 200, 100, 50);
+    }
+  }
+  refiner.process_frame_at(frame.data(), w * 4, w, h, t0 + 1016ms);
+  EXPECT_EQ(refiner.pending_invalidation_count(), 0u);
+
+  int st = 0;
+  std::string body;
+  refiner.poll_at("c1", std::nullopt, t0 + 1016ms, [&](int s, std::string b) {
+    st = s;
+    body = std::move(b);
+  });
+  ASSERT_EQ(st, 200);
+  decoded_batch_t reset_b;
+  ASSERT_TRUE(parse_batch(body, reset_b));
+  EXPECT_EQ(reset_b.flags & sds::tile_wire::FLAG_RESET_ALL, sds::tile_wire::FLAG_RESET_ALL);
 }

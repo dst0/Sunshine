@@ -37,12 +37,23 @@ namespace sds {
     inline constexpr std::size_t MAX_TILES_PER_BATCH = 64;  ///< Max tiles in one HTTP response.
     inline constexpr std::size_t MAX_BATCH_BYTES = 256 * 1024;  ///< Max binary batch byte length.
     inline constexpr std::size_t MAX_TILE_PAYLOAD = tile_qoi::MAX_TILE_PAYLOAD;  ///< Max QOI payload per tile.
-    inline constexpr std::size_t MAX_READY_QUEUE = 256;  ///< Bounded coalescing queue capacity.
+    inline constexpr std::size_t MAX_READY_QUEUE = 4096;  ///< Bounded coalescing queue capacity.
+    inline constexpr std::size_t MAX_PER_TILE_INVALIDATIONS = 128;  ///< Bulk dirty threshold before collapsing to reset_all.
     inline constexpr int TILE_SIZE = tile_qoi::TILE_SIZE;  ///< 64x64 tile edge length.
     inline constexpr int CHROMA_ERROR_THRESHOLD = 10;  ///< Min 4:2:0 round-trip abs RGB error (out of 255).
     inline constexpr std::size_t BANDWIDTH_BYTES_PER_SEC = 4 * 1024 * 1024;  ///< Soft ~4 MiB/s output cap.
     inline constexpr std::size_t BANDWIDTH_BURST_BYTES = MAX_BATCH_BYTES;  ///< Token bucket burst ceiling.
   }  // namespace tile_wire
+
+  /**
+   * @brief Bounding box of a software-blended cursor inside the captured BGRA frame.
+   */
+  struct cursor_rect_t {
+    int x = 0;
+    int y = 0;
+    int w = 0;
+    int h = 0;
+  };
 
   /**
    * @brief Tracks settled 64x64 BGRA desktop tiles and serves lossless QOI-RGB24 refinement batches.
@@ -98,12 +109,25 @@ namespace sds {
      * @param width Frame width in pixels (`1..16384`).
      * @param height Frame height in pixels (`1..16384`).
      */
-    void submit_bgra_frame(const std::uint8_t *bgra, int stride, int width, int height);
+    void submit_bgra_frame(
+      const std::uint8_t *bgra,
+      int stride,
+      int width,
+      int height,
+      std::optional<cursor_rect_t> cursor_rect = std::nullopt
+    );
 
     /**
      * @brief Synchronously inspect one BGRA frame at an explicit timestamp (worker & tests).
      */
-    void process_frame_at(const std::uint8_t *bgra, int stride, int width, int height, clock::time_point now);
+    void process_frame_at(
+      const std::uint8_t *bgra,
+      int stride,
+      int width,
+      int height,
+      clock::time_point now,
+      std::optional<cursor_rect_t> cursor_rect = std::nullopt
+    );
 
     /**
      * @brief Poll for a binary refinement batch or park until `deadline`.
@@ -152,6 +176,11 @@ namespace sds {
     [[nodiscard]] std::size_t ready_queue_size() const;
 
     /**
+     * @brief Number of per-tile invalidations currently queued for transmission (tests).
+     */
+    [[nodiscard]] std::size_t pending_invalidation_count() const;
+
+    /**
      * @brief Number of currently parked polls (tests).
      */
     [[nodiscard]] std::size_t parked_poll_count() const;
@@ -174,6 +203,7 @@ namespace sds {
       bool has_hash = false;
       std::uint8_t settled_frames = 0;
       bool refined_sent = false;
+      bool client_active = false;
     };
 
     struct queued_tile_t {
@@ -194,6 +224,9 @@ namespace sds {
     void worker_loop();
     void enqueue_tile_locked(int tx, int ty, int tile_w, int tile_h, std::vector<std::uint8_t> &&payload);
     void erase_queued_tile_locked(std::uint32_t key);
+    void enqueue_invalidation_locked(int tx, int ty);
+    void erase_invalidation_locked(std::uint32_t key);
+    void collapse_invalidations_to_reset_locked();
     bool build_batch_locked(
       clock::time_point now,
       std::string &out_binary,
@@ -218,6 +251,7 @@ namespace sds {
     int pending_w_ = 0;
     int pending_h_ = 0;
     int pending_stride_ = 0;
+    std::optional<cursor_rect_t> pending_cursor_rect_;
     std::vector<std::uint8_t> pending_frame_;
     std::vector<std::uint8_t> work_frame_;
     std::thread worker_;
@@ -233,6 +267,8 @@ namespace sds {
     std::vector<tile_state_t> tiles_;
     std::list<std::uint32_t> ready_order_;
     std::unordered_map<std::uint32_t, queued_tile_t> ready_tiles_;
+    std::list<std::uint32_t> invalidation_order_;
+    std::unordered_map<std::uint32_t, std::list<std::uint32_t>::iterator> pending_invalidations_;
     double bw_tokens_ = static_cast<double>(tile_wire::BANDWIDTH_BURST_BYTES);
     clock::time_point bw_last_refill_ {};
     bool bw_initialized_ = false;

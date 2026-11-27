@@ -20,6 +20,7 @@
 #include "clipboard_backend.h"
 #include "files.h"
 #include "reply.h"
+#include "tile_refiner.h"
 
 namespace sds {
   namespace file_clipboard {
@@ -209,7 +210,13 @@ namespace sds {
    * @param width Frame width in pixels.
    * @param height Frame height in pixels.
    */
-  void submit_bgra_frame(const std::uint8_t *bgra, int stride, int width, int height);
+  void submit_bgra_frame(
+    const std::uint8_t *bgra,
+    int stride,
+    int width,
+    int height,
+    std::optional<cursor_rect_t> cursor_rect = std::nullopt
+  );
 
   /**
    * @brief Block until both worker threads have run every job queued so far (tests).

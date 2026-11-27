@@ -546,6 +546,11 @@ namespace platf {
     std::int32_t pixel_pitch {};  ///< Bytes per pixel in the image buffer.
     std::int32_t row_pitch {};  ///< Bytes between consecutive image rows.
     bool is_vram_only {false};  ///< True when the underlying pixel buffer lives in GPU VRAM only (never read on CPU).
+    bool has_cursor_rect {false};  ///< True when a software cursor was blended into `data`.
+    std::int32_t cursor_x {};  ///< Blended cursor bounding-box left pixel.
+    std::int32_t cursor_y {};  ///< Blended cursor bounding-box top pixel.
+    std::int32_t cursor_w {};  ///< Blended cursor bounding-box width in pixels.
+    std::int32_t cursor_h {};  ///< Blended cursor bounding-box height in pixels.
 
     std::optional<std::chrono::steady_clock::time_point> frame_timestamp;  ///< Capture timestamp associated with the frame.
 

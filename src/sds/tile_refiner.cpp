@@ -99,7 +99,13 @@ namespace sds {
     }
   }
 
-  void tile_refiner_t::submit_bgra_frame(const std::uint8_t *bgra, int stride, int width, int height) {
+  void tile_refiner_t::submit_bgra_frame(
+    const std::uint8_t *bgra,
+    int stride,
+    int width,
+    int height,
+    std::optional<cursor_rect_t> cursor_rect
+  ) {
     if (!active_.load(std::memory_order_acquire)) {
       return;
     }
@@ -133,6 +139,7 @@ namespace sds {
     pending_w_ = width;
     pending_h_ = height;
     pending_stride_ = static_cast<int>(row_bytes);
+    pending_cursor_rect_ = cursor_rect;
     has_pending_ = true;
     slot_lock.unlock();
     slot_cv_.notify_one();
@@ -143,6 +150,7 @@ namespace sds {
       int w = 0;
       int h = 0;
       int stride = 0;
+      std::optional<cursor_rect_t> cursor_rect;
       {
         std::unique_lock lock {slot_mutex_};
         slot_cv_.wait(lock, [this]() {
@@ -155,12 +163,13 @@ namespace sds {
         w = pending_w_;
         h = pending_h_;
         stride = pending_stride_;
+        cursor_rect = pending_cursor_rect_;
         has_pending_ = false;
         processing_ = true;
       }
 
       if (active_.load(std::memory_order_acquire)) {
-        process_frame_at(work_frame_.data(), stride, w, h, clock::now());
+        process_frame_at(work_frame_.data(), stride, w, h, clock::now(), cursor_rect);
       }
 
       {
@@ -251,6 +260,8 @@ namespace sds {
     tiles_.clear();
     ready_order_.clear();
     ready_tiles_.clear();
+    invalidation_order_.clear();
+    pending_invalidations_.clear();
     bw_tokens_ = static_cast<double>(tile_wire::BANDWIDTH_BURST_BYTES);
     bw_initialized_ = false;
   }
@@ -259,6 +270,34 @@ namespace sds {
     if (auto it = ready_tiles_.find(key); it != ready_tiles_.end()) {
       ready_order_.erase(it->second.order_it);
       ready_tiles_.erase(it);
+    }
+  }
+
+  void tile_refiner_t::enqueue_invalidation_locked(int tx, int ty) {
+    const std::uint32_t key = tile_key(tx, ty);
+    if (pending_invalidations_.contains(key)) {
+      return;
+    }
+    invalidation_order_.push_back(key);
+    pending_invalidations_.emplace(key, std::prev(invalidation_order_.end()));
+  }
+
+  void tile_refiner_t::erase_invalidation_locked(std::uint32_t key) {
+    if (auto it = pending_invalidations_.find(key); it != pending_invalidations_.end()) {
+      invalidation_order_.erase(it->second);
+      pending_invalidations_.erase(it);
+    }
+  }
+
+  void tile_refiner_t::collapse_invalidations_to_reset_locked() {
+    invalidation_order_.clear();
+    pending_invalidations_.clear();
+    pending_reset_all_ = true;
+    for (auto &t : tiles_) {
+      if (t.client_active) {
+        t.client_active = false;
+        t.refined_sent = false;
+      }
     }
   }
 
@@ -272,10 +311,8 @@ namespace sds {
       return;
     }
 
-    while (ready_tiles_.size() >= tile_wire::MAX_READY_QUEUE && !ready_order_.empty()) {
-      const std::uint32_t oldest_key = ready_order_.front();
-      ready_order_.pop_front();
-      ready_tiles_.erase(oldest_key);
+    if (ready_tiles_.size() >= tile_wire::MAX_READY_QUEUE) {
+      return;
     }
 
     queued_tile_t entry;
@@ -296,7 +333,8 @@ namespace sds {
     int stride,
     int width,
     int height,
-    clock::time_point now
+    clock::time_point now,
+    std::optional<cursor_rect_t> cursor_rect
   ) {
     if (!bgra || width <= 0 || height <= 0 || width > 16384 || height > 16384 || stride < width * 4) {
       return;
@@ -315,8 +353,12 @@ namespace sds {
         tiles_.assign(static_cast<std::size_t>(tiles_x_) * static_cast<std::size_t>(tiles_y_), tile_state_t {});
         ready_order_.clear();
         ready_tiles_.clear();
+        invalidation_order_.clear();
+        pending_invalidations_.clear();
         pending_reset_all_ = true;
       }
+
+      const bool has_cursor = cursor_rect && cursor_rect->w > 0 && cursor_rect->h > 0;
 
       for (int ty = 0; ty < tiles_y_; ++ty) {
         const int tile_y = ty * tile_wire::TILE_SIZE;
@@ -325,7 +367,25 @@ namespace sds {
           const int tile_x = tx * tile_wire::TILE_SIZE;
           const int tile_w = std::min(tile_wire::TILE_SIZE, width - tile_x);
 
+          const std::uint32_t key = tile_key(tx, ty);
           auto &state = tiles_[static_cast<std::size_t>(ty) * static_cast<std::size_t>(tiles_x_) + static_cast<std::size_t>(tx)];
+
+          const bool touches_cursor = has_cursor &&
+                                      tile_x < cursor_rect->x + cursor_rect->w &&
+                                      tile_x + tile_w > cursor_rect->x &&
+                                      tile_y < cursor_rect->y + cursor_rect->h &&
+                                      tile_y + tile_h > cursor_rect->y;
+          if (touches_cursor) {
+            state.has_hash = false;
+            state.settled_frames = 0;
+            state.refined_sent = false;
+            erase_queued_tile_locked(key);
+            if (state.client_active) {
+              enqueue_invalidation_locked(tx, ty);
+            }
+            continue;
+          }
+
           const std::uint64_t h = hash_tile_bgr(bgra, stride, tile_x, tile_y, tile_w, tile_h);
 
           if (!state.has_hash || state.hash != h) {
@@ -333,7 +393,10 @@ namespace sds {
             state.has_hash = true;
             state.settled_frames = 0;
             state.refined_sent = false;
-            erase_queued_tile_locked(tile_key(tx, ty));
+            erase_queued_tile_locked(key);
+            if (state.client_active) {
+              enqueue_invalidation_locked(tx, ty);
+            }
             continue;
           }
 
@@ -342,8 +405,16 @@ namespace sds {
           }
 
           if (state.settled_frames == 2 && !state.refined_sent) {
-            state.refined_sent = true;
             if (!has_high_chroma_error_bgra(bgra, stride, tile_x, tile_y, tile_w, tile_h)) {
+              state.refined_sent = true;
+              if (state.client_active) {
+                enqueue_invalidation_locked(tx, ty);
+              }
+              continue;
+            }
+
+            if (ready_tiles_.size() >= tile_wire::MAX_READY_QUEUE && !ready_tiles_.contains(key)) {
+              // Leave refined_sent = false so the tile enqueues on the next frame once drained.
               continue;
             }
 
@@ -362,10 +433,18 @@ namespace sds {
 
             if (tile_qoi::qoi_encode_rgb24(scratch_rgb_.data(), tile_w * 3, tile_w, tile_h, scratch_qoi_) &&
                 scratch_qoi_.size() <= tile_wire::MAX_TILE_PAYLOAD) {
+              erase_invalidation_locked(key);
               enqueue_tile_locked(tx, ty, tile_w, tile_h, std::move(scratch_qoi_));
+            } else if (state.client_active) {
+              enqueue_invalidation_locked(tx, ty);
             }
+            state.refined_sent = true;
           }
         }
+      }
+
+      if (pending_invalidations_.size() > tile_wire::MAX_PER_TILE_INVALIDATIONS) {
+        collapse_invalidations_to_reset_locked();
       }
 
       wake_waiting_locked(now, ready_replies, next_wake);
@@ -406,11 +485,12 @@ namespace sds {
     }
 
     const bool send_reset = pending_reset_all_ && grid_w_ > 0 && grid_h_ > 0;
-    if (!send_reset && ready_order_.empty()) {
+    const bool has_invalidations = !send_reset && !invalidation_order_.empty();
+    if (!send_reset && !has_invalidations && ready_order_.empty()) {
       return false;
     }
 
-    if (!send_reset && !ready_order_.empty()) {
+    if (!send_reset && !has_invalidations && !ready_order_.empty()) {
       const auto &front_tile = ready_tiles_.at(ready_order_.front());
       const double min_needed = static_cast<double>(tile_wire::HEADER_SIZE + tile_wire::TILE_HEADER_SIZE + front_tile.payload.size());
       if (bw_tokens_ < min_needed) {
@@ -428,6 +508,52 @@ namespace sds {
     body.resize(tile_wire::HEADER_SIZE, '\0');
     std::size_t batch_bytes = tile_wire::HEADER_SIZE;
     std::uint16_t tile_count = 0;
+
+    if (send_reset) {
+      invalidation_order_.clear();
+      pending_invalidations_.clear();
+      for (auto &t : tiles_) {
+        if (t.client_active) {
+          t.client_active = false;
+          t.refined_sent = false;
+        }
+      }
+    } else {
+      // Emit per-tile invalidations first so stale refined tiles clear immediately without QOI throttling
+      while (!invalidation_order_.empty() && tile_count < tile_wire::MAX_TILES_PER_BATCH) {
+        if (batch_bytes + tile_wire::TILE_HEADER_SIZE > tile_wire::MAX_BATCH_BYTES) {
+          break;
+        }
+        const std::uint32_t key = invalidation_order_.front();
+        invalidation_order_.pop_front();
+        pending_invalidations_.erase(key);
+
+        const int tx = static_cast<int>(key & 0xFFFFu);
+        const int ty = static_cast<int>((key >> 16) & 0xFFFFu);
+        if (tx < 0 || tx >= tiles_x_ || ty < 0 || ty >= tiles_y_) {
+          continue;
+        }
+
+        const int tile_x = tx * tile_wire::TILE_SIZE;
+        const int tile_y = ty * tile_wire::TILE_SIZE;
+        const int tile_w = std::min(tile_wire::TILE_SIZE, grid_w_ - tile_x);
+        const int tile_h = std::min(tile_wire::TILE_SIZE, grid_h_ - tile_y);
+        if (tile_w <= 0 || tile_h <= 0) {
+          continue;
+        }
+
+        tiles_[static_cast<std::size_t>(ty) * static_cast<std::size_t>(tiles_x_) + static_cast<std::size_t>(tx)].client_active = false;
+        append_u32_le(body, ++seq_counter_);
+        append_u16_le(body, static_cast<std::uint16_t>(tile_x));
+        append_u16_le(body, static_cast<std::uint16_t>(tile_y));
+        append_u16_le(body, static_cast<std::uint16_t>(tile_w));
+        append_u16_le(body, static_cast<std::uint16_t>(tile_h));
+        append_u32_le(body, 0u);
+
+        batch_bytes += tile_wire::TILE_HEADER_SIZE;
+        ++tile_count;
+      }
+    }
 
     while (!ready_order_.empty() && tile_count < tile_wire::MAX_TILES_PER_BATCH) {
       const std::uint32_t key = ready_order_.front();
@@ -454,6 +580,12 @@ namespace sds {
       append_u16_le(body, tile.h);
       append_u32_le(body, static_cast<std::uint32_t>(tile.payload.size()));
       body.append(reinterpret_cast<const char *>(tile.payload.data()), tile.payload.size());
+
+      const int tx = tile.x / tile_wire::TILE_SIZE;
+      const int ty = tile.y / tile_wire::TILE_SIZE;
+      if (tx >= 0 && tx < tiles_x_ && ty >= 0 && ty < tiles_y_) {
+        tiles_[static_cast<std::size_t>(ty) * static_cast<std::size_t>(tiles_x_) + static_cast<std::size_t>(tx)].client_active = true;
+      }
 
       batch_bytes += rec_bytes;
       ++tile_count;
@@ -640,6 +772,11 @@ namespace sds {
   std::size_t tile_refiner_t::ready_queue_size() const {
     std::lock_guard lock {state_mutex_};
     return ready_tiles_.size();
+  }
+
+  std::size_t tile_refiner_t::pending_invalidation_count() const {
+    std::lock_guard lock {state_mutex_};
+    return pending_invalidations_.size();
   }
 
   std::size_t tile_refiner_t::parked_poll_count() const {

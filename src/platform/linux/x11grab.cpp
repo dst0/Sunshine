@@ -471,6 +471,13 @@ namespace platf {
 
     auto delta_height = std::min<uint16_t>(overlay->height, std::max(0, screen_height - overlay->y));
     auto delta_width = std::min<uint16_t>(overlay->width, std::max(0, screen_width - overlay->x));
+    if (delta_width > 0 && delta_height > 0) {
+      img.has_cursor_rect = true;
+      img.cursor_x = overlay->x;
+      img.cursor_y = overlay->y;
+      img.cursor_w = delta_width;
+      img.cursor_h = delta_height;
+    }
     for (auto y = 0; y < delta_height; ++y) {
       auto overlay_begin = &overlay->pixels[y * overlay->width];
       auto overlay_end = &overlay->pixels[y * overlay->width + delta_width];
@@ -697,6 +704,11 @@ namespace platf {
       img->data = (uint8_t *) x_img->data;
       img->row_pitch = x_img->bytes_per_line;
       img->pixel_pitch = x_img->bits_per_pixel / 8;
+      img->has_cursor_rect = false;
+      img->cursor_x = 0;
+      img->cursor_y = 0;
+      img->cursor_w = 0;
+      img->cursor_h = 0;
       img->img.reset(x_img);
 
       if (cursor) {
@@ -870,6 +882,11 @@ namespace platf {
 
         std::copy_n(data.data, frame_size(), img_out->data);
         img_out->frame_timestamp = frame_timestamp;
+        img_out->has_cursor_rect = false;
+        img_out->cursor_x = 0;
+        img_out->cursor_y = 0;
+        img_out->cursor_w = 0;
+        img_out->cursor_h = 0;
 
         if (cursor) {
           blend_cursor(shm_xdisplay.get(), *img_out, offset_x, offset_y);

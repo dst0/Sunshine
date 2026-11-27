@@ -2624,9 +2624,15 @@ namespace sds {
         });
       }
 
-      void submit_bgra(const std::uint8_t *bgra, int stride, int width, int height) {
+      void submit_bgra(
+        const std::uint8_t *bgra,
+        int stride,
+        int width,
+        int height,
+        std::optional<cursor_rect_t> cursor_rect = std::nullopt
+      ) {
         if (!shut_down_.load(std::memory_order_acquire) && tile_refiner_) {
-          tile_refiner_->submit_bgra_frame(bgra, stride, width, height);
+          tile_refiner_->submit_bgra_frame(bgra, stride, width, height, cursor_rect);
         }
       }
     };
@@ -2774,12 +2780,18 @@ namespace sds {
     return tile_refinement_enabled_atomic.load(std::memory_order_acquire);
   }
 
-  void submit_bgra_frame(const std::uint8_t *bgra, int stride, int width, int height) {
+  void submit_bgra_frame(
+    const std::uint8_t *bgra,
+    int stride,
+    int width,
+    int height,
+    std::optional<cursor_rect_t> cursor_rect
+  ) {
     if (!tile_refinement_enabled_atomic.load(std::memory_order_acquire)) {
       return;
     }
     if (const auto runtime = current(); runtime) {
-      runtime->submit_bgra(bgra, stride, width, height);
+      runtime->submit_bgra(bgra, stride, width, height, cursor_rect);
     }
   }
 

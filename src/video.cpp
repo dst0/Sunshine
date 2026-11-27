@@ -2771,7 +2771,11 @@ namespace video {
     if (disp && (img.width != disp->width || img.height != disp->height)) {
       return;
     }
-    sds::submit_bgra_frame(img.data, img.row_pitch, img.width, img.height);
+    std::optional<sds::cursor_rect_t> cursor_rect;
+    if (img.has_cursor_rect && img.cursor_w > 0 && img.cursor_h > 0) {
+      cursor_rect = sds::cursor_rect_t {img.cursor_x, img.cursor_y, img.cursor_w, img.cursor_h};
+    }
+    sds::submit_bgra_frame(img.data, img.row_pitch, img.width, img.height, cursor_rect);
   }
 
   /**
