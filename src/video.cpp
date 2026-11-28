@@ -3377,6 +3377,130 @@ namespace video {
   }
 
   /**
+   * @brief Dedicated CPU-accessible BGRA capture loop for SDLL v1 lossless video mode.
+   */
+  void capture_lossless(safe::mail_t mail, config_t config) {
+    platf::adjust_thread_priority(platf::thread_priority_e::high);
+
+    auto shutdown_event = mail->event<bool>(mail::shutdown);
+    auto touch_port_event = mail->event<input::touch_port_t>(mail::touch_port);
+    auto hdr_event = mail->event<hdr_info_t>(mail::hdr);
+    auto switch_display_event = mail::man->event<int>(mail::switch_display);
+
+    auto fg = util::fail_guard([&shutdown_event]() {
+      shutdown_event->raise(true);
+    });
+
+    hdr_event->raise(std::make_unique<hdr_info_raw_t>(false));
+
+    std::vector<std::string> display_names;
+    int display_p = -1;
+    bool display_cursor = true;
+
+    while (!shutdown_event->peek()) {
+      refresh_displays(platf::mem_type_e::system, display_names, display_p);
+      if (display_names.empty()) {
+        std::this_thread::sleep_for(50ms);
+        continue;
+      }
+      if (switch_display_event->peek()) {
+        display_p = std::clamp(*switch_display_event->pop(), 0, static_cast<int>(display_names.size()) - 1);
+      }
+
+      auto disp = platf::display(platf::mem_type_e::system, display_names[display_p], config);
+      if (!disp) {
+        std::this_thread::sleep_for(50ms);
+        continue;
+      }
+
+      touch_port_event->raise(make_port(disp.get(), config));
+
+      if (auto init_img = disp->alloc_img(); init_img && !disp->dummy_img(init_img.get())) {
+        if (!init_img->is_vram_only && init_img->data && init_img->pixel_pitch == 4 &&
+            init_img->width > 0 && init_img->height > 0 && init_img->row_pitch >= init_img->width * 4) {
+          const auto ts = std::chrono::duration_cast<std::chrono::microseconds>(
+                            std::chrono::steady_clock::now().time_since_epoch()
+          )
+                            .count();
+          sds::submit_lossless_bgra_frame(
+            init_img->data,
+            init_img->row_pitch,
+            init_img->width,
+            init_img->height,
+            static_cast<std::uint64_t>(ts)
+          );
+        }
+      }
+
+      constexpr std::size_t kPoolSize = 4;
+      std::array<std::shared_ptr<platf::img_t>, kPoolSize> pool;
+
+      auto pull_cb = [&](std::shared_ptr<platf::img_t> &img_out) -> bool {
+        img_out.reset();
+        while (!shutdown_event->peek()) {
+          for (auto &slot : pool) {
+            if (slot && slot.use_count() == 1) {
+              img_out = slot;
+              img_out->frame_timestamp.reset();
+              return true;
+            }
+          }
+          for (auto &slot : pool) {
+            if (!slot) {
+              slot = disp->alloc_img();
+              img_out = slot;
+              if (img_out) {
+                img_out->frame_timestamp.reset();
+                return true;
+              }
+            }
+          }
+          std::this_thread::sleep_for(1ms);
+        }
+        return false;
+      };
+
+      bool artificial_reinit = false;
+      auto push_cb = [&](std::shared_ptr<platf::img_t> &&img, bool frame_captured) -> bool {
+        if (frame_captured && img && !img->is_vram_only && img->data && img->pixel_pitch == 4 &&
+            img->width > 0 && img->height > 0 && img->row_pitch >= img->width * 4) {
+          const auto tp = img->frame_timestamp.value_or(std::chrono::steady_clock::now());
+          const auto ts = std::chrono::duration_cast<std::chrono::microseconds>(tp.time_since_epoch()).count();
+          sds::submit_lossless_bgra_frame(
+            img->data,
+            img->row_pitch,
+            img->width,
+            img->height,
+            static_cast<std::uint64_t>(ts)
+          );
+          platf::enable_mouse_keys();
+        }
+        if (shutdown_event->peek()) {
+          return false;
+        }
+        if (switch_display_event->peek()) {
+          artificial_reinit = true;
+          return false;
+        }
+        return true;
+      };
+
+      auto status = disp->capture(push_cb, pull_cb, &display_cursor);
+      for (auto &slot : pool) {
+        slot.reset();
+      }
+      disp.reset();
+
+      if (artificial_reinit && status != platf::capture_e::capture_error) {
+        status = platf::capture_e::reinit;
+      }
+      if (status != platf::capture_e::reinit) {
+        break;
+      }
+    }
+  }
+
+  /**
    * @brief Capture and encode video for a streaming session.
    *
    * @param mail Session mail bus.
@@ -3388,6 +3512,10 @@ namespace video {
     config_t config,
     stream::session_t *channel_data
   ) {
+    if (config.lossless_mode) {
+      capture_lossless(std::move(mail), config);
+      return;
+    }
     if (config.packed_ycocgr_mode == 0) {
       config.packed_ycocgr_mode = get_session_packed_ycocgr_mode();
     }

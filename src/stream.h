@@ -105,6 +105,17 @@ namespace stream {
      * @return `true` when negotiated via `sdsTileRefinement=1`.
      */
     bool tile_refinement_enabled(session_t &session);
+    /**
+     * @brief Return whether dedicated bit-exact SDLL v1 lossless mode is active for this session.
+     *
+     * @param session Active streaming session.
+     * @return `true` when negotiated via `sdsLosslessMode=1`.
+     */
+    bool lossless_enabled(session_t &session);
+    /**
+     * @brief Return negotiated lossless hash algo & encoder pref for this session.
+     */
+    void lossless_config(session_t &session, std::uint8_t &hash_algo, std::string &encoder_pref);
 
 #ifdef SUNSHINE_TESTS
     namespace test_support {

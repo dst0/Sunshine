@@ -174,6 +174,9 @@ if(${SUNSHINE_ENABLE_VULKAN})
     set(VULKAN_SHADER_SOURCE "${SUNSHINE_SOURCE_ASSETS_DIR}/linux/assets/shaders/vulkan/rgb2yuv.comp")
     set(VULKAN_SHADER_SPV "${VULKAN_SHADER_DIR}/rgb2yuv.spv")
     set(VULKAN_SHADER_DATA "${VULKAN_SHADER_DIR}/rgb2yuv.spv.inc")
+    set(LOSSLESS_SHADER_SOURCE "${SUNSHINE_SOURCE_ASSETS_DIR}/linux/assets/shaders/vulkan/sds_lossless_encode.comp")
+    set(LOSSLESS_SHADER_SPV "${VULKAN_SHADER_DIR}/sds_lossless_encode.spv")
+    set(LOSSLESS_SHADER_DATA "${VULKAN_SHADER_DIR}/sds_lossless_encode.spv.inc")
 
     file(MAKE_DIRECTORY "${VULKAN_SHADER_DIR}")
 
@@ -184,12 +187,24 @@ if(${SUNSHINE_ENABLE_VULKAN})
                 DEPENDS "${VULKAN_SHADER_SOURCE}"
                 COMMENT "Compiling Vulkan shader rgb2yuv.comp (glslc)"
                 VERBATIM)
+        add_custom_command(
+                OUTPUT "${LOSSLESS_SHADER_SPV}"
+                COMMAND ${GLSLC_EXECUTABLE} -O "${LOSSLESS_SHADER_SOURCE}" -o "${LOSSLESS_SHADER_SPV}"
+                DEPENDS "${LOSSLESS_SHADER_SOURCE}"
+                COMMENT "Compiling Vulkan shader sds_lossless_encode.comp (glslc)"
+                VERBATIM)
     else()
         add_custom_command(
                 OUTPUT "${VULKAN_SHADER_SPV}"
                 COMMAND ${GLSLANG_EXECUTABLE} -V -o "${VULKAN_SHADER_SPV}" "${VULKAN_SHADER_SOURCE}"
                 DEPENDS "${VULKAN_SHADER_SOURCE}"
                 COMMENT "Compiling Vulkan shader rgb2yuv.comp (glslangValidator)"
+                VERBATIM)
+        add_custom_command(
+                OUTPUT "${LOSSLESS_SHADER_SPV}"
+                COMMAND ${GLSLANG_EXECUTABLE} -V -o "${LOSSLESS_SHADER_SPV}" "${LOSSLESS_SHADER_SOURCE}"
+                DEPENDS "${LOSSLESS_SHADER_SOURCE}"
+                COMMENT "Compiling Vulkan shader sds_lossless_encode.comp (glslangValidator)"
                 VERBATIM)
     endif()
 
@@ -200,12 +215,21 @@ if(${SUNSHINE_ENABLE_VULKAN})
             DEPENDS "${VULKAN_SHADER_SPV}"
             COMMENT "Generating C include from rgb2yuv.spv"
             VERBATIM)
+    add_custom_command(
+            OUTPUT "${LOSSLESS_SHADER_DATA}"
+            COMMAND ${CMAKE_COMMAND} -DSPV_FILE=${LOSSLESS_SHADER_SPV} -DOUT_FILE=${LOSSLESS_SHADER_DATA}
+                -P "${CMAKE_SOURCE_DIR}/cmake/scripts/binary_to_c.cmake"
+            DEPENDS "${LOSSLESS_SHADER_SPV}"
+            COMMENT "Generating C include from sds_lossless_encode.spv"
+            VERBATIM)
 
     add_custom_target(vulkan_shaders
-            DEPENDS "${VULKAN_SHADER_DATA}"
+            DEPENDS "${VULKAN_SHADER_DATA}" "${LOSSLESS_SHADER_DATA}"
             COMMENT "Vulkan shader compilation")
     set(SUNSHINE_TARGET_DEPENDENCIES ${SUNSHINE_TARGET_DEPENDENCIES} vulkan_shaders)
 endif()
+
+list(APPEND PLATFORM_TARGET_FILES "${CMAKE_SOURCE_DIR}/src/sds/lossless_gpu_vulkan.cpp")
 
 # wayland
 if(${SUNSHINE_ENABLE_WAYLAND})

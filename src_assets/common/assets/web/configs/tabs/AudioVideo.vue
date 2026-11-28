@@ -128,5 +128,23 @@ const config = ref(props.config)
         :config="config"
     />
 
+    <!-- Bit-Exact Lossless Video (secure-desktop-stream) -->
+    <Checkbox class="mb-3"
+              id="lossless_video"
+              locale-prefix="config"
+              v-model="config.lossless_video"
+              default="true"
+    ></Checkbox>
+
+    <div class="mb-3" v-if="config.lossless_video === 'enabled' || config.lossless_video === true">
+      <label for="lossless_encoder" class="form-label">{{ $t('config.lossless_encoder') }}</label>
+      <select id="lossless_encoder" class="form-select" v-model="config.lossless_encoder">
+        <option value="auto">{{ $t('config.lossless_encoder_auto') }}</option>
+        <option value="gpu">{{ $t('config.lossless_encoder_gpu') }}</option>
+        <option value="cpu">{{ $t('config.lossless_encoder_cpu') }}</option>
+      </select>
+      <div class="form-text">{{ $t('config.lossless_encoder_desc') }}</div>
+    </div>
+
   </div>
 </template>

@@ -677,6 +677,42 @@ namespace rtsp_stream {
       return false;
     }
 
+    bool has_lossless_session(std::string_view cert) {
+      auto lg = _session_slots.lock();
+      for (const auto &slot : *_session_slots) {
+        if (stream::session::client_cert(*slot) == cert &&
+            stream::session::state(*slot) == stream::session::state_e::RUNNING &&
+            stream::session::lossless_enabled(*slot)) {
+          return true;
+        }
+      }
+      return false;
+    }
+
+    bool any_lossless_session() {
+      auto lg = _session_slots.lock();
+      for (const auto &slot : *_session_slots) {
+        if (stream::session::state(*slot) == stream::session::state_e::RUNNING &&
+            stream::session::lossless_enabled(*slot)) {
+          return true;
+        }
+      }
+      return false;
+    }
+
+    bool get_lossless_session_config(std::string_view cert, std::uint8_t &hash_algo, std::string &encoder_pref) {
+      auto lg = _session_slots.lock();
+      for (const auto &slot : *_session_slots) {
+        if (stream::session::client_cert(*slot) == cert &&
+            stream::session::state(*slot) == stream::session::state_e::RUNNING &&
+            stream::session::lossless_enabled(*slot)) {
+          stream::session::lossless_config(*slot, hash_algo, encoder_pref);
+          return true;
+        }
+      }
+      return false;
+    }
+
     /**
      * @brief Removes the provided session from the set of sessions.
      * @param session The session to remove.
@@ -779,6 +815,24 @@ namespace rtsp_stream {
 
   bool any_tile_refinement_session() {
     return server.any_tile_refinement_session();
+  }
+
+  bool has_lossless_session(std::string_view cert_pem) {
+    if (cert_pem.empty()) {
+      return false;
+    }
+    return server.has_lossless_session(cert_pem);
+  }
+
+  bool any_lossless_session() {
+    return server.any_lossless_session();
+  }
+
+  bool get_lossless_session_config(std::string_view cert_pem, std::uint8_t &hash_algo, std::string &encoder_pref) {
+    if (cert_pem.empty()) {
+      return false;
+    }
+    return server.get_lossless_session_config(cert_pem, hash_algo, encoder_pref);
   }
 
   namespace {
@@ -1283,6 +1337,7 @@ namespace rtsp_stream {
       config.monitor.chromaSamplingType = (int) util::from_view(args.at("x-ss-video[0].chromaSamplingType"sv));
       config.monitor.enableIntraRefresh = (int) util::from_view(args.at("x-ss-video[0].intraRefresh"sv));
       config.monitor.packed_ycocgr_mode = session.packed_ycocgr_mode;
+      config.monitor.lossless_mode = session.lossless_mode;
 
       configuredBitrateKbps = util::from_view(args.at("x-ml-video.configuredBitrateKbps"sv));
     } catch (std::out_of_range &) {

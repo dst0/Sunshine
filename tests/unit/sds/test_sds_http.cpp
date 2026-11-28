@@ -689,7 +689,7 @@ TEST_F(SdsHttpTest, ServerInfoIsAnsweredWhileAnUploadChunkIsBeingWritten) {
   EXPECT_LT(std::chrono::steady_clock::now() - started, 3s);
   ASSERT_EQ(info.status, 200);
   EXPECT_NE(info.body.find("<sdsVersion>1</sdsVersion>"), std::string::npos) << info.body;
-  EXPECT_NE(info.body.find("<sdsFeatures>clipboard,files,xdnd_drop,host_encoder,host_capture_adapter,host_resolution,adaptive_tile_refinement</sdsFeatures>"), std::string::npos) << info.body;
+  EXPECT_NE(info.body.find("<sdsFeatures>clipboard,files,xdnd_drop,host_encoder,host_capture_adapter,host_resolution,adaptive_tile_refinement,lossless_video</sdsFeatures>"), std::string::npos) << info.body;
   EXPECT_EQ(chunk.wait_for(0ms), std::future_status::timeout) << "the chunk is still being processed";
 
   release.set_value();

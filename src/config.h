@@ -420,6 +420,8 @@ namespace config {
     bool file_transfer;  ///< Global switch for file transfer.
     bool file_clipboard;  ///< Global switch for native file clipboard sync.
     bool mic_passthrough;  ///< Global switch for microphone passthrough.
+    bool lossless_video;  ///< Global switch for bit-exact SDLL lossless video mode.
+    std::string lossless_encoder;  ///< Preferred host lossless encoder ("auto", "gpu", "cpu").
     std::size_t clipboard_text_max;  ///< Maximum clipboard text in UTF-8 bytes.
     std::size_t clipboard_image_max;  ///< Maximum clipboard PNG in bytes.
     int clipboard_rate;  ///< Clipboard requests per second per client, both directions.

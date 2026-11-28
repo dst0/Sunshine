@@ -598,6 +598,9 @@ namespace stream {
     sds::mic::session_handle_t mic;  ///< Running microphone passthrough, stopped with the stream.
     std::string input_session_id;  ///< Stable client identity used to retain input devices across resume.
     bool tile_refinement = false;  ///< Adaptive dirty-tile lossless refinement negotiated on launch/resume.
+    bool lossless_mode = false;  ///< Dedicated bit-exact SDLL v1 lossless video mode.
+    std::uint8_t lossless_hash_algo = 1;  ///< Lossless hash algorithm (0=none, 1=crc32c, 2=blake3).
+    std::string lossless_encoder_pref = "auto";  ///< Lossless host encoder preference.
 
     safe::mail_raw_t::event_t<bool> shutdown_event;  ///< Event raised when the stream should shut down.
     safe::signal_t controlEnd;  ///< Signal raised when the control channel exits.
@@ -2327,6 +2330,9 @@ namespace stream {
       if (session.tile_refinement) {
         sds::on_tile_refinement_sessions_changed(running ? std::string_view {} : std::string_view {session.client_cert});
       }
+      if (session.lossless_mode) {
+        sds::on_lossless_sessions_changed(running ? std::string_view {} : std::string_view {session.client_cert});
+      }
       return true;
     }
 
@@ -2348,6 +2354,15 @@ namespace stream {
 
     bool tile_refinement_enabled(session_t &session) {
       return session.tile_refinement;
+    }
+
+    bool lossless_enabled(session_t &session) {
+      return session.lossless_mode;
+    }
+
+    void lossless_config(session_t &session, std::uint8_t &hash_algo, std::string &encoder_pref) {
+      hash_algo = session.lossless_hash_algo;
+      encoder_pref = session.lossless_encoder_pref;
     }
 
     /**
@@ -2509,8 +2524,12 @@ namespace stream {
       session->client_cert = launch_session.client_cert;
       session->input_session_id = launch_session.client_cert.empty() ? launch_session.unique_id : launch_session.client_cert;
       session->tile_refinement = launch_session.tile_refinement;
+      session->lossless_mode = launch_session.lossless_mode;
+      session->lossless_hash_algo = launch_session.lossless_hash_algo;
+      session->lossless_encoder_pref = launch_session.lossless_encoder_pref;
 
       session->config = config;
+      session->config.monitor.lossless_mode = launch_session.lossless_mode;
 
       session->control.connect_data = launch_session.control_connect_data;
       session->control.feedback_queue = mail->queue<platf::gamepad_feedback_msg_t>(mail::gamepad_feedback);

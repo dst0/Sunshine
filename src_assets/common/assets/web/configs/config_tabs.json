@@ -63,7 +63,9 @@
       },
       "max_bitrate": 0,
       "max_stream_resolution": "",
-      "minimum_fps_target": 0
+      "minimum_fps_target": 0,
+      "lossless_video": "enabled",
+      "lossless_encoder": "auto"
     }
   },
   {

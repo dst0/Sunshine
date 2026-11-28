@@ -53,6 +53,7 @@ namespace video {
     int chromaSamplingType;  ///< Chroma sampling type: 0 = 4:2:0, 1 = 4:4:4.
     int enableIntraRefresh;  ///< Intra refresh setting: 0 = disabled, 1 = enabled.
     int packed_ycocgr_mode = 0;  ///< Packed YCoCg-R 4:4:4 mode: 0 = disabled, 1 = Layout A1.
+    bool lossless_mode = false;  ///< Dedicated bit-exact SDLL v1 lossless video mode.
   };
 
   /**

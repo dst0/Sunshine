@@ -80,6 +80,7 @@ set(PLATFORM_TARGET_FILES
         "${CMAKE_SOURCE_DIR}/src/sds/clipboard_backend.h"
         "${CMAKE_SOURCE_DIR}/src/sds/clipboard_backend_util.h"
         "${CMAKE_SOURCE_DIR}/src/sds/clipboard_backend_util.cpp"
+        "${CMAKE_SOURCE_DIR}/src/sds/lossless_gpu_d3d11.cpp"
         "${CMAKE_SOURCE_DIR}/third-party/ViGEmClient/src/ViGEmClient.cpp"
         "${CMAKE_SOURCE_DIR}/third-party/ViGEmClient/include/ViGEm/Client.h"
         "${CMAKE_SOURCE_DIR}/third-party/ViGEmClient/include/ViGEm/Common.h"

@@ -900,6 +900,8 @@ namespace config {
     true,  // file_transfer
     false,  // file_clipboard
     true,  // mic_passthrough
+    true,  // lossless_video
+    "auto",  // lossless_encoder
     1024 * 1024,  // clipboard_text_max: 1 MiB
     16 * 1024 * 1024,  // clipboard_image_max: 16 MiB
     10,  // clipboard_rate per second
@@ -1806,6 +1808,8 @@ namespace config {
     bool_f(vars, "file_transfer", sds.file_transfer);
     bool_f(vars, "file_clipboard", sds.file_clipboard);
     bool_f(vars, "mic_passthrough", sds.mic_passthrough);
+    bool_f(vars, "lossless_video", sds.lossless_video);
+    string_f(vars, "lossless_encoder", sds.lossless_encoder);
     byte_size_between(vars, "clipboard_text_max", sds.clipboard_text_max, {1, 16 * MiB});
     byte_size_between(vars, "clipboard_image_max", sds.clipboard_image_max, {1, 64 * MiB});
     if (const auto rate = unit_int_between(vars, "clipboard_rate", "/s"sv, {1, 1000}); rate) {

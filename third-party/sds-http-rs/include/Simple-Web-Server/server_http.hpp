@@ -454,6 +454,33 @@ namespace SimpleWeb {
           sds_http_response_abort(sender);
         }
       }
+
+      SdsHttpRawStream *upgrade_raw(
+        const std::string &http_response_head,
+        std::size_t queue_capacity,
+        void (*on_client_data)(void *user_data, const std::uint8_t *data, std::size_t len),
+        void (*on_closed)(void *user_data),
+        void *user_data
+      ) noexcept {
+        SdsHttpResponseSender *sender = nullptr;
+        {
+          std::lock_guard lock(mutex_);
+          if (aborted_ || !sender_) {
+            return nullptr;
+          }
+          sender = sender_;
+          sender_ = nullptr;
+        }
+        return sds_http_response_upgrade(
+          sender,
+          reinterpret_cast<const std::uint8_t *>(http_response_head.data()),
+          http_response_head.size(),
+          queue_capacity,
+          on_client_data,
+          on_closed,
+          user_data
+        );
+      }
     };
 
     class Request {

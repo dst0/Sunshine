@@ -140,6 +140,7 @@ namespace sds::http {
         list.push_back({"GET", std::regex {"^/sds/v1/capabilities$"}, op_e::capabilities});
         list.push_back({"GET", std::regex {"^/sds/v1/events$"}, op_e::events});
         list.push_back({"GET", std::regex {"^/sds/v1/tile-refinement$"}, op_e::tile_refinement});
+        list.push_back({"GET", std::regex {"^/sds/v1/lossless-stream$"}, op_e::lossless_stream});
         list.push_back({"GET", std::regex {"^/sds/v1/clipboard$"}, op_e::clipboard_get});
         list.push_back({"PUT", std::regex {"^/sds/v1/clipboard$"}, op_e::clipboard_put});
         list.push_back({"GET", std::regex {"^/sds/v1/file-clipboard$"}, op_e::file_clipboard_get});
@@ -327,6 +328,63 @@ namespace sds::http {
         }
       }
       fields.body = request->content.string();
+      if (matched->op == op_e::lossless_stream) {
+        const auto ieq = [](std::string_view a, std::string_view b) {
+          if (a.size() != b.size()) {
+            return false;
+          }
+          for (std::size_t i = 0; i < a.size(); ++i) {
+            if (std::tolower(static_cast<unsigned char>(a[i])) != std::tolower(static_cast<unsigned char>(b[i]))) {
+              return false;
+            }
+          }
+          return true;
+        };
+        const auto icontains = [](std::string_view haystack, std::string_view needle) {
+          if (needle.empty()) {
+            return true;
+          }
+          for (std::size_t i = 0; i + needle.size() <= haystack.size(); ++i) {
+            bool ok = true;
+            for (std::size_t j = 0; j < needle.size(); ++j) {
+              if (std::tolower(static_cast<unsigned char>(haystack[i + j])) != std::tolower(static_cast<unsigned char>(needle[j]))) {
+                ok = false;
+                break;
+              }
+            }
+            if (ok) {
+              return true;
+            }
+          }
+          return false;
+        };
+        const auto upg_it = request->header.find("Upgrade");
+        const auto conn_it = request->header.find("Connection");
+        if (upg_it == request->header.end() || !ieq(upg_it->second, "sds-lossless-v1") ||
+            conn_it == request->header.end() || !icontains(conn_it->second, "upgrade")) {
+          respond(reply_t::failure(400, "bad_request", "missing or invalid Upgrade header"));
+          return;
+        }
+        fields.upgrade_raw = [guard](
+                               sds::lossless::lossless_stream_t::raw_data_cb_t on_data,
+                               sds::lossless::lossless_stream_t::raw_closed_cb_t on_closed,
+                               void *user_data
+                             ) -> SdsHttpRawStream * {
+          if (guard->done.exchange(true)) {
+            return nullptr;
+          }
+          static constexpr const char *UPGRADE_HEAD =
+            "HTTP/1.1 101 Switching Protocols\r\n"
+            "Upgrade: sds-lossless-v1\r\n"
+            "Connection: Upgrade\r\n"
+            "\r\n";
+          SdsHttpRawStream *raw = guard->response->upgrade_raw(UPGRADE_HEAD, 2, on_data, on_closed, user_data);
+          if (!raw) {
+            guard->done.store(false);
+          }
+          return raw;
+        };
+      }
 
       handle(matched->op, std::move(fields), std::move(respond));
     }
