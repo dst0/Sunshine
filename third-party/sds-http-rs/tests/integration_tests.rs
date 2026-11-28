@@ -1169,7 +1169,9 @@ fn pq_tls13_http_upgrade_raw_binary_stream_and_backpressure() {
         let sender = unsafe { Box::from_raw(sender) };
         let head = b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: sds-lossless-v1\r\n\r\n".to_vec();
         let st_ptr = Arc::as_ptr(&ctx.state) as usize;
-        let raw = sender.upgrade(head, 2, Some(on_client_data), Some(on_closed), st_ptr);
+        let raw = sender
+            .upgrade(head, 2, Some(on_client_data), Some(on_closed), st_ptr)
+            .expect("upgrade should succeed");
         *ctx.state.stream.lock().unwrap() = Some(raw);
     }
 
@@ -1316,5 +1318,179 @@ fn pq_tls13_http_upgrade_raw_binary_stream_and_backpressure() {
 
     srv.stop();
     srv_thread.join().unwrap();
+    unsafe { drop(Box::from_raw(ctx_ptr)) };
+}
+
+#[test]
+fn upgrade_stream_closes_cleanly_on_server_shutdown_and_fires_on_closed_once() {
+    let srv_cert = generate_cert("srv_up_shut", "127.0.0.1");
+    let cli_cert = generate_cert("cli_up_shut", "client");
+
+    #[derive(Default)]
+    struct State {
+        stream: Mutex<Option<Arc<sds_http_rs::server::RawStreamHandle>>>,
+        closed_count: AtomicUsize,
+    }
+    struct Ctx {
+        bound_port: Mutex<Option<u16>>,
+        state: Arc<State>,
+    }
+
+    extern "C" fn on_bound(ud: *mut c_void, port: u16) {
+        let ctx = unsafe { &*(ud as *const Ctx) };
+        *ctx.bound_port.lock().unwrap() = Some(port);
+    }
+    extern "C" fn create_conn(
+        _: *mut c_void,
+        _: u64,
+        _: *const u8,
+        _: usize,
+        _: u16,
+        _: *const u8,
+        _: usize,
+        _: u16,
+    ) -> *mut c_void {
+        Box::into_raw(Box::new(1u8)) as *mut c_void
+    }
+    extern "C" fn drop_conn(_: *mut c_void, p: *mut c_void) {
+        if !p.is_null() {
+            unsafe { drop(Box::from_raw(p as *mut u8)) };
+        }
+    }
+    extern "C" fn create_req(
+        _: *mut c_void,
+        _: *mut c_void,
+        _: *const ServerRequestHeadFfi,
+    ) -> *mut c_void {
+        Box::into_raw(Box::new(2u8)) as *mut c_void
+    }
+    extern "C" fn drop_req(_: *mut c_void, p: *mut c_void) {
+        if !p.is_null() {
+            unsafe { drop(Box::from_raw(p as *mut u8)) };
+        }
+    }
+    extern "C" fn attach_body(_: *mut c_void, _: *mut c_void, _: *const u8, _: usize) {}
+    extern "C" fn on_closed_cb(ud: *mut c_void) {
+        let st = unsafe { &*(ud as *const State) };
+        st.closed_count.fetch_add(1, Ordering::AcqRel);
+    }
+    extern "C" fn dispatch_req(
+        ud: *mut c_void,
+        _: *mut c_void,
+        sender: *mut ResponseSenderHandle,
+    ) {
+        let ctx = unsafe { &*(ud as *const Ctx) };
+        let sender = unsafe { Box::from_raw(sender) };
+        let head = b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: sds-lossless-v1\r\n\r\n".to_vec();
+        let st_ptr = Arc::as_ptr(&ctx.state) as usize;
+        let raw = sender
+            .upgrade(head, 2, None, Some(on_closed_cb), st_ptr)
+            .expect("upgrade should succeed");
+        *ctx.state.stream.lock().unwrap() = Some(raw);
+    }
+
+    let state = Arc::new(State::default());
+    let ctx = Box::new(Ctx {
+        bound_port: Mutex::new(None),
+        state: state.clone(),
+    });
+    let ctx_ptr = Box::into_raw(ctx);
+
+    let cbs = ServerCallbacks {
+        user_data: ctx_ptr as usize,
+        on_bound: Some(on_bound),
+        create_connection: create_conn,
+        drop_connection: drop_conn,
+        on_connection_accepted: None,
+        on_verify_client: None,
+        on_verify_failed: None,
+        on_connection_authenticated: None,
+        create_request: create_req,
+        drop_request: drop_req,
+        on_request_header: None,
+        attach_request_body: attach_body,
+        dispatch_request: dispatch_req,
+        on_error: None,
+    };
+
+    let srv = Arc::new(
+        HttpServerInstance::create(
+            ServerSettings {
+                port: 0,
+                thread_pool_size: 2,
+                timeout_request_secs: 5,
+                timeout_content_secs: 5,
+                max_request_streambuf_size: 64 * 1024,
+                max_request_header_size: 16 * 1024,
+                address: "127.0.0.1".into(),
+                reuse_address: true,
+                is_https: true,
+                cert_file: Some(srv_cert.cert_path.to_string_lossy().into_owned()),
+                key_file: Some(srv_cert.key_path.to_string_lossy().into_owned()),
+                verify_file: None,
+                require_client_cert: true,
+            },
+            cbs,
+        )
+        .unwrap(),
+    );
+
+    let srv_run = srv.clone();
+    let srv_thread = thread::spawn(move || {
+        srv_run.run().unwrap();
+    });
+
+    let port = loop {
+        let p = unsafe { (*ctx_ptr).bound_port.lock().unwrap() };
+        if let Some(port) = *p {
+            break port;
+        }
+        drop(p);
+        thread::sleep(Duration::from_millis(5));
+    };
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let _kept_tls = rt.block_on(async {
+        let mut provider = aws_lc_rs::default_provider();
+        provider.kx_groups = vec![aws_lc_rs::kx_group::X25519MLKEM768];
+        let verifier = Arc::new(AcceptAllServerCerts {
+            algs: provider.signature_verification_algorithms,
+        });
+        let cert_der = CertificateDer::from(cli_cert.cert_der.clone());
+        let key_der = PrivateKeyDer::try_from(cli_cert.key_der.clone()).unwrap();
+        let client_cfg = ClientConfig::builder_with_provider(Arc::new(provider))
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .unwrap()
+            .dangerous()
+            .with_custom_certificate_verifier(verifier)
+            .with_client_auth_cert(vec![cert_der], key_der)
+            .unwrap();
+        let connector = TlsConnector::from(Arc::new(client_cfg));
+        let tcp = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        let sni = ServerName::try_from("127.0.0.1").unwrap();
+        let mut tls = connector.connect(sni, tcp).await.unwrap();
+        tls.write_all(
+            b"GET /sds/v1/lossless-stream HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: Upgrade\r\nUpgrade: sds-lossless-v1\r\n\r\n",
+        )
+        .await
+        .unwrap();
+        tls.flush().await.unwrap();
+        let mut head = Vec::new();
+        let mut b = [0u8; 1];
+        while !head.ends_with(b"\r\n\r\n") {
+            let n = tls.read(&mut b).await.unwrap();
+            assert!(n > 0);
+            head.push(b[0]);
+        }
+        tls
+    });
+
+    // Server stop while client TLS socket is still open must NOT hang and must fire on_closed once
+    srv.stop();
+    srv_thread.join().unwrap();
+    assert_eq!(state.closed_count.load(Ordering::Acquire), 1);
+    if let Some(h) = state.stream.lock().unwrap().take() {
+        assert!(h.is_closed());
+    }
     unsafe { drop(Box::from_raw(ctx_ptr)) };
 }

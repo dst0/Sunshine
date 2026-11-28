@@ -531,14 +531,16 @@ pub unsafe extern "C" fn sds_http_response_upgrade(
         }
         let handle = unsafe { Box::from_raw(sender) };
         let bytes = unsafe { bytes_slice(response_head, response_head_len) }.to_vec();
-        let stream = handle.upgrade(
+        match handle.upgrade(
             bytes,
             queue_capacity.max(1),
             on_client_data,
             on_closed,
             user_data as usize,
-        );
-        Box::into_raw(Box::new(SdsHttpRawStream(stream)))
+        ) {
+            Some(stream) => Box::into_raw(Box::new(SdsHttpRawStream(stream))),
+            None => std::ptr::null_mut(),
+        }
     }))
     .unwrap_or(std::ptr::null_mut())
 }

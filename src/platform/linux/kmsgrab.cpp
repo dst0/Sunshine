@@ -1991,7 +1991,7 @@ namespace platf {
         img->height = height;
         img->pixel_pitch = 4;
         img->row_pitch = img->pixel_pitch * width;
-        img->data = new std::uint8_t[height * img->row_pitch];
+        img->data = new std::uint8_t[height * img->row_pitch]();
 
         return img;
       }

@@ -287,6 +287,7 @@ void run_encode_tiles() {
     if (lid == 0u) {
         sh_dirty = 0u;
     }
+    memoryBarrierShared();
     barrier();
 
     for (uint i = lid; i < pixels; i += 64u) {
@@ -309,6 +310,7 @@ void run_encode_tiles() {
         rgb8_to_ycocgr_i(r, g, b, cy, cco, ccg);
         sh_ycocg[i] = pack_ycocg(cy, cco, ccg);
     }
+    memoryBarrierShared();
     barrier();
 
     if (pc.is_keyframe == 0u && sh_dirty == 0u) {
@@ -342,6 +344,7 @@ void run_encode_tiles() {
 
         sh_sym[i] = (sy & 0x1FFu) | ((sco & 0x7FFu) << 9) | ((scg & 0x7FFu) << 20);
     }
+    memoryBarrierShared();
     barrier();
 
     if (lid == 0u) {
@@ -421,6 +424,7 @@ void run_encode_tiles() {
             }
         }
     }
+    memoryBarrierShared();
     barrier();
 
     if (sh_best_mode == 1u) return;
@@ -442,6 +446,7 @@ void run_encode_tiles() {
             uint scg = zigzag_u(unpack_cg(sh_ycocg[i]) - pcg);
             sh_sym[i] = (sy & 0x1FFu) | ((sco & 0x7FFu) << 9) | ((scg & 0x7FFu) << 20);
         }
+        memoryBarrierShared();
         barrier();
 
         if (lid == 0u) {
@@ -459,6 +464,7 @@ void run_encode_tiles() {
                 sh_best_mode = 4u;
             }
         }
+        memoryBarrierShared();
         barrier();
     }
 

@@ -77,20 +77,29 @@ namespace sds::lossless {
         std::vector<VkPhysicalDevice> phys(phys_count);
         vkEnumeratePhysicalDevices(instance_, &phys_count, phys.data());
 
+        int best_score = -1;
         for (VkPhysicalDevice pd : phys) {
+          VkPhysicalDeviceProperties props {};
+          vkGetPhysicalDeviceProperties(pd, &props);
+          if (props.deviceType == VK_PHYSICAL_DEVICE_TYPE_CPU) {
+            continue;
+          }
           std::uint32_t qcount = 0;
           vkGetPhysicalDeviceQueueFamilyProperties(pd, &qcount, nullptr);
           std::vector<VkQueueFamilyProperties> qprops(qcount);
           vkGetPhysicalDeviceQueueFamilyProperties(pd, &qcount, qprops.data());
           for (std::uint32_t qi = 0; qi < qcount; ++qi) {
             if (qprops[qi].queueFlags & VK_QUEUE_COMPUTE_BIT) {
-              phys_ = pd;
-              queue_family_ = qi;
+              const int score = (props.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU)   ? 3 :
+                                (props.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU) ? 2 :
+                                                                                               1;
+              if (score > best_score) {
+                best_score = score;
+                phys_ = pd;
+                queue_family_ = qi;
+              }
               break;
             }
-          }
-          if (phys_ != VK_NULL_HANDLE) {
-            break;
           }
         }
         if (phys_ == VK_NULL_HANDLE) {
@@ -287,22 +296,24 @@ namespace sds::lossless {
         const std::size_t total_tiles = static_cast<std::size_t>(tiles_x) * static_cast<std::size_t>(tiles_y);
 
         if (!ensure_buffers(height, frame_bytes, total_tiles)) {
+          has_prev_ = false;
           return false;
         }
 
-        auto *curr_dst = static_cast<std::uint8_t *>(curr_.mapped);
+        curr_cpu_.resize(frame_bytes);
         if (stride == dst_stride) {
-          std::memcpy(curr_dst, bgra, frame_bytes);
+          std::memcpy(curr_cpu_.data(), bgra, frame_bytes);
         } else {
           for (int y = 0; y < height; ++y) {
-            std::memcpy(curr_dst + static_cast<std::size_t>(y) * dst_stride, bgra + static_cast<std::size_t>(y) * stride, dst_stride);
+            std::memcpy(curr_cpu_.data() + static_cast<std::size_t>(y) * dst_stride, bgra + static_cast<std::size_t>(y) * stride, dst_stride);
           }
         }
+        std::memcpy(curr_.mapped, curr_cpu_.data(), frame_bytes);
 
         std::vector<copy_rect_t> copy_rects;
-        if (!is_keyframe) {
+        if (!is_keyframe && prev_cpu_.size() == frame_bytes) {
           copy_rects = detect_scroll_copy_rects(
-            static_cast<const std::uint8_t *>(prev_.mapped), dst_stride, curr_dst, dst_stride, width, height);
+            prev_cpu_.data(), dst_stride, curr_cpu_.data(), dst_stride, width, height);
         }
 
         vulkan_push_t pc {};
@@ -384,7 +395,7 @@ namespace sds::lossless {
 
         std::array<std::uint8_t, 32> frame_hash {};
         if (hash_algo == hash_algo_e::blake3) {
-          frame_hash = blake3_rgb24_from_bgra(curr_dst, dst_stride, width, height);
+          frame_hash = blake3_rgb24_from_bgra(curr_cpu_.data(), dst_stride, width, height);
         }
 
         if (vkWaitForFences(device_, 1, &fence_, VK_TRUE, UINT64_MAX) != VK_SUCCESS) {
@@ -487,6 +498,7 @@ namespace sds::lossless {
         }
 
         std::swap(curr_, prev_);
+        prev_cpu_.swap(curr_cpu_);
         update_descriptors();
         has_prev_ = true;
         width_ = width;
@@ -519,11 +531,22 @@ namespace sds::lossless {
         VkMemoryRequirements mr {};
         vkGetBufferMemoryRequirements(device_, out.buf, &mr);
         std::uint32_t mem_idx = UINT32_MAX;
-        const VkMemoryPropertyFlags want = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+        const VkMemoryPropertyFlags cached_want =
+          VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
+        const VkMemoryPropertyFlags fallback_want =
+          VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
         for (std::uint32_t i = 0; i < mem_props_.memoryTypeCount; ++i) {
-          if ((mr.memoryTypeBits & (1u << i)) && (mem_props_.memoryTypes[i].propertyFlags & want) == want) {
+          if ((mr.memoryTypeBits & (1u << i)) && (mem_props_.memoryTypes[i].propertyFlags & cached_want) == cached_want) {
             mem_idx = i;
             break;
+          }
+        }
+        if (mem_idx == UINT32_MAX) {
+          for (std::uint32_t i = 0; i < mem_props_.memoryTypeCount; ++i) {
+            if ((mr.memoryTypeBits & (1u << i)) && (mem_props_.memoryTypes[i].propertyFlags & fallback_want) == fallback_want) {
+              mem_idx = i;
+              break;
+            }
           }
         }
         if (mem_idx == UINT32_MAX) {
@@ -623,6 +646,8 @@ namespace sds::lossless {
       VkCommandBuffer cmd_buf_ = VK_NULL_HANDLE;
       VkFence fence_ = VK_NULL_HANDLE;
       host_buf_t curr_, prev_, pred_, slots_, row_crcs_, crc_table_;
+      std::vector<std::uint8_t> curr_cpu_;
+      std::vector<std::uint8_t> prev_cpu_;
       int width_ = 0;
       int height_ = 0;
       bool has_prev_ = false;
@@ -641,13 +666,16 @@ namespace sds::lossless {
   }
 
   std::string available_encoder_backends() {
+    static const std::string cached = []() -> std::string {
 #if defined(SUNSHINE_BUILD_VULKAN)
-    auto enc = make_gpu_encoder_backend();
-    if (enc) {
-      return "vulkan,cpu";
-    }
+      auto enc = make_gpu_encoder_backend();
+      if (enc) {
+        return "vulkan,cpu";
+      }
 #endif
-    return "cpu";
+      return "cpu";
+    }();
+    return cached;
   }
 }  // namespace sds::lossless
 

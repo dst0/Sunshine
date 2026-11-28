@@ -122,13 +122,19 @@ namespace sds::lossless {
     std::condition_variable slot_cv_;
     bool stopping_ = false;
     bool has_pending_ = false;
+    bool resend_last_ = false;
     bool has_last_frame_ = false;
     int pending_w_ = 0;
     int pending_h_ = 0;
     int pending_stride_ = 0;
     std::uint64_t pending_ts_us_ = 0;
+    int last_w_ = 0;
+    int last_h_ = 0;
+    int last_stride_ = 0;
+    std::uint64_t last_ts_us_ = 0;
     std::vector<std::uint8_t> pending_frame_;
     std::vector<std::uint8_t> work_frame_;
+    std::vector<std::uint8_t> last_frame_;
 
     // Upgraded raw stream ownership
     mutable std::mutex stream_mutex_;

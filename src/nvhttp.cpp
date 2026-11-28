@@ -1490,9 +1490,7 @@ namespace nvhttp {
       encoder_pref_out = config::sds.lossless_encoder.empty() ? std::string {"auto"} : config::sds.lossless_encoder;
 
       if (sds_lossless_mode.empty() || sds_lossless_mode == "0") {
-        if (sds_lossless_mode == "0" || sds_lossless_mode.empty()) {
-          return true;
-        }
+        return true;
       }
       if (!is_binary_flag_or_empty(sds_lossless_mode)) {
         error_msg = "Invalid sdsLosslessMode parameter";
@@ -2033,8 +2031,10 @@ namespace nvhttp {
       // Probe encoders again before streaming to ensure our chosen
       // encoder matches the active GPU (which could have changed
       // due to hotplugging, driver crash, primary monitor change,
-      // or any number of other factors).
-      if (video::probe_encoders()) {
+      // or any number of other factors). Skip in lossless mode, which
+      // uses its own dedicated capture/encoder pipeline and does not need
+      // hardware YUV encoders to succeed.
+      if (!launch_session->lossless_mode && video::probe_encoders()) {
         tree.put("root.<xmlattr>.status_code", 503);
         tree.put("root.<xmlattr>.status_message", "Failed to initialize video capture/encoding. Is a display connected and turned on?");
         tree.put("root.gamesession", 0);
@@ -2234,8 +2234,10 @@ namespace nvhttp {
       // Probe encoders again before streaming to ensure our chosen
       // encoder matches the active GPU (which could have changed
       // due to hotplugging, driver crash, primary monitor change,
-      // or any number of other factors).
-      if (video::probe_encoders()) {
+      // or any number of other factors). Skip in lossless mode, which
+      // uses its own dedicated capture/encoder pipeline and does not need
+      // hardware YUV encoders to succeed.
+      if (!launch_session->lossless_mode && video::probe_encoders()) {
         tree.put("root.resume", 0);
         tree.put("root.<xmlattr>.status_code", 503);
         tree.put("root.<xmlattr>.status_message", "Failed to initialize video capture/encoding. Is a display connected and turned on?");

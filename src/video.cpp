@@ -3413,24 +3413,12 @@ namespace video {
         continue;
       }
 
-      touch_port_event->raise(make_port(disp.get(), config));
-
-      if (auto init_img = disp->alloc_img(); init_img && !disp->dummy_img(init_img.get())) {
-        if (!init_img->is_vram_only && init_img->data && init_img->pixel_pitch == 4 &&
-            init_img->width > 0 && init_img->height > 0 && init_img->row_pitch >= init_img->width * 4) {
-          const auto ts = std::chrono::duration_cast<std::chrono::microseconds>(
-                            std::chrono::steady_clock::now().time_since_epoch()
-          )
-                            .count();
-          sds::submit_lossless_bgra_frame(
-            init_img->data,
-            init_img->row_pitch,
-            init_img->width,
-            init_img->height,
-            static_cast<std::uint64_t>(ts)
-          );
-        }
+      config_t port_config = config;
+      if (disp->width > 0 && disp->height > 0) {
+        port_config.width = disp->width;
+        port_config.height = disp->height;
       }
+      touch_port_event->raise(make_port(disp.get(), port_config));
 
       constexpr std::size_t kPoolSize = 4;
       std::array<std::shared_ptr<platf::img_t>, kPoolSize> pool;
@@ -3461,19 +3449,28 @@ namespace video {
       };
 
       bool artificial_reinit = false;
+      bool logged_bad_frame = false;
       auto push_cb = [&](std::shared_ptr<platf::img_t> &&img, bool frame_captured) -> bool {
-        if (frame_captured && img && !img->is_vram_only && img->data && img->pixel_pitch == 4 &&
-            img->width > 0 && img->height > 0 && img->row_pitch >= img->width * 4) {
-          const auto tp = img->frame_timestamp.value_or(std::chrono::steady_clock::now());
-          const auto ts = std::chrono::duration_cast<std::chrono::microseconds>(tp.time_since_epoch()).count();
-          sds::submit_lossless_bgra_frame(
-            img->data,
-            img->row_pitch,
-            img->width,
-            img->height,
-            static_cast<std::uint64_t>(ts)
-          );
-          platf::enable_mouse_keys();
+        if (frame_captured && img) {
+          if (!img->is_vram_only && img->data && img->pixel_pitch == 4 &&
+              img->width > 0 && img->height > 0 && img->row_pitch >= img->width * 4) {
+            const auto tp = img->frame_timestamp.value_or(std::chrono::steady_clock::now());
+            const auto ts = std::chrono::duration_cast<std::chrono::microseconds>(tp.time_since_epoch()).count();
+            sds::submit_lossless_bgra_frame(
+              img->data,
+              img->row_pitch,
+              img->width,
+              img->height,
+              static_cast<std::uint64_t>(ts)
+            );
+            platf::enable_mouse_keys();
+          } else if (!logged_bad_frame) {
+            logged_bad_frame = true;
+            BOOST_LOG(warning) << "Lossless capture dropped incompatible frame: is_vram_only="
+                               << img->is_vram_only << " pixel_pitch=" << img->pixel_pitch
+                               << " size=" << img->width << "x" << img->height
+                               << " row_pitch=" << img->row_pitch;
+          }
         }
         if (shutdown_event->peek()) {
           return false;

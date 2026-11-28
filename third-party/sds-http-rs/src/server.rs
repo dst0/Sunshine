@@ -12,11 +12,22 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpListener;
-use tokio::sync::{mpsc, oneshot, watch, Notify};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinSet;
 use tokio_rustls::TlsAcceptor;
 
 static NEXT_CONNECTION_ID: AtomicU64 = AtomicU64::new(1);
+
+async fn wait_close(rx: &mut watch::Receiver<bool>) {
+    if *rx.borrow() {
+        return;
+    }
+    while rx.changed().await.is_ok() {
+        if *rx.borrow() {
+            return;
+        }
+    }
+}
 
 pub trait StreamSockOpt {
     fn configure_low_latency(&self) {}
@@ -38,7 +49,7 @@ pub struct RawStreamHandle {
     tx: mpsc::Sender<Vec<u8>>,
     rx: std::sync::Mutex<Option<mpsc::Receiver<Vec<u8>>>>,
     closed: AtomicBool,
-    close_notify: Notify,
+    close_tx: watch::Sender<bool>,
     writable_mu: std::sync::Mutex<()>,
     writable_cv: std::sync::Condvar,
 }
@@ -46,14 +57,19 @@ pub struct RawStreamHandle {
 impl RawStreamHandle {
     pub fn new(capacity: usize) -> Arc<Self> {
         let (tx, rx) = mpsc::channel(capacity.max(1));
+        let (close_tx, _) = watch::channel(false);
         Arc::new(Self {
             tx,
             rx: std::sync::Mutex::new(Some(rx)),
             closed: AtomicBool::new(false),
-            close_notify: Notify::new(),
+            close_tx,
             writable_mu: std::sync::Mutex::new(()),
             writable_cv: std::sync::Condvar::new(),
         })
+    }
+
+    pub fn subscribe_close(&self) -> watch::Receiver<bool> {
+        self.close_tx.subscribe()
     }
 
     pub fn is_closed(&self) -> bool {
@@ -65,15 +81,14 @@ impl RawStreamHandle {
     }
 
     pub fn wait_writable(&self, timeout_ms: u64) -> bool {
+        let mut g = self.writable_mu.lock().unwrap_or_else(|e| e.into_inner());
         if self.can_send() {
             return true;
         }
         if self.is_closed() {
             return false;
         }
-        let guard = self.writable_mu.lock().unwrap_or_else(|e| e.into_inner());
         let deadline = std::time::Instant::now() + Duration::from_millis(timeout_ms);
-        let mut g = guard;
         while !self.can_send() && !self.is_closed() {
             let now = std::time::Instant::now();
             if now >= deadline {
@@ -91,6 +106,11 @@ impl RawStreamHandle {
         self.can_send()
     }
 
+    pub fn notify_writable(&self) {
+        let _guard = self.writable_mu.lock().unwrap_or_else(|e| e.into_inner());
+        self.writable_cv.notify_all();
+    }
+
     pub fn try_send(&self, data: Vec<u8>) -> Result<(), mpsc::error::TrySendError<Vec<u8>>> {
         if self.is_closed() {
             return Err(mpsc::error::TrySendError::Closed(data));
@@ -100,12 +120,51 @@ impl RawStreamHandle {
 
     pub fn close(&self) {
         self.closed.store(true, Ordering::Release);
-        self.close_notify.notify_waiters();
+        let _ = self.close_tx.send(true);
+        let _guard = self.writable_mu.lock().unwrap_or_else(|e| e.into_inner());
         self.writable_cv.notify_all();
     }
 
     pub fn mark_closed(&self) {
         self.close();
+    }
+}
+
+struct UpgradeClosedGuard {
+    raw_handle: Arc<RawStreamHandle>,
+    on_closed: Option<extern "C" fn(*mut c_void)>,
+    user_data: usize,
+    disarmed: bool,
+}
+
+impl UpgradeClosedGuard {
+    fn new(
+        raw_handle: Arc<RawStreamHandle>,
+        on_closed: Option<extern "C" fn(*mut c_void)>,
+        user_data: usize,
+    ) -> Self {
+        Self {
+            raw_handle,
+            on_closed,
+            user_data,
+            disarmed: false,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.disarmed = true;
+    }
+}
+
+impl Drop for UpgradeClosedGuard {
+    fn drop(&mut self) {
+        if self.disarmed {
+            return;
+        }
+        self.raw_handle.mark_closed();
+        if let Some(cb) = self.on_closed {
+            cb(self.user_data as *mut c_void);
+        }
     }
 }
 
@@ -162,7 +221,7 @@ impl ResponseSenderHandle {
         on_client_data: Option<extern "C" fn(*mut c_void, *const u8, usize)>,
         on_closed: Option<extern "C" fn(*mut c_void)>,
         user_data: usize,
-    ) -> Arc<RawStreamHandle> {
+    ) -> Option<Arc<RawStreamHandle>> {
         let stream = RawStreamHandle::new(capacity);
         if let Some(tx) = self.tx.take() {
             if tx
@@ -176,11 +235,13 @@ impl ResponseSenderHandle {
                 .is_err()
             {
                 stream.mark_closed();
+                return None;
             }
+            Some(stream)
         } else {
             stream.mark_closed();
+            None
         }
-        stream
     }
 
     pub fn abort(mut self) {
@@ -1076,10 +1137,16 @@ async fn run_http_loop<S>(
                 on_closed,
                 user_data,
             } => {
+                let mut closed_guard =
+                    UpgradeClosedGuard::new(raw_handle.clone(), on_closed, user_data);
                 let write_res = tokio::select! {
                     biased;
                     _ = wait_shutdown(shutdown_rx) => {
                         raw_handle.mark_closed();
+                        closed_guard.disarm();
+                        if let Some(cb) = on_closed {
+                            let _ = tokio::task::spawn_blocking(move || cb(user_data as *mut c_void)).await;
+                        }
                         return;
                     }
                     res = run_with_timeout(content_timeout, async {
@@ -1089,6 +1156,7 @@ async fn run_http_loop<S>(
                 };
                 if !matches!(write_res, Ok(Ok(()))) {
                     raw_handle.mark_closed();
+                    closed_guard.disarm();
                     if let Some(cb) = on_closed {
                         let _ = tokio::task::spawn_blocking(move || cb(user_data as *mut c_void)).await;
                     }
@@ -1117,6 +1185,7 @@ async fn run_http_loop<S>(
                     on_closed,
                     user_data,
                     shutdown_rx,
+                    closed_guard,
                 )
                 .await;
                 return;
@@ -1191,6 +1260,7 @@ async fn run_upgraded_stream<S>(
     on_closed: Option<extern "C" fn(*mut c_void)>,
     user_data: usize,
     shutdown_rx: &mut watch::Receiver<bool>,
+    mut closed_guard: UpgradeClosedGuard,
 ) where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -1201,6 +1271,7 @@ async fn run_upgraded_stream<S>(
         .take();
     let Some(mut rx) = rx_opt else {
         raw_handle.mark_closed();
+        closed_guard.disarm();
         if let Some(cb) = on_closed {
             let _ = tokio::task::spawn_blocking(move || cb(user_data as *mut c_void)).await;
         }
@@ -1210,6 +1281,8 @@ async fn run_upgraded_stream<S>(
     let (mut reader, mut writer) = tokio::io::split(stream);
     let mut shut_rx_r = shutdown_rx.clone();
     let mut shut_rx_w = shutdown_rx.clone();
+    let mut close_rx_r = raw_handle.subscribe_close();
+    let mut close_rx_w = raw_handle.subscribe_close();
     let h_read = raw_handle.clone();
     let h_write = raw_handle.clone();
 
@@ -1219,7 +1292,7 @@ async fn run_upgraded_stream<S>(
             let n = tokio::select! {
                 biased;
                 _ = wait_shutdown(&mut shut_rx_r) => break,
-                _ = h_read.close_notify.notified() => break,
+                _ = wait_close(&mut close_rx_r) => break,
                 res = reader.read(&mut buf) => match res {
                     Ok(0) | Err(_) => break,
                     Ok(n) => n,
@@ -1241,14 +1314,23 @@ async fn run_upgraded_stream<S>(
             let pkt = tokio::select! {
                 biased;
                 _ = wait_shutdown(&mut shut_rx_w) => break,
-                _ = h_write.close_notify.notified() => break,
+                _ = wait_close(&mut close_rx_w) => break,
                 maybe = rx.recv() => match maybe {
                     Some(p) => p,
                     None => break,
                 }
             };
-            h_write.writable_cv.notify_all();
-            if writer.write_all(&pkt).await.is_err() || writer.flush().await.is_err() {
+            h_write.notify_writable();
+            let write_res = tokio::select! {
+                biased;
+                _ = wait_shutdown(&mut shut_rx_w) => break,
+                _ = wait_close(&mut close_rx_w) => break,
+                res = run_with_timeout(Some(Duration::from_secs(10)), async {
+                    writer.write_all(&pkt).await?;
+                    writer.flush().await
+                }) => res,
+            };
+            if !matches!(write_res, Ok(Ok(()))) {
                 break;
             }
         }
@@ -1258,6 +1340,7 @@ async fn run_upgraded_stream<S>(
 
     tokio::join!(read_fut, write_fut);
     raw_handle.mark_closed();
+    closed_guard.disarm();
     if let Some(cb) = on_closed {
         let _ = tokio::task::spawn_blocking(move || cb(user_data as *mut c_void)).await;
     }

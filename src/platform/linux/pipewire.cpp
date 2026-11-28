@@ -141,6 +141,7 @@ namespace pipewire {
     }
 
     bool data_owned = false;  ///< Whether img->data is owned by this image and must be freed.
+    std::vector<uint8_t> owned_buffer;  ///< Reusable frame copy for MemPtr captures to avoid front/back swap races.
   };
 
   /**
@@ -328,7 +329,7 @@ namespace pipewire {
      * @param display_is_nvidia Display is nvidia.
      * @return 0 when the PipeWire stream is configured; nonzero on negotiation failure.
      */
-    int ensure_stream(const platf::mem_type_e mem_type, const uint32_t width, const uint32_t height, const AVRational target_framerate, const struct dmabuf_format_info_t *dmabuf_infos, const int n_dmabuf_infos, const bool display_is_nvidia) {
+    int ensure_stream(const platf::mem_type_e mem_type, const uint32_t width, const uint32_t height, const AVRational target_framerate, const struct dmabuf_format_info_t *dmabuf_infos, const int n_dmabuf_infos, const bool display_is_nvidia, const bool lossless_mode = false) {
       pw_thread_loop_lock(loop);
       int result = 0;
       if (!stream_data.stream) {
@@ -367,6 +368,11 @@ namespace pipewire {
 
         // Add fallback for memptr
         for (const auto &fmt : format_map) {
+          if (lossless_mode &&
+              fmt.pw_format != SPA_VIDEO_FORMAT_BGRA &&
+              fmt.pw_format != SPA_VIDEO_FORMAT_BGRx) {
+            continue;
+          }
           auto format_param = build_format_parameter(&pod_builder, width, height, target_framerate, fmt.pw_format, nullptr, 0);
           params[n_params] = format_param;
           n_params++;
@@ -693,7 +699,12 @@ namespace pipewire {
         if (buf->datas[0].type == SPA_DATA_DmaBuf) {
           fill_img_dmabuf(img_descriptor, buf, stream_data);
         } else {
-          img->data = stream_data.front_buffer->data();
+          const auto src_size = stream_data.front_buffer->size();
+          img_descriptor->owned_buffer.resize(src_size);
+          if (src_size > 0) {
+            std::memcpy(img_descriptor->owned_buffer.data(), stream_data.front_buffer->data(), src_size);
+          }
+          img->data = img_descriptor->owned_buffer.data();
           img_descriptor->data_owned = false;
           img->row_pitch = stream_data.local_stride;
           // NV12 is the only 1-byte-per-pixel format delivered on the memory
@@ -1083,6 +1094,7 @@ namespace pipewire {
       }
       this->target_framerate = fps;
       mem_type = hwdevice_type;
+      lossless_mode = config.lossless_mode;
 
       if (get_dmabuf_modifiers() < 0) {
         return -1;
@@ -1120,7 +1132,7 @@ namespace pipewire {
       }
 
       // Start PipeWire now so format negotiation can proceed before capture start
-      if (pipewire.ensure_stream(mem_type, width, height, target_framerate, dmabuf_infos.data(), n_dmabuf_infos, display_is_nvidia) < 0) {
+      if (pipewire.ensure_stream(mem_type, width, height, target_framerate, dmabuf_infos.data(), n_dmabuf_infos, display_is_nvidia, lossless_mode) < 0) {
         BOOST_LOG(error) << "[pipewire] Failed to ensure pipewire stream. pipewire_t::init() failed.";
         return -1;
       }
@@ -1242,7 +1254,7 @@ namespace pipewire {
 
       auto next_frame = std::chrono::steady_clock::now();
 
-      if (pipewire.ensure_stream(mem_type, width, height, target_framerate, dmabuf_infos.data(), n_dmabuf_infos, display_is_nvidia) < 0) {
+      if (pipewire.ensure_stream(mem_type, width, height, target_framerate, dmabuf_infos.data(), n_dmabuf_infos, display_is_nvidia, lossless_mode) < 0) {
         BOOST_LOG(error) << "[pipewire] Failed to ensure pipewire stream. capture() failed with error.";
         return capture_error;
       }
@@ -1548,6 +1560,7 @@ namespace pipewire {
     std::array<struct dmabuf_format_info_t, MAX_DMABUF_FORMATS> dmabuf_infos;
     int n_dmabuf_infos;
     bool display_is_nvidia = false;  // Track if display GPU is NVIDIA
+    bool lossless_mode = false;  ///< Whether session requested bit-exact SDLL lossless video mode.
     std::chrono::nanoseconds delay;
     std::optional<std::uint64_t> last_pts {};
     std::optional<std::uint64_t> last_seq {};
