@@ -1474,6 +1474,64 @@ namespace nvhttp {
       return true;
     }
 
+    bool validate_lossless_request(
+      std::string_view sds_lossless_mode,
+      std::string_view sds_lossless_hash,
+      std::string_view sds_lossless_encoder,
+      const rtsp_stream::launch_session_t &launch_session,
+      std::string_view sds_chroma_mode,
+      bool &lossless_out,
+      std::uint8_t &hash_algo_out,
+      std::string &encoder_pref_out,
+      std::string_view &error_msg
+    ) {
+      lossless_out = false;
+      hash_algo_out = 1;  // crc32c default
+      encoder_pref_out = config::sds.lossless_encoder.empty() ? std::string {"auto"} : config::sds.lossless_encoder;
+
+      if (sds_lossless_mode.empty() || sds_lossless_mode == "0") {
+        if (sds_lossless_mode == "0" || sds_lossless_mode.empty()) {
+          return true;
+        }
+      }
+      if (!is_binary_flag_or_empty(sds_lossless_mode)) {
+        error_msg = "Invalid sdsLosslessMode parameter";
+        return false;
+      }
+      lossless_out = (sds_lossless_mode == "1");
+      if (!lossless_out) {
+        return true;
+      }
+      if (!config::sds.lossless_video) {
+        error_msg = "Lossless video mode is disabled on host";
+        return false;
+      }
+      if (launch_session.enable_hdr || !sds_chroma_mode.empty() || launch_session.tile_refinement) {
+        error_msg = "sdsLosslessMode cannot be combined with HDR, sdsChromaMode, or sdsTileRefinement";
+        return false;
+      }
+      if (sds_lossless_hash.empty() || sds_lossless_hash == "crc32c") {
+        hash_algo_out = 1;
+      } else if (sds_lossless_hash == "blake3") {
+        hash_algo_out = 2;
+      } else if (sds_lossless_hash == "off" || sds_lossless_hash == "none") {
+        hash_algo_out = 0;
+      } else {
+        error_msg = "Invalid sdsLosslessHash parameter";
+        return false;
+      }
+      if (!sds_lossless_encoder.empty()) {
+        if (sds_lossless_encoder != "auto" && sds_lossless_encoder != "gpu" && sds_lossless_encoder != "cpu") {
+          error_msg = "Invalid sdsLosslessEncoder parameter";
+          return false;
+        }
+        if (encoder_pref_out == "auto" || sds_lossless_encoder == "cpu") {
+          encoder_pref_out = std::string {sds_lossless_encoder};
+        }
+      }
+      return true;
+    }
+
     std::string build_paired_sds_features() {
       std::string features = sds::server_features();
       const auto has_token = [&features](std::string_view token) {
@@ -1516,6 +1574,9 @@ namespace nvhttp {
       append_token("host_capture_adapter"sv);
       append_token("host_resolution"sv);
       append_token("adaptive_tile_refinement"sv);
+      if (config::sds.lossless_video) {
+        append_token("lossless_video"sv);
+      }
       return features;
     }
 
@@ -1736,6 +1797,7 @@ namespace nvhttp {
       tree.put("root.sdsFeatures", build_paired_sds_features());
       tree.put("root.sdsEncoders", join_available_encoders());
       tree.put("root.sdsSoftwareCodecModeSupport", video::software_codec_mode_flags());
+      tree.put("root.sdsLosslessBackends", sds::lossless::available_encoder_backends());
 
       pt::ptree adapters_tree;
       for (const auto &adapter : platf::enumerate_render_adapters()) {
@@ -1895,6 +1957,9 @@ namespace nvhttp {
       return;
     }
     const auto sds_tile_refinement = get_arg(args, "sdsTileRefinement", "");
+    const auto sds_lossless_mode = get_arg(args, "sdsLosslessMode", "");
+    const auto sds_lossless_hash = get_arg(args, "sdsLosslessHash", "");
+    const auto sds_lossless_encoder = get_arg(args, "sdsLosslessEncoder", "");
 
     auto appid = util::from_view(get_arg(args, "appid"));
 
@@ -1922,6 +1987,22 @@ namespace nvhttp {
           *launch_session,
           sds_chroma_mode,
           launch_session->tile_refinement,
+          chroma_error
+        )) {
+      tree.put("root.gamesession", 0);
+      tree.put("root.<xmlattr>.status_code", 400);
+      tree.put("root.<xmlattr>.status_message", chroma_error);
+      return;
+    }
+    if (!validate_lossless_request(
+          sds_lossless_mode,
+          sds_lossless_hash,
+          sds_lossless_encoder,
+          *launch_session,
+          sds_chroma_mode,
+          launch_session->lossless_mode,
+          launch_session->lossless_hash_algo,
+          launch_session->lossless_encoder_pref,
           chroma_error
         )) {
       tree.put("root.gamesession", 0);
@@ -2085,6 +2166,9 @@ namespace nvhttp {
       return;
     }
     const auto sds_tile_refinement = get_arg(args, "sdsTileRefinement", "");
+    const auto sds_lossless_mode = get_arg(args, "sdsLosslessMode", "");
+    const auto sds_lossless_hash = get_arg(args, "sdsLosslessHash", "");
+    const auto sds_lossless_encoder = get_arg(args, "sdsLosslessEncoder", "");
 
     // Newer Moonlight clients send localAudioPlayMode on /resume too,
     // so we should use it if it's present in the args and there are
@@ -2107,6 +2191,22 @@ namespace nvhttp {
           *launch_session,
           sds_chroma_mode,
           launch_session->tile_refinement,
+          chroma_error
+        )) {
+      tree.put("root.resume", 0);
+      tree.put("root.<xmlattr>.status_code", 400);
+      tree.put("root.<xmlattr>.status_message", chroma_error);
+      return;
+    }
+    if (!validate_lossless_request(
+          sds_lossless_mode,
+          sds_lossless_hash,
+          sds_lossless_encoder,
+          *launch_session,
+          sds_chroma_mode,
+          launch_session->lossless_mode,
+          launch_session->lossless_hash_algo,
+          launch_session->lossless_encoder_pref,
           chroma_error
         )) {
       tree.put("root.resume", 0);

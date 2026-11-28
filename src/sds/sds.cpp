@@ -40,6 +40,7 @@ namespace sds {
   namespace {
     std::atomic_bool mic_available {false};  ///< Set by the microphone module.
     std::atomic_bool tile_refinement_enabled_atomic {false};  ///< Fast-path flag for active tile refinement capture tap.
+    std::atomic_bool lossless_enabled_atomic {false};  ///< Fast-path flag for active SDLL v1 lossless video stream.
 
     /**
      * @brief Mutex protecting the prepared clipboard backend.
@@ -479,6 +480,15 @@ namespace sds {
         if (!deps_.any_tile_refinement_active) {
           deps_.any_tile_refinement_active = rtsp_stream::any_tile_refinement_session;
         }
+        if (!deps_.lossless_active) {
+          deps_.lossless_active = rtsp_stream::has_lossless_session;
+        }
+        if (!deps_.any_lossless_active) {
+          deps_.any_lossless_active = rtsp_stream::any_lossless_session;
+        }
+        if (!deps_.lossless_config) {
+          deps_.lossless_config = rtsp_stream::get_lossless_session_config;
+        }
         if (!deps_.find_client) {
           deps_.find_client = find_paired_client;
         }
@@ -514,6 +524,10 @@ namespace sds {
           );
         }
         refresh_tile_refinement_active();
+        if (options_.lossless_video) {
+          lossless_stream_ = std::make_unique<lossless::lossless_stream_t>();
+        }
+        refresh_lossless_active();
 
         clipboard::hooks_t hooks;
         hooks.publish = [this](const std::string &client, nlohmann::json event) {
@@ -582,8 +596,12 @@ namespace sds {
           return;
         }
         tile_refinement_enabled_atomic.store(false, std::memory_order_release);
+        lossless_enabled_atomic.store(false, std::memory_order_release);
         if (tile_refiner_) {
           tile_refiner_->shutdown();
+        }
+        if (lossless_stream_) {
+          lossless_stream_->shutdown();
         }
         events_.shutdown();
         control_->post([this]() {
@@ -634,6 +652,8 @@ namespace sds {
             return options_.mic_passthrough && mic_available.load();
           case feature_e::tile_refinement:
             return options_.tile_refinement && tile_refiner_ != nullptr;
+          case feature_e::lossless_video:
+            return options_.lossless_video && lossless_stream_ != nullptr;
         }
         return false;
       }
@@ -711,6 +731,9 @@ namespace sds {
             return;
           case op_e::tile_refinement:
             poll_tile_refinement(client, request, std::move(respond));
+            return;
+          case op_e::lossless_stream:
+            start_lossless_stream(client, request, std::move(respond));
             return;
           case op_e::clipboard_get:
             clipboard_get(client, request, authority, std::move(respond));
@@ -1129,6 +1152,39 @@ namespace sds {
        * @param request Request.
        * @param respond Completion callback.
        */
+      void start_lossless_stream(const client_t &client, const request_t &request, reply_fn respond) {
+        if (!lossless_stream_) {
+          respond(reply_t::failure(404, "not_found", "lossless video mode not available"));
+          return;
+        }
+        if (!deps_.lossless_active || !deps_.lossless_active(client.cert)) {
+          respond(reply_t::failure(409, "no_active_stream", "no active lossless stream for this client"));
+          return;
+        }
+        if (!request.upgrade_raw) {
+          respond(reply_t::failure(400, "bad_request", "upgrade transport unavailable"));
+          return;
+        }
+        std::uint8_t hash_algo = static_cast<std::uint8_t>(lossless::hash_algo_e::crc32c);
+        std::string encoder_pref = options_.lossless_encoder;
+        if (deps_.lossless_config) {
+          deps_.lossless_config(client.cert, hash_algo, encoder_pref);
+        }
+        if (hash_algo > static_cast<std::uint8_t>(lossless::hash_algo_e::blake3)) {
+          hash_algo = static_cast<std::uint8_t>(lossless::hash_algo_e::crc32c);
+        }
+        lossless_stream_->configure_session(
+          client.cert,
+          static_cast<lossless::hash_algo_e>(hash_algo),
+          std::move(encoder_pref)
+        );
+        lossless_stream_->set_active(true);
+        if (!lossless_stream_->accept_http_upgrade(client.cert, request.upgrade_raw)) {
+          respond(reply_t::failure(500, "internal", "failed to upgrade lossless stream"));
+          return;
+        }
+      }
+
       void poll_tile_refinement(const client_t &client, const request_t &request, reply_fn respond) {
         if (!tile_refiner_) {
           respond(reply_t::failure(404, "not_found", "feature not available"));
@@ -1558,10 +1614,12 @@ namespace sds {
             // active notification should announce the current clipboard.
             if (!active_.insert(cert).second) {
               refresh_tile_refinement_active();
+              refresh_lossless_active();
               return;
             }
           }
           refresh_tile_refinement_active();
+          refresh_lossless_active();
           reset_file_clipboard();
           refresh_clipboard_watching();
           const auto client = deps_.find_client(cert);
@@ -1586,6 +1644,10 @@ namespace sds {
           tile_refiner_->end_stream(cert);
         }
         refresh_tile_refinement_active();
+        if (lossless_stream_) {
+          lossless_stream_->end_stream(cert);
+        }
+        refresh_lossless_active();
         clipboard_rate_.forget(cert);
         clipboard_->forget_client(cert);
         refresh_clipboard_watching();
@@ -2594,6 +2656,7 @@ namespace sds {
       std::unique_ptr<worker_t> control_;  ///< Clipboard, events and lifecycle jobs.
       std::unique_ptr<worker_t> io_;  ///< Disk I/O and hashing jobs.
       std::unique_ptr<tile_refiner_t> tile_refiner_;  ///< Adaptive dirty-tile refiner.
+      std::unique_ptr<lossless::lossless_stream_t> lossless_stream_;  ///< Dedicated bit-exact SDLL v1 lossless video stream.
 
     public:
       void refresh_tile_refinement_active() {
@@ -2635,6 +2698,46 @@ namespace sds {
           tile_refiner_->submit_bgra_frame(bgra, stride, width, height, cursor_rect);
         }
       }
+
+      void refresh_lossless_active() {
+        const bool active = !shut_down_.load(std::memory_order_acquire) &&
+                            options_.lossless_video &&
+                            lossless_stream_ != nullptr &&
+                            deps_.any_lossless_active &&
+                            deps_.any_lossless_active();
+        if (lossless_stream_) {
+          lossless_stream_->set_active(active);
+        }
+        lossless_enabled_atomic.store(active, std::memory_order_release);
+      }
+
+      void post_refresh_lossless(std::string stopped_cert) {
+        if (shut_down_.load(std::memory_order_acquire) || !control_) {
+          return;
+        }
+        control_->post([this, stopped_cert = std::move(stopped_cert)]() {
+          if (shut_down_.load(std::memory_order_acquire)) {
+            return;
+          }
+          if (!stopped_cert.empty() && lossless_stream_ &&
+              (!deps_.lossless_active || !deps_.lossless_active(stopped_cert))) {
+            lossless_stream_->end_stream(stopped_cert);
+          }
+          refresh_lossless_active();
+        });
+      }
+
+      void submit_lossless_bgra(
+        const std::uint8_t *bgra,
+        int stride,
+        int width,
+        int height,
+        std::uint64_t capture_ts_us
+      ) {
+        if (!shut_down_.load(std::memory_order_acquire) && lossless_stream_) {
+          lossless_stream_->submit_bgra_frame(bgra, stride, width, height, capture_ts_us);
+        }
+      }
     };
 
     std::mutex runtime_mutex;  ///< Protects current_runtime.
@@ -2673,6 +2776,8 @@ namespace sds {
     options.file_transfer = config::sds.file_transfer;
     options.file_clipboard = file_clipboard::private_x11_enabled();
     options.mic_passthrough = config::sds.mic_passthrough;
+    options.lossless_video = config::sds.lossless_video;
+    options.lossless_encoder = config::sds.lossless_encoder;
     options.clipboard_text_max = config::sds.clipboard_text_max;
     options.clipboard_image_max = config::sds.clipboard_image_max;
     options.clipboard_rate = config::sds.clipboard_rate;
@@ -2708,6 +2813,7 @@ namespace sds {
 
   void stop() {
     tile_refinement_enabled_atomic.store(false, std::memory_order_release);
+    lossless_enabled_atomic.store(false, std::memory_order_release);
     std::shared_ptr<runtime_t> runtime;
     {
       std::lock_guard lock {runtime_mutex};
@@ -2792,6 +2898,33 @@ namespace sds {
     }
     if (const auto runtime = current(); runtime) {
       runtime->submit_bgra(bgra, stride, width, height, cursor_rect);
+    }
+  }
+
+  void on_lossless_sessions_changed(std::string_view stopped_cert) {
+    if (const auto runtime = current(); runtime) {
+      runtime->post_refresh_lossless(std::string {stopped_cert});
+    } else {
+      lossless_enabled_atomic.store(false, std::memory_order_release);
+    }
+  }
+
+  bool lossless_wanted() {
+    return lossless_enabled_atomic.load(std::memory_order_acquire);
+  }
+
+  void submit_lossless_bgra_frame(
+    const std::uint8_t *bgra,
+    int stride,
+    int width,
+    int height,
+    std::uint64_t capture_ts_us
+  ) {
+    if (!lossless_enabled_atomic.load(std::memory_order_acquire)) {
+      return;
+    }
+    if (const auto runtime = current(); runtime) {
+      runtime->submit_lossless_bgra(bgra, stride, width, height, capture_ts_us);
     }
   }
 

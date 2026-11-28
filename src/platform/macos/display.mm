@@ -557,6 +557,8 @@ namespace platf {
             const auto pixel_format {videotoolbox_pixel_format(config)};
             [display->sc_capture setFrameWidth:config.width frameHeight:config.height];
             display->sc_capture.pixelFormat = pixel_format;
+          } else if (config.lossless_mode) {
+            display->sc_capture.pixelFormat = kCVPixelFormatType_32BGRA;
           }
 
           return display;
@@ -587,6 +589,8 @@ namespace platf {
       const auto pixel_format {videotoolbox_pixel_format(config)};
       [display->av_capture setFrameWidth:config.width frameHeight:config.height];
       display->av_capture.pixelFormat = pixel_format;
+    } else if (config.lossless_mode) {
+      display->av_capture.pixelFormat = kCVPixelFormatType_32BGRA;
     }
 
     return display;

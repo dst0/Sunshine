@@ -1632,6 +1632,59 @@ consent prompt for directory ACLs, so the Web UI shows setup steps for correctin
     </tr>
 </table>
 
+### lossless_video
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            Allow paired Moonlight clients to stream using bit-exact SDLL v1 lossless video mode over the upgraded post-quantum mTLS channel instead of lossy H.264/HEVC/AV1 video.
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}
+            enabled
+            @endcode</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            lossless_video = disabled
+            @endcode</td>
+    </tr>
+</table>
+
+### lossless_encoder
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            Select the host-side encoder backend used when a client negotiates bit-exact SDLL v1 lossless video mode. Clients can override this per session from Moonlight preferences.
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}
+            auto
+            @endcode</td>
+    </tr>
+    <tr>
+        <td rowspan="3">Choices</td>
+        <td>auto</td>
+        <td>Prefer the native GPU compute encoder (Metal, D3D11, or Vulkan) and fall back to multi-threaded CPU SIMD automatically.</td>
+    </tr>
+    <tr>
+        <td>gpu</td>
+        <td>Use the GPU compute shader encoder when available, falling back to CPU SIMD if unavailable.</td>
+    </tr>
+    <tr>
+        <td>cpu</td>
+        <td>Use the multi-threaded CPU SIMD encoder only.</td>
+    </tr>
+</table>
+
 ## Network
 
 ### upnp

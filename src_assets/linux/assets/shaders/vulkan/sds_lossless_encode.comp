@@ -1,0 +1,488 @@
+#version 450
+
+// Bit-exact SDLL v1 GPU Compute encoder shader for Linux Vulkan Compute.
+// Push constant `stage`:
+//   0 = copy_rects (prev -> pred with CopyRect relocation; dispatch (height, 1, 1))
+//   1 = encode_tiles (dispatch (tiles_x, tiles_y, 1))
+//   2 = crc32c_rows (dispatch ((height + 63)/64, 1, 1))
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, set = 0, binding = 0) readonly buffer CurrBuf {
+    uint curr_bgra[];
+};
+
+layout(std430, set = 0, binding = 1) readonly buffer PrevBuf {
+    uint prev_bgra[];
+};
+
+layout(std430, set = 0, binding = 2) buffer PredBuf {
+    uint pred_bgra[];
+};
+
+// Fixed 3088-byte slots = 772 uint32 words per tile
+layout(std430, set = 0, binding = 3) buffer OutSlots {
+    uint out_slots[];
+};
+
+layout(std430, set = 0, binding = 4) buffer RowCrcs {
+    uint row_crcs[];
+};
+
+layout(std430, set = 0, binding = 5) readonly buffer CrcTable {
+    uint crc_table[256];
+};
+
+layout(push_constant) uniform Params {
+    uint stage;
+    uint width;
+    uint height;
+    uint tiles_x;
+    uint tiles_y;
+    uint is_keyframe;
+    uint copy_rect_count;
+    uint reserved0;
+    uvec4 rects0; // src_x, src_y, dst_x, dst_y
+    uvec4 sizes0; // w, h, src_x1, src_y1
+    uvec4 rects1; // dst_x1, dst_y1, w1, h1
+    uvec4 rects2; // src_x2, src_y2, dst_x2, dst_y2
+    uvec4 sizes2; // w2, h2, src_x3, src_y3
+    uvec4 rects3; // dst_x3, dst_y3, w3, h3
+} pc;
+
+const uint TILE_SZ = 32u;
+const uint SLOT_WORDS = 772u; // 3088 / 4
+const int RICE_ESCAPE_Q = 16;
+
+// 12,292 bytes shared memory (< 16 KiB Vulkan baseline guarantee)
+shared uint sh_px[1024];
+shared uint sh_ycocg[1024]; // packed bits: [0..7]=Y, [8..18]=Co+512, [19..29]=Cg+512
+shared uint sh_sym[1024];   // packed bits: [0..8]=sy, [9..19]=sco, [20..30]=scg
+shared uint sh_dirty;
+shared uint sh_best_mode;
+shared uint sh_best_size;
+
+int floor_div2_i(int v) {
+    return (v >= 0) ? (v >> 1) : -((-v + 1) >> 1);
+}
+
+void rgb8_to_ycocgr_i(uint r, uint g, uint b, out int out_y, out int out_co, out int out_cg) {
+    int ri = int(r);
+    int gi = int(g);
+    int bi = int(b);
+    out_co = ri - bi;
+    int t = bi + floor_div2_i(out_co);
+    out_cg = gi - t;
+    out_y = t + floor_div2_i(out_cg);
+}
+
+uint pack_ycocg(int y, int co, int cg) {
+    return (uint(y) & 0xFFu) |
+           ((uint(co + 512) & 0x7FFu) << 8) |
+           ((uint(cg + 512) & 0x7FFu) << 19);
+}
+
+int unpack_y(uint p) { return int(p & 0xFFu); }
+int unpack_co(uint p) { return int((p >> 8) & 0x7FFu) - 512; }
+int unpack_cg(uint p) { return int((p >> 19) & 0x7FFu) - 512; }
+
+uint zigzag_u(int v) {
+    return (v >= 0) ? uint(v * 2) : uint((-v) * 2 - 1);
+}
+
+uint get_sym(uint idx, uint ch) {
+    uint w = sh_sym[idx];
+    if (ch == 0u) return w & 0x1FFu;
+    if (ch == 1u) return (w >> 9) & 0x7FFu;
+    return (w >> 20) & 0x7FFu;
+}
+
+int med_predict_i(int a, int b, int c) {
+    int mn = min(a, b);
+    int mx = max(a, b);
+    if (c >= mx) return mn;
+    if (c <= mn) return mx;
+    return a + b - c;
+}
+
+void slot_write_byte(uint slot_base_word, uint byte_off, uint val) {
+    uint wi = slot_base_word + (byte_off >> 2);
+    uint shift = (byte_off & 3u) * 8u;
+    uint old_w = out_slots[wi];
+    out_slots[wi] = (old_w & ~(0xFFu << shift)) | ((val & 0xFFu) << shift);
+}
+
+uint measure_rice_chan(uint tile_w, uint tile_h, int raw_bits, uint ch) {
+    uint bit_count = 0u;
+    for (uint y = 0u; y < tile_h; ++y) {
+        uint row_off = y * tile_w;
+        bool all_zero = true;
+        for (uint x = 0u; x < tile_w; ++x) {
+            if (get_sym(row_off + x, ch) != 0u) {
+                all_zero = false;
+                break;
+            }
+        }
+        if (all_zero) {
+            bit_count += 1u;
+            continue;
+        }
+        int best_bits = 1 << 28;
+        for (int k = 0; k < 8; ++k) {
+            int bits = 4;
+            for (uint x = 0u; x < tile_w; ++x) {
+                uint q = get_sym(row_off + x, ch) >> k;
+                if (q < uint(RICE_ESCAPE_Q)) {
+                    bits += int(q) + 1 + k;
+                } else {
+                    bits += RICE_ESCAPE_Q + raw_bits;
+                }
+            }
+            if (bits < best_bits) {
+                best_bits = bits;
+            }
+        }
+        bit_count += uint(best_bits);
+    }
+    return (bit_count + 7u) >> 3;
+}
+
+uint write_rice_chan(uint slot_base_word, uint out_byte_start, uint tile_w, uint tile_h, int raw_bits, uint ch) {
+    uint pos = out_byte_start;
+    uint cur = 0u;
+    int bits = 0;
+
+    for (uint y = 0u; y < tile_h; ++y) {
+        uint row_off = y * tile_w;
+        bool all_zero = true;
+        for (uint x = 0u; x < tile_w; ++x) {
+            if (get_sym(row_off + x, ch) != 0u) {
+                all_zero = false;
+                break;
+            }
+        }
+        if (all_zero) {
+            cur = (cur << 1);
+            if (++bits == 8) { slot_write_byte(slot_base_word, pos++, cur); cur = 0u; bits = 0; }
+            continue;
+        }
+
+        int best_k = 0;
+        int best_bits = 1 << 28;
+        for (int k = 0; k < 8; ++k) {
+            int b = 4;
+            for (uint x = 0u; x < tile_w; ++x) {
+                uint q = get_sym(row_off + x, ch) >> k;
+                if (q < uint(RICE_ESCAPE_Q)) {
+                    b += int(q) + 1 + k;
+                } else {
+                    b += RICE_ESCAPE_Q + raw_bits;
+                }
+            }
+            if (b < best_bits) {
+                best_bits = b;
+                best_k = k;
+            }
+        }
+
+        // Write 1 + 3-bit best_k
+        cur = (cur << 1) | 1u;
+        if (++bits == 8) { slot_write_byte(slot_base_word, pos++, cur); cur = 0u; bits = 0; }
+        for (int bi = 2; bi >= 0; --bi) {
+            cur = (cur << 1) | ((uint(best_k) >> bi) & 1u);
+            if (++bits == 8) { slot_write_byte(slot_base_word, pos++, cur); cur = 0u; bits = 0; }
+        }
+
+        uint rem_mask = (1u << best_k) - 1u;
+        for (uint x = 0u; x < tile_w; ++x) {
+            uint u = get_sym(row_off + x, ch);
+            uint q = u >> best_k;
+            if (q < uint(RICE_ESCAPE_Q)) {
+                for (int zi = 0; zi < int(q); ++zi) {
+                    cur = (cur << 1);
+                    if (++bits == 8) { slot_write_byte(slot_base_word, pos++, cur); cur = 0u; bits = 0; }
+                }
+                cur = (cur << 1) | 1u;
+                if (++bits == 8) { slot_write_byte(slot_base_word, pos++, cur); cur = 0u; bits = 0; }
+                for (int bi = best_k - 1; bi >= 0; --bi) {
+                    cur = (cur << 1) | ((u >> bi) & 1u);
+                    if (++bits == 8) { slot_write_byte(slot_base_word, pos++, cur); cur = 0u; bits = 0; }
+                }
+            } else {
+                for (int zi = 0; zi < RICE_ESCAPE_Q; ++zi) {
+                    cur = (cur << 1);
+                    if (++bits == 8) { slot_write_byte(slot_base_word, pos++, cur); cur = 0u; bits = 0; }
+                }
+                for (int bi = raw_bits - 1; bi >= 0; --bi) {
+                    cur = (cur << 1) | ((u >> bi) & 1u);
+                    if (++bits == 8) { slot_write_byte(slot_base_word, pos++, cur); cur = 0u; bits = 0; }
+                }
+            }
+        }
+    }
+    if (bits > 0) {
+        cur <<= (8 - bits);
+        slot_write_byte(slot_base_word, pos++, cur);
+    }
+    return pos - out_byte_start;
+}
+
+void get_copy_rect(uint idx, out uint sx, out uint sy, out uint dx, out uint dy, out uint w, out uint h) {
+    if (idx == 0u) { sx = pc.rects0.x; sy = pc.rects0.y; dx = pc.rects0.z; dy = pc.rects0.w; w = pc.sizes0.x; h = pc.sizes0.y; }
+    else if (idx == 1u) { sx = pc.sizes0.z; sy = pc.sizes0.w; dx = pc.rects1.x; dy = pc.rects1.y; w = pc.rects1.z; h = pc.rects1.w; }
+    else if (idx == 2u) { sx = pc.rects2.x; sy = pc.rects2.y; dx = pc.rects2.z; dy = pc.rects2.w; w = pc.sizes2.x; h = pc.sizes2.y; }
+    else { sx = pc.sizes2.z; sy = pc.sizes2.w; dx = pc.rects3.x; dy = pc.rects3.y; w = pc.rects3.z; h = pc.rects3.w; }
+}
+
+void run_copy_rects() {
+    uint y = gl_WorkGroupID.x;
+    if (y >= pc.height) return;
+    uint lid = gl_LocalInvocationID.x;
+    for (uint x = lid; x < pc.width; x += 64u) {
+        uint sx = x;
+        uint sy = y;
+        for (uint r = 0u; r < pc.copy_rect_count && r < 4u; ++r) {
+            uint rsx, rsy, rdx, rdy, rw, rh;
+            get_copy_rect(r, rsx, rsy, rdx, rdy, rw, rh);
+            if (x >= rdx && x < rdx + rw && y >= rdy && y < rdy + rh) {
+                sx = rsx + (x - rdx);
+                sy = rsy + (y - rdy);
+            }
+        }
+        pred_bgra[y * pc.width + x] = prev_bgra[sy * pc.width + sx] | 0xFF000000u;
+    }
+}
+
+void run_crc32c_rows() {
+    uint y = gl_GlobalInvocationID.x;
+    if (y >= pc.height) return;
+    uint crc = 0xFFFFFFFFu;
+    uint base = y * pc.width;
+    for (uint x = 0u; x < pc.width; ++x) {
+        uint px = curr_bgra[base + x];
+        uint b = px & 0xFFu;
+        uint g = (px >> 8) & 0xFFu;
+        uint r = (px >> 16) & 0xFFu;
+        crc = (crc >> 8) ^ crc_table[(crc ^ r) & 0xFFu];
+        crc = (crc >> 8) ^ crc_table[(crc ^ g) & 0xFFu];
+        crc = (crc >> 8) ^ crc_table[(crc ^ b) & 0xFFu];
+    }
+    row_crcs[y] = crc ^ 0xFFFFFFFFu;
+}
+
+void run_encode_tiles() {
+    uint tx = gl_WorkGroupID.x;
+    uint ty = gl_WorkGroupID.y;
+    if (tx >= pc.tiles_x || ty >= pc.tiles_y) return;
+
+    uint tile_x = tx * TILE_SZ;
+    uint tile_y = ty * TILE_SZ;
+    uint tile_w = min(TILE_SZ, pc.width - tile_x);
+    uint tile_h = min(TILE_SZ, pc.height - tile_y);
+    uint pixels = tile_w * tile_h;
+    uint tile_idx = ty * pc.tiles_x + tx;
+    uint slot_word = tile_idx * SLOT_WORDS;
+    uint lid = gl_LocalInvocationID.x;
+
+    if (lid == 0u) {
+        sh_dirty = 0u;
+    }
+    barrier();
+
+    for (uint i = lid; i < pixels; i += 64u) {
+        uint x = i % tile_w;
+        uint y = i / tile_w;
+        uint c_raw = curr_bgra[(tile_y + y) * pc.width + (tile_x + x)] & 0x00FFFFFFu;
+        // Convert BGRX uint32 -> R | (G<<8) | (B<<16)
+        uint r = (c_raw >> 16) & 0xFFu;
+        uint g = (c_raw >> 8) & 0xFFu;
+        uint b = c_raw & 0xFFu;
+        sh_px[i] = r | (g << 8) | (b << 16);
+
+        if (pc.is_keyframe == 0u) {
+            uint p_raw = pred_bgra[(tile_y + y) * pc.width + (tile_x + x)] & 0x00FFFFFFu;
+            if (p_raw != c_raw) {
+                atomicOr(sh_dirty, 1u);
+            }
+        }
+        int cy, cco, ccg;
+        rgb8_to_ycocgr_i(r, g, b, cy, cco, ccg);
+        sh_ycocg[i] = pack_ycocg(cy, cco, ccg);
+    }
+    barrier();
+
+    if (pc.is_keyframe == 0u && sh_dirty == 0u) {
+        if (lid == 0u) {
+            out_slots[slot_word] = 0u;
+        }
+        return;
+    }
+
+    // Parallel MED residuals
+    for (uint i = lid; i < pixels; i += 64u) {
+        uint x = i % tile_w;
+        uint y = i / tile_w;
+        int ya = (x > 0u) ? unpack_y(sh_ycocg[i - 1u]) : 0;
+        int yb = (y > 0u) ? unpack_y(sh_ycocg[i - tile_w]) : 0;
+        int yc = (x > 0u && y > 0u) ? unpack_y(sh_ycocg[i - tile_w - 1u]) : 0;
+        int py = med_predict_i(ya, yb, yc);
+        int dy = ((unpack_y(sh_ycocg[i]) - py) & 0xFF);
+        if (dy >= 128) dy -= 256;
+        uint sy = zigzag_u(dy);
+
+        int coa = (x > 0u) ? unpack_co(sh_ycocg[i - 1u]) : 0;
+        int cob = (y > 0u) ? unpack_co(sh_ycocg[i - tile_w]) : 0;
+        int coc = (x > 0u && y > 0u) ? unpack_co(sh_ycocg[i - tile_w - 1u]) : 0;
+        uint sco = zigzag_u(unpack_co(sh_ycocg[i]) - med_predict_i(coa, cob, coc));
+
+        int cga = (x > 0u) ? unpack_cg(sh_ycocg[i - 1u]) : 0;
+        int cgb = (y > 0u) ? unpack_cg(sh_ycocg[i - tile_w]) : 0;
+        int cgc = (x > 0u && y > 0u) ? unpack_cg(sh_ycocg[i - tile_w - 1u]) : 0;
+        uint scg = zigzag_u(unpack_cg(sh_ycocg[i]) - med_predict_i(cga, cgb, cgc));
+
+        sh_sym[i] = (sy & 0x1FFu) | ((sco & 0x7FFu) << 9) | ((scg & 0x7FFu) << 20);
+    }
+    barrier();
+
+    if (lid == 0u) {
+        uint raw_size = pixels * 3u;
+        uint best_mode = 5u;
+        uint best_size = raw_size;
+
+        uint palette[16];
+        uint pal_count = 0u;
+        bool pal_overflow = false;
+        for (uint i = 0u; i < pixels; ++i) {
+            uint rgb = sh_px[i];
+            int found = -1;
+            for (uint p = 0u; p < pal_count; ++p) {
+                if (palette[p] == rgb) { found = int(p); break; }
+            }
+            if (found < 0) {
+                if (pal_count < 16u) palette[pal_count++] = rgb;
+                else { pal_overflow = true; break; }
+            }
+        }
+
+        if (!pal_overflow && pal_count == 1u) {
+            out_slots[slot_word] = 1u | (1u << 8) | (3u << 16);
+            slot_write_byte(slot_word, 16u, palette[0] & 0xFFu);
+            slot_write_byte(slot_word, 17u, (palette[0] >> 8) & 0xFFu);
+            slot_write_byte(slot_word, 18u, (palette[0] >> 16) & 0xFFu);
+            sh_best_mode = 1u;
+            sh_best_size = 3u;
+        } else {
+            uint med_sz = 6u + measure_rice_chan(tile_w, tile_h, 8, 0u)
+                             + measure_rice_chan(tile_w, tile_h, 10, 1u)
+                             + measure_rice_chan(tile_w, tile_h, 10, 2u);
+            if (!pal_overflow && pal_count >= 2u) {
+                int bpp = (pal_count <= 2u) ? 1 : (pal_count <= 4u ? 2 : 4);
+                uint pal_sz = 1u + pal_count * 3u + ((pixels * uint(bpp) + 7u) >> 3);
+                if (pal_sz < best_size) { best_size = pal_sz; best_mode = 2u; }
+            }
+            if (med_sz < best_size) { best_size = med_sz; best_mode = 3u; }
+
+            sh_best_mode = best_mode;
+            sh_best_size = best_size;
+
+            if (best_mode == 2u) {
+                int bpp = (pal_count <= 2u) ? 1 : (pal_count <= 4u ? 2 : 4);
+                uint pos = 16u;
+                slot_write_byte(slot_word, pos++, pal_count);
+                for (uint p = 0u; p < pal_count; ++p) {
+                    slot_write_byte(slot_word, pos++, palette[p] & 0xFFu);
+                    slot_write_byte(slot_word, pos++, (palette[p] >> 8) & 0xFFu);
+                    slot_write_byte(slot_word, pos++, (palette[p] >> 16) & 0xFFu);
+                }
+                uint cur = 0u;
+                int bits = 0;
+                for (uint i = 0u; i < pixels; ++i) {
+                    uint rgb = sh_px[i];
+                    uint idx = 0u;
+                    for (uint p = 0u; p < pal_count; ++p) { if (palette[p] == rgb) { idx = p; break; } }
+                    for (int bi = bpp - 1; bi >= 0; --bi) {
+                        cur = (cur << 1) | ((idx >> bi) & 1u);
+                        if (++bits == 8) { slot_write_byte(slot_word, pos++, cur); cur = 0u; bits = 0; }
+                    }
+                }
+                if (bits > 0) {
+                    cur <<= (8 - bits);
+                    slot_write_byte(slot_word, pos++, cur);
+                }
+                sh_best_size = pos - 16u;
+            } else if (best_mode == 3u) {
+                uint sy_len = write_rice_chan(slot_word, 22u, tile_w, tile_h, 8, 0u);
+                uint sco_len = write_rice_chan(slot_word, 22u + sy_len, tile_w, tile_h, 10, 1u);
+                uint scg_len = write_rice_chan(slot_word, 22u + sy_len + sco_len, tile_w, tile_h, 10, 2u);
+                slot_write_byte(slot_word, 16u, sy_len & 0xFFu); slot_write_byte(slot_word, 17u, sy_len >> 8);
+                slot_write_byte(slot_word, 18u, sco_len & 0xFFu); slot_write_byte(slot_word, 19u, sco_len >> 8);
+                slot_write_byte(slot_word, 20u, scg_len & 0xFFu); slot_write_byte(slot_word, 21u, scg_len >> 8);
+                sh_best_size = 6u + sy_len + sco_len + scg_len;
+            }
+        }
+    }
+    barrier();
+
+    if (sh_best_mode == 1u) return;
+
+    if (pc.is_keyframe == 0u) {
+        for (uint i = lid; i < pixels; i += 64u) {
+            uint x = i % tile_w;
+            uint y = i / tile_w;
+            uint p_raw = pred_bgra[(tile_y + y) * pc.width + (tile_x + x)] & 0x00FFFFFFu;
+            uint pr = (p_raw >> 16) & 0xFFu;
+            uint pg = (p_raw >> 8) & 0xFFu;
+            uint pb = p_raw & 0xFFu;
+            int py, pco, pcg;
+            rgb8_to_ycocgr_i(pr, pg, pb, py, pco, pcg);
+            int dy = ((unpack_y(sh_ycocg[i]) - py) & 0xFF);
+            if (dy >= 128) dy -= 256;
+            uint sy = zigzag_u(dy);
+            uint sco = zigzag_u(unpack_co(sh_ycocg[i]) - pco);
+            uint scg = zigzag_u(unpack_cg(sh_ycocg[i]) - pcg);
+            sh_sym[i] = (sy & 0x1FFu) | ((sco & 0x7FFu) << 9) | ((scg & 0x7FFu) << 20);
+        }
+        barrier();
+
+        if (lid == 0u) {
+            uint temp_sz = 6u + measure_rice_chan(tile_w, tile_h, 8, 0u)
+                              + measure_rice_chan(tile_w, tile_h, 10, 1u)
+                              + measure_rice_chan(tile_w, tile_h, 10, 2u);
+            if (temp_sz < sh_best_size) {
+                uint sy_len = write_rice_chan(slot_word, 22u, tile_w, tile_h, 8, 0u);
+                uint sco_len = write_rice_chan(slot_word, 22u + sy_len, tile_w, tile_h, 10, 1u);
+                uint scg_len = write_rice_chan(slot_word, 22u + sy_len + sco_len, tile_w, tile_h, 10, 2u);
+                slot_write_byte(slot_word, 16u, sy_len & 0xFFu); slot_write_byte(slot_word, 17u, sy_len >> 8);
+                slot_write_byte(slot_word, 18u, sco_len & 0xFFu); slot_write_byte(slot_word, 19u, sco_len >> 8);
+                slot_write_byte(slot_word, 20u, scg_len & 0xFFu); slot_write_byte(slot_word, 21u, scg_len >> 8);
+                sh_best_size = 6u + sy_len + sco_len + scg_len;
+                sh_best_mode = 4u;
+            }
+        }
+        barrier();
+    }
+
+    if (lid == 0u) {
+        if (sh_best_mode == 5u) {
+            uint pos = 16u;
+            for (uint i = 0u; i < pixels; ++i) {
+                uint rgb = sh_px[i];
+                slot_write_byte(slot_word, pos++, rgb & 0xFFu);
+                slot_write_byte(slot_word, pos++, (rgb >> 8) & 0xFFu);
+                slot_write_byte(slot_word, pos++, (rgb >> 16) & 0xFFu);
+            }
+            sh_best_size = pixels * 3u;
+        }
+        out_slots[slot_word] = 1u | (sh_best_mode << 8) | ((sh_best_size & 0xFFFFu) << 16);
+    }
+}
+
+void main() {
+    if (pc.stage == 0u) {
+        run_copy_rects();
+    } else if (pc.stage == 1u) {
+        run_encode_tiles();
+    } else {
+        run_crc32c_rows();
+    }
+}

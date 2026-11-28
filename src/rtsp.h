@@ -116,6 +116,11 @@ namespace rtsp_stream {
 
     // Adaptive dirty-tile lossless refinement negotiated on /launch or /resume
     bool tile_refinement = false;  ///< Adaptive dirty-tile refinement enabled for this launch session.
+
+    // Dedicated bit-exact SDLL v1 lossless video mode negotiated on /launch or /resume
+    bool lossless_mode = false;  ///< True bit-exact SDLL v1 lossless video mode enabled for this launch session.
+    std::uint8_t lossless_hash_algo = 1;  ///< Negotiated hash algorithm (0=none, 1=crc32c, 2=blake3).
+    std::string lossless_encoder_pref = "auto";  ///< Negotiated host lossless encoder ("auto", "gpu", "cpu").
   };
 
   /**
@@ -170,6 +175,21 @@ namespace rtsp_stream {
    * @brief Check whether any running session uses adaptive tile refinement.
    */
   bool any_tile_refinement_session();
+
+  /**
+   * @brief Check whether a running session of this client certificate uses SDLL lossless mode.
+   */
+  bool has_lossless_session(std::string_view cert_pem);
+
+  /**
+   * @brief Check whether any running session uses SDLL lossless mode.
+   */
+  bool any_lossless_session();
+
+  /**
+   * @brief Read negotiated lossless hash algo & encoder preference for `cert_pem`.
+   */
+  bool get_lossless_session_config(std::string_view cert_pem, std::uint8_t &hash_algo, std::string &encoder_pref);
 
   /**
    * @brief Observer notified when a streaming session starts running or begins to stop.

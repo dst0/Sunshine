@@ -7,16 +7,107 @@ use std::ffi::c_void;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener as StdTcpListener};
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpListener;
-use tokio::sync::{oneshot, watch};
+use tokio::sync::{mpsc, oneshot, watch, Notify};
 use tokio::task::JoinSet;
 use tokio_rustls::TlsAcceptor;
 
 static NEXT_CONNECTION_ID: AtomicU64 = AtomicU64::new(1);
+
+pub trait StreamSockOpt {
+    fn configure_low_latency(&self) {}
+}
+
+impl StreamSockOpt for tokio::net::TcpStream {
+    fn configure_low_latency(&self) {
+        let _ = self.set_nodelay(true);
+    }
+}
+
+impl StreamSockOpt for tokio_rustls::server::TlsStream<tokio::net::TcpStream> {
+    fn configure_low_latency(&self) {
+        let _ = self.get_ref().0.set_nodelay(true);
+    }
+}
+
+pub struct RawStreamHandle {
+    tx: mpsc::Sender<Vec<u8>>,
+    rx: std::sync::Mutex<Option<mpsc::Receiver<Vec<u8>>>>,
+    closed: AtomicBool,
+    close_notify: Notify,
+    writable_mu: std::sync::Mutex<()>,
+    writable_cv: std::sync::Condvar,
+}
+
+impl RawStreamHandle {
+    pub fn new(capacity: usize) -> Arc<Self> {
+        let (tx, rx) = mpsc::channel(capacity.max(1));
+        Arc::new(Self {
+            tx,
+            rx: std::sync::Mutex::new(Some(rx)),
+            closed: AtomicBool::new(false),
+            close_notify: Notify::new(),
+            writable_mu: std::sync::Mutex::new(()),
+            writable_cv: std::sync::Condvar::new(),
+        })
+    }
+
+    pub fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::Acquire)
+    }
+
+    pub fn can_send(&self) -> bool {
+        !self.is_closed() && self.tx.capacity() > 0
+    }
+
+    pub fn wait_writable(&self, timeout_ms: u64) -> bool {
+        if self.can_send() {
+            return true;
+        }
+        if self.is_closed() {
+            return false;
+        }
+        let guard = self.writable_mu.lock().unwrap_or_else(|e| e.into_inner());
+        let deadline = std::time::Instant::now() + Duration::from_millis(timeout_ms);
+        let mut g = guard;
+        while !self.can_send() && !self.is_closed() {
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                return false;
+            }
+            let (ng, res) = self
+                .writable_cv
+                .wait_timeout(g, deadline - now)
+                .unwrap_or_else(|e| e.into_inner());
+            g = ng;
+            if res.timed_out() {
+                break;
+            }
+        }
+        self.can_send()
+    }
+
+    pub fn try_send(&self, data: Vec<u8>) -> Result<(), mpsc::error::TrySendError<Vec<u8>>> {
+        if self.is_closed() {
+            return Err(mpsc::error::TrySendError::Closed(data));
+        }
+        self.tx.try_send(data)
+    }
+
+    pub fn close(&self) {
+        self.closed.store(true, Ordering::Release);
+        self.close_notify.notify_waiters();
+        self.writable_cv.notify_all();
+    }
+
+    pub fn mark_closed(&self) {
+        self.close();
+    }
+}
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -35,6 +126,13 @@ pub enum ResponseAction {
     Send {
         bytes: Vec<u8>,
         close_connection: bool,
+    },
+    Upgrade {
+        response_bytes: Vec<u8>,
+        stream: Arc<RawStreamHandle>,
+        on_client_data: Option<extern "C" fn(*mut c_void, *const u8, usize)>,
+        on_closed: Option<extern "C" fn(*mut c_void)>,
+        user_data: usize,
     },
     Abort,
 }
@@ -55,6 +153,34 @@ impl ResponseSenderHandle {
                 close_connection,
             });
         }
+    }
+
+    pub fn upgrade(
+        mut self,
+        response_bytes: Vec<u8>,
+        capacity: usize,
+        on_client_data: Option<extern "C" fn(*mut c_void, *const u8, usize)>,
+        on_closed: Option<extern "C" fn(*mut c_void)>,
+        user_data: usize,
+    ) -> Arc<RawStreamHandle> {
+        let stream = RawStreamHandle::new(capacity);
+        if let Some(tx) = self.tx.take() {
+            if tx
+                .send(ResponseAction::Upgrade {
+                    response_bytes,
+                    stream: stream.clone(),
+                    on_client_data,
+                    on_closed,
+                    user_data,
+                })
+                .is_err()
+            {
+                stream.mark_closed();
+            }
+        } else {
+            stream.mark_closed();
+        }
+        stream
     }
 
     pub fn abort(mut self) {
@@ -675,7 +801,7 @@ async fn run_http_loop<S>(
     callbacks: &Arc<ServerCallbacks>,
     shutdown_rx: &mut watch::Receiver<bool>,
 ) where
-    S: AsyncRead + AsyncWrite + Unpin,
+    S: AsyncRead + AsyncWrite + StreamSockOpt + Unpin,
 {
     let req_timeout = timeout_duration(settings.timeout_request_secs);
     let content_timeout = timeout_duration(settings.timeout_content_secs);
@@ -943,6 +1069,58 @@ async fn run_http_loop<S>(
 
         let (bytes, close_after) = match action {
             ResponseAction::Abort => return,
+            ResponseAction::Upgrade {
+                response_bytes,
+                stream: raw_handle,
+                on_client_data,
+                on_closed,
+                user_data,
+            } => {
+                let write_res = tokio::select! {
+                    biased;
+                    _ = wait_shutdown(shutdown_rx) => {
+                        raw_handle.mark_closed();
+                        return;
+                    }
+                    res = run_with_timeout(content_timeout, async {
+                        stream.write_all(&response_bytes).await?;
+                        stream.flush().await
+                    }) => res,
+                };
+                if !matches!(write_res, Ok(Ok(()))) {
+                    raw_handle.mark_closed();
+                    if let Some(cb) = on_closed {
+                        let _ = tokio::task::spawn_blocking(move || cb(user_data as *mut c_void)).await;
+                    }
+                    return;
+                }
+
+                drop(req_guard);
+                stream.configure_low_latency();
+
+                if !read_buf.is_empty() {
+                    if let Some(cb) = on_client_data {
+                        let leftover = std::mem::take(&mut read_buf);
+                        let _ = tokio::task::spawn_blocking(move || {
+                            cb(user_data as *mut c_void, leftover.as_ptr(), leftover.len());
+                        })
+                        .await;
+                    } else {
+                        read_buf.clear();
+                    }
+                }
+
+                run_upgraded_stream(
+                    stream,
+                    raw_handle,
+                    on_client_data,
+                    on_closed,
+                    user_data,
+                    shutdown_rx,
+                )
+                .await;
+                return;
+            }
             ResponseAction::Send {
                 bytes,
                 close_connection,
@@ -1003,6 +1181,85 @@ async fn run_http_loop<S>(
         if read_buf.is_empty() && read_buf.capacity() > 64 * 1024 {
             read_buf = Vec::with_capacity(4096);
         }
+    }
+}
+
+async fn run_upgraded_stream<S>(
+    stream: S,
+    raw_handle: Arc<RawStreamHandle>,
+    on_client_data: Option<extern "C" fn(*mut c_void, *const u8, usize)>,
+    on_closed: Option<extern "C" fn(*mut c_void)>,
+    user_data: usize,
+    shutdown_rx: &mut watch::Receiver<bool>,
+) where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let rx_opt = raw_handle
+        .rx
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take();
+    let Some(mut rx) = rx_opt else {
+        raw_handle.mark_closed();
+        if let Some(cb) = on_closed {
+            let _ = tokio::task::spawn_blocking(move || cb(user_data as *mut c_void)).await;
+        }
+        return;
+    };
+
+    let (mut reader, mut writer) = tokio::io::split(stream);
+    let mut shut_rx_r = shutdown_rx.clone();
+    let mut shut_rx_w = shutdown_rx.clone();
+    let h_read = raw_handle.clone();
+    let h_write = raw_handle.clone();
+
+    let read_fut = async move {
+        let mut buf = [0u8; 4096];
+        loop {
+            let n = tokio::select! {
+                biased;
+                _ = wait_shutdown(&mut shut_rx_r) => break,
+                _ = h_read.close_notify.notified() => break,
+                res = reader.read(&mut buf) => match res {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => n,
+                }
+            };
+            if let Some(cb) = on_client_data {
+                let owned = buf[..n].to_vec();
+                let _ = tokio::task::spawn_blocking(move || {
+                    cb(user_data as *mut c_void, owned.as_ptr(), owned.len());
+                })
+                .await;
+            }
+        }
+        h_read.mark_closed();
+    };
+
+    let write_fut = async move {
+        loop {
+            let pkt = tokio::select! {
+                biased;
+                _ = wait_shutdown(&mut shut_rx_w) => break,
+                _ = h_write.close_notify.notified() => break,
+                maybe = rx.recv() => match maybe {
+                    Some(p) => p,
+                    None => break,
+                }
+            };
+            h_write.writable_cv.notify_all();
+            if writer.write_all(&pkt).await.is_err() || writer.flush().await.is_err() {
+                break;
+            }
+        }
+        h_write.mark_closed();
+        let _ = tokio::time::timeout(Duration::from_millis(500), writer.shutdown()).await;
+    };
+
+    tokio::join!(read_fut, write_fut);
+    raw_handle.mark_closed();
+    if let Some(cb) = on_closed {
+        let _ = tokio::task::spawn_blocking(move || cb(user_data as *mut c_void)).await;
     }
 }
 

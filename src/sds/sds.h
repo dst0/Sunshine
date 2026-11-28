@@ -19,6 +19,7 @@
 #include "auth.h"
 #include "clipboard_backend.h"
 #include "files.h"
+#include "lossless_stream.h"
 #include "reply.h"
 #include "tile_refiner.h"
 
@@ -41,6 +42,8 @@ namespace sds {
     bool file_clipboard = false;  ///< Explicit opt-in for the isolated X11 desktop.
     bool mic_passthrough = true;  ///< `mic_passthrough` switch.
     bool tile_refinement = true;  ///< Adaptive dirty-tile lossless refinement switch.
+    bool lossless_video = true;  ///< Bit-exact SDLL v1 lossless video mode switch.
+    std::string lossless_encoder = "auto";  ///< Default host lossless encoder ("auto", "gpu", "cpu").
     std::size_t clipboard_text_max = 1024 * 1024;  ///< `clipboard_text_max`.
     std::size_t clipboard_image_max = 16 * 1024 * 1024;  ///< `clipboard_image_max`.
     double clipboard_rate = 10;  ///< `clipboard_rate` per second.
@@ -70,6 +73,9 @@ namespace sds {
     std::function<bool(std::string_view cert)> stream_active;  ///< Default: rtsp_stream::has_running_session.
     std::function<bool(std::string_view cert)> tile_refinement_active;  ///< Default: rtsp_stream::has_tile_refinement_session.
     std::function<bool()> any_tile_refinement_active;  ///< Default: rtsp_stream::any_tile_refinement_session.
+    std::function<bool(std::string_view cert)> lossless_active;  ///< Default: rtsp_stream::has_lossless_session.
+    std::function<bool()> any_lossless_active;  ///< Default: rtsp_stream::any_lossless_session.
+    std::function<bool(std::string_view cert, std::uint8_t &hash_algo, std::string &encoder_pref)> lossless_config;  ///< Default: rtsp_stream::get_lossless_session_config.
     std::function<std::optional<client_t>(std::string_view cert)> find_client;  ///< Default: nvhttp paired-client store.
     std::function<std::unique_ptr<clipboard::backend_t>()> make_clipboard_backend;  ///< Default: clipboard::make_backend.
     std::function<std::shared_ptr<const file_clipboard::stage_t>(std::string_view body, const std::function<bool()> &allowed)> stage_file_clipboard;  ///< Default: file_clipboard::stage.
@@ -89,6 +95,7 @@ namespace sds {
     std::string body;  ///< Request body.
     std::string file_clipboard_seq {};  ///< `X-SDS-Clipboard-Seq`.
     std::string file_clipboard_epoch {};  ///< `X-SDS-Clipboard-Epoch`.
+    sds::lossless::lossless_stream_t::upgrade_invoker_t upgrade_raw;  ///< Raw HTTP 101 stream upgrade callback for `op_e::lossless_stream`.
   };
 
   /**
@@ -216,6 +223,27 @@ namespace sds {
     int width,
     int height,
     std::optional<cursor_rect_t> cursor_rect = std::nullopt
+  );
+
+  /**
+   * @brief Refresh SDLL v1 lossless stream active state from running session flags. Never blocks.
+   */
+  void on_lossless_sessions_changed(std::string_view stopped_cert = {});
+
+  /**
+   * @brief Lock-free check whether any active stream uses SDLL v1 lossless video mode.
+   */
+  bool lossless_wanted();
+
+  /**
+   * @brief Non-blocking single-slot BGRA submission for SDLL v1 lossless video streaming.
+   */
+  void submit_lossless_bgra_frame(
+    const std::uint8_t *bgra,
+    int stride,
+    int width,
+    int height,
+    std::uint64_t capture_ts_us
   );
 
   /**

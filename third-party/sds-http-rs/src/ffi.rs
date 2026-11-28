@@ -4,11 +4,12 @@ use crate::http::{
     percent_decode_bytes, percent_encode_bytes, validate_request_framing,
 };
 use crate::server::{
-    ErrorKind, HeaderSliceFfi, HttpServerInstance, ResponseSenderHandle, ServerCallbacks,
-    ServerRequestHeadFfi, ServerSettings,
+    ErrorKind, HeaderSliceFfi, HttpServerInstance, RawStreamHandle, ResponseSenderHandle,
+    ServerCallbacks, ServerRequestHeadFfi, ServerSettings,
 };
 use std::ffi::{c_char, c_void, CStr};
 use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::sync::Arc;
 
 #[repr(C)]
 pub struct SdsHttpBytes {
@@ -505,6 +506,126 @@ pub unsafe extern "C" fn sds_http_response_abort(sender: *mut ResponseSenderHand
         if !sender.is_null() {
             let handle = unsafe { Box::from_raw(sender) };
             handle.abort();
+        }
+    }));
+}
+
+pub struct SdsHttpRawStream(pub Arc<RawStreamHandle>);
+
+/// # Safety
+/// `sender` must be an unconsumed handle passed to a callback; `response_head` must cover
+/// `response_head_len` valid bytes. Returned handle must be freed via `sds_http_raw_stream_release`.
+#[no_mangle]
+pub unsafe extern "C" fn sds_http_response_upgrade(
+    sender: *mut ResponseSenderHandle,
+    response_head: *const u8,
+    response_head_len: usize,
+    queue_capacity: usize,
+    on_client_data: Option<extern "C" fn(*mut c_void, *const u8, usize)>,
+    on_closed: Option<extern "C" fn(*mut c_void)>,
+    user_data: *mut c_void,
+) -> *mut SdsHttpRawStream {
+    catch_unwind(AssertUnwindSafe(|| {
+        if sender.is_null() {
+            return std::ptr::null_mut();
+        }
+        let handle = unsafe { Box::from_raw(sender) };
+        let bytes = unsafe { bytes_slice(response_head, response_head_len) }.to_vec();
+        let stream = handle.upgrade(
+            bytes,
+            queue_capacity.max(1),
+            on_client_data,
+            on_closed,
+            user_data as usize,
+        );
+        Box::into_raw(Box::new(SdsHttpRawStream(stream)))
+    }))
+    .unwrap_or(std::ptr::null_mut())
+}
+
+/// # Safety
+/// `stream` must be null or a valid handle returned by `sds_http_response_upgrade` not yet released.
+#[no_mangle]
+pub unsafe extern "C" fn sds_http_raw_stream_can_send(stream: *const SdsHttpRawStream) -> bool {
+    catch_unwind(AssertUnwindSafe(|| {
+        if stream.is_null() {
+            return false;
+        }
+        unsafe { (&*stream).0.can_send() }
+    }))
+    .unwrap_or(false)
+}
+
+/// # Safety
+/// `stream` must be null or a valid handle returned by `sds_http_response_upgrade` not yet released.
+#[no_mangle]
+pub unsafe extern "C" fn sds_http_raw_stream_wait_writable(
+    stream: *const SdsHttpRawStream,
+    timeout_ms: u64,
+) -> bool {
+    catch_unwind(AssertUnwindSafe(|| {
+        if stream.is_null() {
+            return false;
+        }
+        unsafe { (&*stream).0.wait_writable(timeout_ms) }
+    }))
+    .unwrap_or(false)
+}
+
+/// # Safety
+/// `stream` must be a valid handle; if `len > 0`, `data` must point to `len` valid bytes.
+/// Returns `1` on queue, `0` when bounded queue is full, `-1` if closed/invalid.
+#[no_mangle]
+pub unsafe extern "C" fn sds_http_raw_stream_try_send(
+    stream: *const SdsHttpRawStream,
+    data: *const u8,
+    len: usize,
+) -> i32 {
+    catch_unwind(AssertUnwindSafe(|| {
+        if stream.is_null() {
+            return -1;
+        }
+        let bytes = unsafe { bytes_slice(data, len) }.to_vec();
+        match unsafe { (&*stream).0.try_send(bytes) } {
+            Ok(()) => 1,
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => 0,
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => -1,
+        }
+    }))
+    .unwrap_or(-1)
+}
+
+/// # Safety
+/// `stream` must be null or a valid handle returned by `sds_http_response_upgrade` not yet released.
+#[no_mangle]
+pub unsafe extern "C" fn sds_http_raw_stream_is_closed(stream: *const SdsHttpRawStream) -> bool {
+    catch_unwind(AssertUnwindSafe(|| {
+        if stream.is_null() {
+            return true;
+        }
+        unsafe { (&*stream).0.is_closed() }
+    }))
+    .unwrap_or(true)
+}
+
+/// # Safety
+/// `stream` must be null or a valid handle returned by `sds_http_response_upgrade` not yet released.
+#[no_mangle]
+pub unsafe extern "C" fn sds_http_raw_stream_close(stream: *const SdsHttpRawStream) {
+    let _ = catch_unwind(AssertUnwindSafe(|| {
+        if !stream.is_null() {
+            unsafe { (&*stream).0.close() };
+        }
+    }));
+}
+
+/// # Safety
+/// `stream` must be null or a valid handle returned by `sds_http_response_upgrade` not yet released.
+#[no_mangle]
+pub unsafe extern "C" fn sds_http_raw_stream_release(stream: *mut SdsHttpRawStream) {
+    let _ = catch_unwind(AssertUnwindSafe(|| {
+        if !stream.is_null() {
+            unsafe { drop(Box::from_raw(stream)) };
         }
     }));
 }

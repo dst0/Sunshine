@@ -12,6 +12,7 @@ extern "C" {
 typedef struct SdsHttpServer SdsHttpServer;
 typedef struct SdsHttpClient SdsHttpClient;
 typedef struct SdsHttpResponseSender SdsHttpResponseSender;
+typedef struct SdsHttpRawStream SdsHttpRawStream;
 
 typedef struct {
   uint8_t *data;
@@ -175,6 +176,22 @@ void sds_http_response_send(
   bool close_connection
 );
 void sds_http_response_abort(SdsHttpResponseSender *sender);
+
+SdsHttpRawStream *sds_http_response_upgrade(
+  SdsHttpResponseSender *sender,
+  const uint8_t *response_head,
+  size_t response_head_len,
+  size_t queue_capacity,
+  void (*on_client_data)(void *user_data, const uint8_t *data, size_t len),
+  void (*on_closed)(void *user_data),
+  void *user_data
+);
+bool sds_http_raw_stream_can_send(const SdsHttpRawStream *stream);
+bool sds_http_raw_stream_wait_writable(const SdsHttpRawStream *stream, uint64_t timeout_ms);
+int32_t sds_http_raw_stream_try_send(const SdsHttpRawStream *stream, const uint8_t *data, size_t len);
+bool sds_http_raw_stream_is_closed(const SdsHttpRawStream *stream);
+void sds_http_raw_stream_close(const SdsHttpRawStream *stream);
+void sds_http_raw_stream_release(SdsHttpRawStream *stream);
 
 SdsHttpClient *sds_http_client_create(const SdsHttpClientConfig *config, SdsHttpBytes *out_error);
 void sds_http_client_stop(SdsHttpClient *client);

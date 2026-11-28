@@ -28,6 +28,7 @@ namespace sds {
     file_clipboard,  ///< Native file clipboard on an explicitly isolated Linux desktop.
     mic,  ///< Microphone passthrough (`mic_passthrough`).
     tile_refinement,  ///< Adaptive dirty-tile lossless refinement.
+    lossless_video,  ///< Bit-exact SDLL v1 lossless video mode.
   };
 
   /**
@@ -37,6 +38,7 @@ namespace sds {
     capabilities,  ///< `GET /sds/v1/capabilities`.
     events,  ///< `GET /sds/v1/events`.
     tile_refinement,  ///< `GET /sds/v1/tile-refinement`.
+    lossless_stream,  ///< `GET /sds/v1/lossless-stream` (HTTP 101 binary upgrade).
     clipboard_get,  ///< `GET /sds/v1/clipboard`.
     clipboard_put,  ///< `PUT /sds/v1/clipboard`.
     file_clipboard_baseline,  ///< Read generation and stream epoch, never data.
