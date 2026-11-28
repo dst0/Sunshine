@@ -340,28 +340,41 @@ namespace sds::http {
           }
           return true;
         };
-        const auto icontains = [](std::string_view haystack, std::string_view needle) {
-          if (needle.empty()) {
-            return true;
-          }
-          for (std::size_t i = 0; i + needle.size() <= haystack.size(); ++i) {
-            bool ok = true;
-            for (std::size_t j = 0; j < needle.size(); ++j) {
-              if (std::tolower(static_cast<unsigned char>(haystack[i + j])) != std::tolower(static_cast<unsigned char>(needle[j]))) {
-                ok = false;
-                break;
-              }
+        const auto has_header_token = [&ieq](std::string_view header_val, std::string_view token) {
+          std::size_t pos = 0;
+          while (pos < header_val.size()) {
+            const auto comma = header_val.find(',', pos);
+            std::string_view part = (comma == std::string_view::npos)
+                                      ? header_val.substr(pos)
+                                      : header_val.substr(pos, comma - pos);
+            while (!part.empty() && (part.front() == ' ' || part.front() == '\t')) {
+              part.remove_prefix(1);
             }
-            if (ok) {
+            while (!part.empty() && (part.back() == ' ' || part.back() == '\t')) {
+              part.remove_suffix(1);
+            }
+            if (ieq(part, token)) {
               return true;
             }
+            if (comma == std::string_view::npos) {
+              break;
+            }
+            pos = comma + 1;
           }
           return false;
         };
+        if (request->http_version != "1.1" || !fields.body.empty()) {
+          respond(reply_t::failure(400, "bad_request", "invalid upgrade request version or body"));
+          return;
+        }
+        if (request->header.count("Upgrade") != 1) {
+          respond(reply_t::failure(400, "bad_request", "missing or duplicate Upgrade header"));
+          return;
+        }
         const auto upg_it = request->header.find("Upgrade");
         const auto conn_it = request->header.find("Connection");
         if (upg_it == request->header.end() || !ieq(upg_it->second, "sds-lossless-v1") ||
-            conn_it == request->header.end() || !icontains(conn_it->second, "upgrade")) {
+            conn_it == request->header.end() || !has_header_token(conn_it->second, "upgrade")) {
           respond(reply_t::failure(400, "bad_request", "missing or invalid Upgrade header"));
           return;
         }

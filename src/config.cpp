@@ -1810,6 +1810,11 @@ namespace config {
     bool_f(vars, "mic_passthrough", sds.mic_passthrough);
     bool_f(vars, "lossless_video", sds.lossless_video);
     string_f(vars, "lossless_encoder", sds.lossless_encoder);
+    if (!sds.lossless_encoder.empty() && sds.lossless_encoder != "auto" &&
+        sds.lossless_encoder != "gpu" && sds.lossless_encoder != "cpu") {
+      BOOST_LOG(warning) << "Invalid lossless_encoder value '"sv << sds.lossless_encoder << "', falling back to 'auto'"sv;
+      sds.lossless_encoder = "auto";
+    }
     byte_size_between(vars, "clipboard_text_max", sds.clipboard_text_max, {1, 16 * MiB});
     byte_size_between(vars, "clipboard_image_max", sds.clipboard_image_max, {1, 64 * MiB});
     if (const auto rate = unit_int_between(vars, "clipboard_rate", "/s"sv, {1, 1000}); rate) {

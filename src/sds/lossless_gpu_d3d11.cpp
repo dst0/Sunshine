@@ -852,6 +852,7 @@ void cs_crc32c_rows(uint3 gid : SV_DispatchThreadID) {
           bd.Usage = D3D11_USAGE_STAGING;
           bd.BindFlags = 0;
           bd.MiscFlags = 0;
+          bd.StructureByteStride = 0;
           bd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
           if (FAILED(device_->CreateBuffer(&bd, nullptr, &slots_staging_))) {
             return false;
@@ -880,6 +881,7 @@ void cs_crc32c_rows(uint3 gid : SV_DispatchThreadID) {
           bd.Usage = D3D11_USAGE_STAGING;
           bd.BindFlags = 0;
           bd.MiscFlags = 0;
+          bd.StructureByteStride = 0;
           bd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
           if (FAILED(device_->CreateBuffer(&bd, nullptr, &row_crc_staging_))) {
             return false;
@@ -928,14 +930,17 @@ void cs_crc32c_rows(uint3 gid : SV_DispatchThreadID) {
   }
 
   std::string available_encoder_backends() {
-    ComPtr<ID3D11Device> dev;
-    ComPtr<ID3D11DeviceContext> ctx;
-    D3D_FEATURE_LEVEL lvl {};
-    D3D_FEATURE_LEVEL req = D3D_FEATURE_LEVEL_11_0;
-    if (SUCCEEDED(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0, &req, 1, D3D11_SDK_VERSION, &dev, &lvl, &ctx))) {
-      return "d3d11,cpu";
-    }
-    return "cpu";
+    static const std::string cached = []() -> std::string {
+      ComPtr<ID3D11Device> dev;
+      ComPtr<ID3D11DeviceContext> ctx;
+      D3D_FEATURE_LEVEL lvl {};
+      D3D_FEATURE_LEVEL req = D3D_FEATURE_LEVEL_11_0;
+      if (SUCCEEDED(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0, &req, 1, D3D11_SDK_VERSION, &dev, &lvl, &ctx))) {
+        return "d3d11,cpu";
+      }
+      return "cpu";
+    }();
+    return cached;
   }
 }  // namespace sds::lossless
 

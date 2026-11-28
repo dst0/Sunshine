@@ -180,6 +180,12 @@ namespace sds::lossless {
     if (!do_upgrade) {
       return false;
     }
+    {
+      std::lock_guard lock {config_mutex_};
+      if (session_cert_.empty() || session_cert_ != client_cert) {
+        return false;
+      }
+    }
     auto ctx = std::make_shared<callback_ctx_t>();
     ctx->state = alive_;
     auto *heap_sp = new std::shared_ptr<callback_ctx_t>(ctx);
@@ -208,12 +214,13 @@ namespace sds::lossless {
       close_raw_stream_locked();
       active_raw_ = std::move(raw_handle);
       active_cert_ = std::string {client_cert};
+      ctrl_rx_buf_.clear();
     }
     force_keyframe_.store(true, std::memory_order_release);
     {
       std::lock_guard lock {slot_mutex_};
-      if (has_last_frame_ && !work_frame_.empty() && pending_w_ > 0 && pending_h_ > 0) {
-        has_pending_ = true;
+      if (has_last_frame_ && !last_frame_.empty() && last_w_ > 0 && last_h_ > 0) {
+        resend_last_ = true;
       }
     }
     slot_cv_.notify_one();
@@ -282,8 +289,8 @@ namespace sds::lossless {
           force_keyframe_.store(true, std::memory_order_release);
           {
             std::lock_guard slock {slot_mutex_};
-            if (has_last_frame_ && !work_frame_.empty()) {
-              has_pending_ = true;
+            if (has_last_frame_ && !last_frame_.empty() && last_w_ > 0 && last_h_ > 0) {
+              resend_last_ = true;
             }
           }
           slot_cv_.notify_one();
@@ -379,16 +386,37 @@ namespace sds::lossless {
         if (stopping_) {
           return;
         }
-        if (!has_pending_) {
+        slot_cv_.wait(lock, [this]() {
+          return stopping_ || has_pending_ || resend_last_;
+        });
+        if (stopping_) {
+          return;
+        }
+        if (has_pending_) {
+          work_frame_.swap(pending_frame_);
+          w = pending_w_;
+          h = pending_h_;
+          stride = pending_stride_;
+          ts_us = pending_ts_us_;
+          last_frame_ = work_frame_;
+          last_w_ = w;
+          last_h_ = h;
+          last_stride_ = stride;
+          last_ts_us_ = ts_us;
+          has_pending_ = false;
+          resend_last_ = false;
+          has_last_frame_ = true;
+        } else if (resend_last_ && has_last_frame_ && !last_frame_.empty() && last_w_ > 0 && last_h_ > 0) {
+          work_frame_ = last_frame_;
+          w = last_w_;
+          h = last_h_;
+          stride = last_stride_;
+          ts_us = last_ts_us_;
+          resend_last_ = false;
+        } else {
+          resend_last_ = false;
           continue;
         }
-        work_frame_.swap(pending_frame_);
-        w = pending_w_;
-        h = pending_h_;
-        stride = pending_stride_;
-        ts_us = pending_ts_us_;
-        has_pending_ = false;
-        has_last_frame_ = true;
       }
 
       const std::uint64_t epoch = session_epoch_.load(std::memory_order_acquire);
@@ -401,13 +429,21 @@ namespace sds::lossless {
         local_enc.swap(encoder_);
       }
 
-      const bool keyframe = force_keyframe_.exchange(false, std::memory_order_acq_rel);
-      const auto algo = static_cast<hash_algo_e>(hash_algo_.load(std::memory_order_acquire));
-      const std::uint64_t fid = ++frame_id_counter_;
+      bool has_live_raw = false;
+      {
+        std::lock_guard sl {stream_mutex_};
+        has_live_raw = (active_raw_ != nullptr && active_raw_->raw != nullptr);
+      }
+
+      const bool stale_before_encode =
+        !active_.load(std::memory_order_acquire) ||
+        session_epoch_.load(std::memory_order_acquire) != epoch;
 
       bool encoded = false;
-      if (local_enc && active_.load(std::memory_order_acquire) &&
-          session_epoch_.load(std::memory_order_acquire) == epoch) {
+      if (local_enc && !stale_before_encode && has_live_raw) {
+        const bool keyframe = force_keyframe_.exchange(false, std::memory_order_acq_rel);
+        const auto algo = static_cast<hash_algo_e>(hash_algo_.load(std::memory_order_acquire));
+        const std::uint64_t fid = ++frame_id_counter_;
         encoded = local_enc->encode_frame(
           work_frame_.data(),
           stride,
@@ -424,8 +460,10 @@ namespace sds::lossless {
 
       const bool stale_epoch = (session_epoch_.load(std::memory_order_acquire) != epoch) ||
                                !active_.load(std::memory_order_acquire);
-      if (stale_epoch && local_enc) {
-        local_enc->reset();
+      if (stale_epoch) {
+        local_enc.reset();
+        force_keyframe_.store(true, std::memory_order_release);
+        continue;
       }
 
       {
@@ -435,7 +473,7 @@ namespace sds::lossless {
         }
       }
 
-      if (stale_epoch) {
+      if (!has_live_raw) {
         force_keyframe_.store(true, std::memory_order_release);
         continue;
       }

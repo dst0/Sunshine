@@ -110,3 +110,71 @@ TEST(LosslessCodec, MultiFrameScrollAndOddDimsRoundtrip) {
   ASSERT_TRUE(dec.decode_frame(pkt.data(), pkt.size(), true, nullptr, &dstats));
   EXPECT_TRUE(dstats.hash_matched);
 }
+
+TEST(LosslessHash, Blake3MultiChunkBoundarySizes) {
+  for (std::size_t pixels : {std::size_t {341}, std::size_t {342}, std::size_t {683}, std::size_t {1025}, std::size_t {3414}}) {
+    const int w = static_cast<int>(pixels);
+    std::vector<std::uint8_t> rgb(pixels * 3u);
+    std::vector<std::uint8_t> bgra(pixels * 4u);
+    for (std::size_t i = 0; i < pixels; ++i) {
+      const std::uint8_t r = static_cast<std::uint8_t>((i * 73u + 19u) & 0xFFu);
+      const std::uint8_t g = static_cast<std::uint8_t>((i * 41u + 7u) & 0xFFu);
+      const std::uint8_t b = static_cast<std::uint8_t>((i * 19u + 93u) & 0xFFu);
+      rgb[i * 3u + 0] = r;
+      rgb[i * 3u + 1] = g;
+      rgb[i * 3u + 2] = b;
+      bgra[i * 4u + 0] = b;
+      bgra[i * 4u + 1] = g;
+      bgra[i * 4u + 2] = r;
+      bgra[i * 4u + 3] = static_cast<std::uint8_t>(i & 0xFFu);
+    }
+    const auto from_rgb = sds::lossless::blake3_hash(rgb.data(), rgb.size());
+    const auto from_bgra = sds::lossless::blake3_rgb24_from_bgra(bgra.data(), w * 4, w, 1);
+    EXPECT_EQ(from_bgra, from_rgb) << "bytes=" << rgb.size();
+
+    bgra[pixels * 4u - 2u] ^= 0x01u;  // Flip 1 bit in the last pixel's R channel
+    EXPECT_NE(sds::lossless::blake3_rgb24_from_bgra(bgra.data(), w * 4, w, 1), from_rgb);
+  }
+}
+
+TEST(LosslessCodec, ScrollDownZeroDirtyAndMalformedKeyframeRejection) {
+  const int w = 641;
+  const int h = 363;
+  auto f1 = make_pattern_bgra(w, h, 5);
+  auto f2 = f1;
+  // Scroll down by 32 rows
+  for (int y = h - 1; y >= 32; --y) {
+    std::memcpy(f2.data() + static_cast<std::size_t>(y) * w * 4u,
+                f1.data() + static_cast<std::size_t>(y - 32) * w * 4u,
+                static_cast<std::size_t>(w) * 4u);
+  }
+
+  sds::lossless::cpu_encoder_t enc(2);
+  sds::lossless::cpu_decoder_t dec(2);
+  std::vector<std::uint8_t> pkt;
+  sds::lossless::encode_stats_t estats;
+  sds::lossless::decode_stats_t dstats;
+
+  // Frame 1 keyframe
+  ASSERT_TRUE(enc.encode_frame(f1.data(), w * 4, w, h, 1, 1000, sds::lossless::hash_algo_e::crc32c, true, pkt, &estats));
+  ASSERT_TRUE(dec.decode_frame(pkt.data(), pkt.size(), true, nullptr, &dstats));
+  EXPECT_TRUE(dstats.hash_matched);
+
+  // Frame 2 identical -> 0 dirty tiles
+  ASSERT_TRUE(enc.encode_frame(f1.data(), w * 4, w, h, 2, 2000, sds::lossless::hash_algo_e::blake3, false, pkt, &estats));
+  EXPECT_EQ(estats.dirty_tiles, 0u);
+  ASSERT_TRUE(dec.decode_frame(pkt.data(), pkt.size(), true, nullptr, &dstats));
+  EXPECT_TRUE(dstats.hash_matched);
+
+  // Frame 3 scroll-down
+  ASSERT_TRUE(enc.encode_frame(f2.data(), w * 4, w, h, 3, 3000, sds::lossless::hash_algo_e::crc32c, false, pkt, &estats));
+  EXPECT_GE(estats.copy_rects, 1u);
+  ASSERT_TRUE(dec.decode_frame(pkt.data(), pkt.size(), true, nullptr, &dstats));
+  EXPECT_TRUE(dstats.hash_matched);
+
+  // Malformed delta-flagged-as-keyframe with fewer dirty tiles / copy rects must be rejected
+  ASSERT_FALSE(pkt.empty());
+  std::vector<std::uint8_t> bad_pkt = pkt;
+  bad_pkt[6] |= static_cast<std::uint8_t>(sds::lossless::FLAG_KEYFRAME & 0xFFu);
+  EXPECT_FALSE(dec.decode_frame(bad_pkt.data(), bad_pkt.size(), false, nullptr, nullptr));
+}

@@ -120,7 +120,9 @@ namespace platf {
       img->row_pitch = CVPixelBufferIsPlanar(new_pixel_buffer->buf) ?
                          (int) CVPixelBufferGetBytesPerRowOfPlane(new_pixel_buffer->buf, 0) :
                          (int) CVPixelBufferGetBytesPerRow(new_pixel_buffer->buf);
-      img->pixel_pitch = img->row_pitch / img->width;
+      img->pixel_pitch = (CVPixelBufferGetPixelFormatType(new_pixel_buffer->buf) == kCVPixelFormatType_32BGRA) ?
+                           4 :
+                           (img->row_pitch / img->width);
       img->frame_timestamp = frame_timestamp_from_pts(sample_buffer);
 
       old_data_retainer = nullptr;
@@ -291,7 +293,9 @@ namespace platf {
         img_out->width = (int) CVPixelBufferGetWidth(new_pixel_buffer->buf);
         img_out->height = (int) CVPixelBufferGetHeight(new_pixel_buffer->buf);
         img_out->row_pitch = (int) CVPixelBufferGetBytesPerRow(new_pixel_buffer->buf);
-        img_out->pixel_pitch = img_out->row_pitch / img_out->width;
+        img_out->pixel_pitch = (CVPixelBufferGetPixelFormatType(new_pixel_buffer->buf) == kCVPixelFormatType_32BGRA) ?
+                                 4 :
+                                 (img_out->row_pitch / img_out->width);
         img_out->frame_timestamp = frame_timestamp;
 
         old_data_retainer = nullptr;

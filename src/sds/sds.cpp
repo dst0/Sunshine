@@ -1180,9 +1180,11 @@ namespace sds {
         );
         lossless_stream_->set_active(true);
         if (!lossless_stream_->accept_http_upgrade(client.cert, request.upgrade_raw)) {
+          refresh_lossless_active();
           respond(reply_t::failure(500, "internal", "failed to upgrade lossless stream"));
           return;
         }
+        lossless_enabled_atomic.store(true, std::memory_order_release);
       }
 
       void poll_tile_refinement(const client_t &client, const request_t &request, reply_fn respond) {

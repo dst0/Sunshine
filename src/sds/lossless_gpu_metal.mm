@@ -678,6 +678,7 @@ kernel void cs_crc32c_rows(
           const std::size_t total_tiles = static_cast<std::size_t>(tiles_x) * static_cast<std::size_t>(tiles_y);
 
           if (!ensure_buffers(width, height, frame_bytes, total_tiles)) {
+            has_prev_ = false;
             return false;
           }
 
@@ -889,6 +890,7 @@ kernel void cs_crc32c_rows(
           pred_buf_ = [device_ newBufferWithLength:frame_bytes options:MTLResourceStorageModeShared];
           if (!curr_buf_ || !prev_buf_ || !pred_buf_) {
             cap_frame_bytes_ = 0;
+            has_prev_ = false;
             return false;
           }
           cap_frame_bytes_ = frame_bytes;
@@ -901,6 +903,7 @@ kernel void cs_crc32c_rows(
           tile_slots_buf_ = [device_ newBufferWithLength:slots_bytes options:MTLResourceStorageModeShared];
           if (!tile_slots_buf_) {
             cap_slots_bytes_ = 0;
+            has_prev_ = false;
             return false;
           }
           cap_slots_bytes_ = slots_bytes;
@@ -948,15 +951,18 @@ kernel void cs_crc32c_rows(
   }
 
   std::string available_encoder_backends() {
-    @autoreleasepool {
-      id<MTLDevice> dev = MTLCreateSystemDefaultDevice();
-      if (dev) {
+    static const std::string cached = []() -> std::string {
+      @autoreleasepool {
+        id<MTLDevice> dev = MTLCreateSystemDefaultDevice();
+        if (dev) {
 #if !__has_feature(objc_arc)
-        [dev release];
+          [dev release];
 #endif
-        return "metal,cpu";
+          return "metal,cpu";
+        }
+        return "cpu";
       }
-      return "cpu";
-    }
+    }();
+    return cached;
   }
 }  // namespace sds::lossless

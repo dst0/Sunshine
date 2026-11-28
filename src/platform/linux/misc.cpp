@@ -1508,9 +1508,14 @@ namespace platf {
 #endif
 #ifdef SUNSHINE_BUILD_X11
     // We enumerate this capture backend regardless of other suitable sources,
-    // since it may be needed as a NvFBC fallback for software encoding on X11.
-    if ((selected_capture.empty() || selected_capture == "x11") && verify_x11()) {
+    // since it may be needed as a NvFBC fallback for software/lossless capture on X11.
+    if ((selected_capture.empty() || selected_capture == "x11" || selected_capture == "nvfbc") && verify_x11()) {
       sources[source::X11] = true;
+    }
+#endif
+#ifdef SUNSHINE_BUILD_DRM
+    if (selected_capture == "nvfbc" && !sources[source::X11] && !sources[source::KMS] && verify_kms()) {
+      sources[source::KMS] = true;
     }
 #endif
 #ifdef SUNSHINE_BUILD_KWIN
